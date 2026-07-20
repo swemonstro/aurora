@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -15,16 +16,18 @@ import (
 func main() {
 	event := flag.String("event", "", "local event to normalize")
 	source := flag.String("source", "test", "integration that produced the event")
+	relayURL := flag.String("relay", "", "Aurora Relay base URL")
 	flag.Parse()
 
-	if strings.TrimSpace(*event) == "" {
-		fmt.Fprintln(os.Stderr, "usage: aurora-agent -event <event> [-source <source>]")
+	if strings.TrimSpace(*event) == "" || strings.TrimSpace(*relayURL) == "" {
+		fmt.Fprintln(os.Stderr, "usage: aurora-agent -event <event> -relay <URL> [-source <source>]")
 		os.Exit(2)
 	}
 
-	publisher, err := publish.NewJSONPublisher(os.Stdout)
+	client := &http.Client{Timeout: 5 * time.Second}
+	publisher, err := publish.NewHTTPPublisher(*relayURL, client)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "create publisher:", err)
+		fmt.Fprintln(os.Stderr, "create HTTP publisher:", err)
 		os.Exit(1)
 	}
 
