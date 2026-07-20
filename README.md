@@ -5,10 +5,117 @@ Aurora is an experimental physical status indicator for AI workers.
 The project contains:
 
 - `aurora-agent`: runs where Claude, Codex, or another supported AI tool runs.
-- `aurora-relay`: distributes minimal AI presence snapshots over outbound TLS connections.
+- `aurora-relay`: receives presence snapshots over HTTP and exposes the latest snapshot.
 - `device`: firmware for the Aurora ESP device.
 
 Aurora must not transmit prompts, source code, file names, terminal output, or other work content.
+
+## Aurora Relay
+
+Aurora Relay is an in-memory HTTP service. Agents publish with `POST /presence`, and
+clients such as the ESP read the latest snapshot with `GET /presence`.
+
+### Build and run locally
+
+Build the relay from the repository root:
+
+```sh
+mkdir -p bin
+go build -o bin/aurora-relay ./cmd/aurora-relay
+```
+
+For development that is only accessed from the same machine, retain the safe
+loopback default:
+
+```sh
+go run ./cmd/aurora-relay
+```
+
+To serve the ESP over the local network, the relay must listen on all interfaces:
+
+```sh
+go run ./cmd/aurora-relay -listen 0.0.0.0:8080
+```
+
+The ESP uses Blue1's LAN address, for example
+`http://192.168.0.247:8080/presence`; `localhost` on the ESP would refer to the ESP
+itself. The relay API has no authentication, so binding to `0.0.0.0` exposes it to
+the local network. Do not expose port 8080 to an untrusted network.
+
+### Install as a systemd service on Blue1
+
+The repository includes `deploy/systemd/aurora-relay.service` and a controlled
+installer. The unit runs as `carl`, executes `/usr/local/bin/aurora-relay` without a
+repository working directory, and explicitly listens on `0.0.0.0:8080`.
+
+1. Inspect the unit and installer, then install the binary and unit:
+
+```sh
+./scripts/install-aurora-relay.sh
+```
+
+The installation builds the relay, installs the binary and unit, and runs
+`systemctl daemon-reload`. It never enables, starts, stops, or restarts the service.
+Existing installed files are not replaced unless `--replace` is supplied.
+
+2. Stop the manually running relay before starting the systemd service. The
+installer deliberately does not do this. If the manual relay still owns port 8080,
+the systemd service cannot start.
+
+3. Enable the installed service at boot:
+
+```sh
+sudo systemctl enable aurora-relay.service
+```
+
+4. Start the systemd service explicitly:
+
+```sh
+sudo systemctl start aurora-relay.service
+```
+
+5. Verify service state, journal logs, and the HTTP endpoint:
+
+```sh
+systemctl status aurora-relay.service
+journalctl -u aurora-relay.service
+curl -i http://127.0.0.1:8080/presence
+```
+
+A newly started relay has no in-memory snapshot. Until an agent publishes the first
+status, `GET /presence` correctly returns `404 Not Found`.
+
+For a reviewed upgrade, rerun the installer with `--replace`:
+
+```sh
+./scripts/install-aurora-relay.sh --replace
+```
+
+This installs the new binary and unit and runs `systemctl daemon-reload`, but does
+not restart a running service. Explicitly restart it to begin using the new binary:
+
+```sh
+sudo systemctl restart aurora-relay.service
+```
+
+The installer may require `sudo`. Restart remains a separate operator action and is
+never combined with installation.
+
+Stop or disable the service with:
+
+```sh
+sudo systemctl stop aurora-relay.service
+sudo systemctl disable aurora-relay.service
+```
+
+To uninstall it, stop and disable it first, then remove only its installed files and
+reload systemd:
+
+```sh
+sudo rm /etc/systemd/system/aurora-relay.service
+sudo rm /usr/local/bin/aurora-relay
+sudo systemctl daemon-reload
+```
 
 ## Claude Code hooks
 
