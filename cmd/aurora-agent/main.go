@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/swemonstro/aurora/internal/status"
-	"github.com/swemonstro/aurora/internal/transport"
+	"github.com/swemonstro/aurora/internal/agent"
+	"github.com/swemonstro/aurora/internal/publish"
 )
 
 func main() {
@@ -22,27 +22,20 @@ func main() {
 		os.Exit(2)
 	}
 
-	state, err := status.Normalize(*event)
+	publisher, err := publish.NewJSONPublisher(os.Stdout)
 	if err != nil {
+		fmt.Fprintln(os.Stderr, "create publisher:", err)
+		os.Exit(1)
+	}
+
+	instance, err := agent.New(*source, publisher, time.Now)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "create agent:", err)
+		os.Exit(1)
+	}
+
+	if err := instance.Handle(context.Background(), *event); err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-
-	message := status.Message{
-		Version:   1,
-		Source:    *source,
-		State:     state,
-		Timestamp: time.Now().UTC(),
-	}
-
-	sender, err := transport.NewJSONSender(os.Stdout)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "create transport:", err)
-		os.Exit(1)
-	}
-
-	if err := sender.Send(context.Background(), message); err != nil {
-		fmt.Fprintln(os.Stderr, "send status:", err)
 		os.Exit(1)
 	}
 }

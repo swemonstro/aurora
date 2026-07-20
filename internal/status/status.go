@@ -3,7 +3,6 @@ package status
 import (
 	"fmt"
 	"strings"
-	"time"
 )
 
 type State string
@@ -14,13 +13,6 @@ const (
 	Error     State = "error"
 	Idle      State = "idle"
 )
-
-type Message struct {
-	Version   int       `json:"version"`
-	Source    string    `json:"source"`
-	State     State     `json:"state"`
-	Timestamp time.Time `json:"timestamp"`
-}
 
 func Normalize(event string) (State, error) {
 	switch strings.ToLower(strings.TrimSpace(event)) {
