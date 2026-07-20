@@ -1,7 +1,7 @@
 package main
 
 import (
-	"encoding/json"
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/swemonstro/aurora/internal/status"
+	"github.com/swemonstro/aurora/internal/transport"
 )
 
 func main() {
@@ -34,11 +35,14 @@ func main() {
 		Timestamp: time.Now().UTC(),
 	}
 
-	encoder := json.NewEncoder(os.Stdout)
-	encoder.SetEscapeHTML(false)
+	sender, err := transport.NewJSONSender(os.Stdout)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "create transport:", err)
+		os.Exit(1)
+	}
 
-	if err := encoder.Encode(message); err != nil {
-		fmt.Fprintln(os.Stderr, "encode status:", err)
+	if err := sender.Send(context.Background(), message); err != nil {
+		fmt.Fprintln(os.Stderr, "send status:", err)
 		os.Exit(1)
 	}
 }
