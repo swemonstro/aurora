@@ -1,1 +1,3 @@
-/bin/
+/bin/*
+!/bin/aurora-codex
+!/bin/aurora-codex-test

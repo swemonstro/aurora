@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+set -u
+
+REAL_CODEX="${AURORA_CODEX_COMMAND:-/home/carl/.npm-global/bin/codex}"
+HOOK_COMMAND="${AURORA_CODEX_HOOK_COMMAND:-/srv/dev/aurora/bin/aurora-codex-hook}"
+CODEX_HOME_VALUE="${CODEX_HOME:-$HOME/.codex}"
+
+case "$CODEX_HOME_VALUE" in
+  "$HOME/.codex-business"|*/.codex-business)
+    DEFAULT_SOURCE="codex-business"
+    ;;
+  *)
+    DEFAULT_SOURCE="codex-api"
+    ;;
+esac
+
+export AURORA_CODEX_SOURCE="${AURORA_CODEX_SOURCE:-$DEFAULT_SOURCE}"
+export AURORA_CODEX_STATE_FILE="${AURORA_CODEX_STATE_FILE:-$HOME/.local/state/aurora/${AURORA_CODEX_SOURCE}-sessions.json}"
+
+RUNTIME_BASE="${XDG_RUNTIME_DIR:-$HOME/.local/state/aurora/runtime}"
+mkdir -p "$RUNTIME_BASE"
+chmod 700 "$RUNTIME_BASE"
+
+SESSION_ID_FILE="$(mktemp "$RUNTIME_BASE/codex-session.XXXXXX")"
+chmod 600 "$SESSION_ID_FILE"
+export AURORA_CODEX_SESSION_ID_FILE="$SESSION_ID_FILE"
+
+cleanup() {
+  local exit_status=$?
+
+  if [ -s "$SESSION_ID_FILE" ] && [ -x "$HOOK_COMMAND" ]; then
+    "$HOOK_COMMAND" --session-end-file "$SESSION_ID_FILE" >/dev/null 2>&1 || true
+  fi
+
+  rm -f "$SESSION_ID_FILE"
+  return "$exit_status"
+}
+
+trap cleanup EXIT
+
+"$REAL_CODEX" "$@"
+exit $?

@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+mkdir -p "$TMP/home/.codex-business" "$TMP/runtime"
+
+cat >"$TMP/fake-codex" <<'EOF'
+#!/usr/bin/env bash
+set -eu
+printf '%s\n' "$AURORA_CODEX_SOURCE" >"$TEST_OUTPUT/source"
+printf '%s\n' "$AURORA_CODEX_STATE_FILE" >"$TEST_OUTPUT/state"
+printf '%s\n' "$*" >"$TEST_OUTPUT/args"
+printf '%s\n' "session-test" >"$AURORA_CODEX_SESSION_ID_FILE"
+exit "${TEST_CODEX_EXIT:-0}"
+EOF
+
+cat >"$TMP/fake-hook" <<'EOF'
+#!/usr/bin/env bash
+set -eu
+printf '%s\n' "$*" >"$TEST_OUTPUT/hook-args"
+printf '%s\n' "$2" >"$TEST_OUTPUT/hook-session-path"
+printf '%s\n' "$AURORA_CODEX_SOURCE" >"$TEST_OUTPUT/hook-source"
+printf '%s\n' "$AURORA_CODEX_STATE_FILE" >"$TEST_OUTPUT/hook-state"
+cat "$2" >"$TEST_OUTPUT/hook-session"
+EOF
+
+chmod +x "$TMP/fake-codex" "$TMP/fake-hook"
+mkdir -p "$TMP/output"
+
+set +e
+HOME="$TMP/home" \
+XDG_RUNTIME_DIR="$TMP/runtime" \
+CODEX_HOME="$TMP/home/.codex-business" \
+TEST_OUTPUT="$TMP/output" \
+TEST_CODEX_EXIT=7 \
+AURORA_CODEX_COMMAND="$TMP/fake-codex" \
+AURORA_CODEX_HOOK_COMMAND="$TMP/fake-hook" \
+"$ROOT/bin/aurora-codex" --no-alt-screen example
+result=$?
+set -e
+
+test "$result" -eq 7
+test "$(cat "$TMP/output/source")" = "codex-business"
+test "$(cat "$TMP/output/hook-source")" = "codex-business"
+test "$(cat "$TMP/output/state")" = "$TMP/home/.local/state/aurora/codex-business-sessions.json"
+test "$(cat "$TMP/output/hook-state")" = "$TMP/home/.local/state/aurora/codex-business-sessions.json"
+test "$(cat "$TMP/output/args")" = "--no-alt-screen example"
+test "$(cat "$TMP/output/hook-args")" = "--session-end-file $(cat "$TMP/output/hook-session-path")"
+test "$(cat "$TMP/output/hook-session")" = "session-test"
+
+if find "$TMP/runtime" -name 'codex-session.*' -print -quit | grep -q .; then
+  echo "temporary session file was not removed" >&2
+  exit 1
+fi
+
+printf 'aurora-codex wrapper test: OK\n'
