@@ -131,16 +131,21 @@ disk instead of sending that raw payload to the relay.
 | Claude Code event | Per-session effect |
 | --- | --- |
 | `UserPromptSubmit` | Set session to `working` |
-| `Notification` | Set session to `attention` |
-| `Stop` | Set session to `attention` |
+| `PreToolUse` with `AskUserQuestion` | Set session to `attention` |
+| `PostToolUse` with `AskUserQuestion` | Set session to `working` |
+| `Notification` with `permission_prompt` | Set session to `attention` |
+| `Notification` with `idle_prompt` | Set session to `idle` |
+| Other `Notification` events | Set session to `attention` |
+| `Stop` | Set session to `idle` |
 | `StopFailure` | Set session to `error` |
 | `SessionEnd` | Remove that session |
 
 Observed Claude Code behavior is a `UserPromptSubmit` when work begins, followed by
-`Stop` and an `idle_prompt` notification after a normal response. Permission prompts
-arrive as notifications with `notification_type="permission_prompt"`; both those and
-`idle_prompt` notifications map to attention. Other notification types currently do
-the same. Session exit arrives as `SessionEnd`, commonly with a reason such as
+`Stop` and an `idle_prompt` notification after a normal response. Both completion
+events map to idle. Interactive questions are detected through `PreToolUse` and
+`PostToolUse` events matched specifically to `AskUserQuestion`, producing the flow
+`working -> attention -> working`. Permission prompts remain attention. Unknown
+notification types also map defensively to attention. Session exit arrives as `SessionEnd`, commonly with a reason such as
 `prompt_input_exit`.
 
 ### Concurrent session aggregation
@@ -223,6 +228,32 @@ a recommended production installation path.
         ]
       }
     ],
+    "PreToolUse": [
+      {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/srv/dev/aurora/bin/aurora-claude-hook",
+            "async": true,
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/srv/dev/aurora/bin/aurora-claude-hook",
+            "async": true,
+            "timeout": 3
+          }
+        ]
+      }
+    ],
     "Notification": [
       {
         "hooks": [
@@ -276,7 +307,7 @@ a recommended production installation path.
 ```
 
 Restart Claude Code after editing the settings, then run `/hooks` to confirm that
-the five user hooks are loaded and point to the absolute binary path above.
+the seven user hooks are loaded and point to the absolute binary path above.
 
 ### Temporary raw hook capture
 

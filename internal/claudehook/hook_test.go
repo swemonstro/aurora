@@ -15,10 +15,12 @@ func TestMapEvent(t *testing.T) {
 	}{
 		{name: "prompt", event: Event{HookEventName: "UserPromptSubmit"}, state: status.Working},
 		{name: "permission notification", event: Event{HookEventName: "Notification", NotificationType: "permission_prompt"}, state: status.Attention},
-		{name: "idle notification", event: Event{HookEventName: "Notification", NotificationType: "idle_prompt"}, state: status.Attention},
+		{name: "idle notification", event: Event{HookEventName: "Notification", NotificationType: "idle_prompt"}, state: status.Idle},
 		{name: "unknown notification", event: Event{HookEventName: "Notification", NotificationType: "future_type"}, state: status.Attention},
 		{name: "missing notification type", event: Event{HookEventName: "Notification"}, state: status.Attention},
-		{name: "stop", event: Event{HookEventName: "Stop"}, state: status.Attention},
+		{name: "question begins", event: Event{HookEventName: "PreToolUse", ToolName: "AskUserQuestion"}, state: status.Attention},
+		{name: "question answered", event: Event{HookEventName: "PostToolUse", ToolName: "AskUserQuestion"}, state: status.Working},
+		{name: "stop", event: Event{HookEventName: "Stop"}, state: status.Idle},
 		{name: "failure", event: Event{HookEventName: "StopFailure"}, state: status.Error},
 		{name: "session end removes", event: Event{HookEventName: "SessionEnd"}, remove: true},
 	}
@@ -36,10 +38,17 @@ func TestMapEvent(t *testing.T) {
 	}
 }
 
-func TestMapEventRejectsUnsupportedEvent(t *testing.T) {
-	action, supported := MapEvent(Event{HookEventName: "PreToolUse"})
-	if supported {
-		t.Fatalf("supported = true with action %#v", action)
+func TestMapEventRejectsUnsupportedToolEvents(t *testing.T) {
+	for _, eventName := range []string{"PreToolUse", "PostToolUse"} {
+		t.Run(eventName, func(t *testing.T) {
+			action, supported := MapEvent(Event{
+				HookEventName: eventName,
+				ToolName:      "Bash",
+			})
+			if supported {
+				t.Fatalf("supported = true with action %#v", action)
+			}
+		})
 	}
 }
 

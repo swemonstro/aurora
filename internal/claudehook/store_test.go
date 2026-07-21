@@ -16,12 +16,13 @@ import (
 
 func TestParseEventFields(t *testing.T) {
 	event, err := ParseEvent([]byte(
-		`{"hook_event_name":"Notification","session_id":" session-a ","notification_type":"permission_prompt","prompt":"ignored"}`,
+		`{"hook_event_name":"Notification","session_id":" session-a ","notification_type":"permission_prompt","tool_name":"AskUserQuestion","prompt":"ignored"}`,
 	))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if event.HookEventName != "Notification" || event.SessionID != "session-a" || event.NotificationType != "permission_prompt" {
+	if event.HookEventName != "Notification" || event.SessionID != "session-a" ||
+		event.NotificationType != "permission_prompt" || event.ToolName != "AskUserQuestion" {
 		t.Fatalf("event = %#v", event)
 	}
 }
@@ -33,10 +34,12 @@ func TestSessionEventSemantics(t *testing.T) {
 		want  status.State
 	}{
 		{name: "prompt", event: Event{HookEventName: "UserPromptSubmit", SessionID: "a"}, want: status.Working},
-		{name: "stop for unknown session", event: Event{HookEventName: "Stop", SessionID: "a"}, want: status.Attention},
+		{name: "stop for unknown session", event: Event{HookEventName: "Stop", SessionID: "a"}, want: status.Idle},
 		{name: "permission", event: Event{HookEventName: "Notification", SessionID: "a", NotificationType: "permission_prompt"}, want: status.Attention},
-		{name: "idle prompt", event: Event{HookEventName: "Notification", SessionID: "a", NotificationType: "idle_prompt"}, want: status.Attention},
+		{name: "idle prompt", event: Event{HookEventName: "Notification", SessionID: "a", NotificationType: "idle_prompt"}, want: status.Idle},
 		{name: "other notification", event: Event{HookEventName: "Notification", SessionID: "a", NotificationType: "other"}, want: status.Attention},
+		{name: "question begins", event: Event{HookEventName: "PreToolUse", SessionID: "a", ToolName: "AskUserQuestion"}, want: status.Attention},
+		{name: "question answered", event: Event{HookEventName: "PostToolUse", SessionID: "a", ToolName: "AskUserQuestion"}, want: status.Working},
 		{name: "failure", event: Event{HookEventName: "StopFailure", SessionID: "a"}, want: status.Error},
 	}
 
@@ -57,15 +60,15 @@ func TestSessionEventSemantics(t *testing.T) {
 	}
 }
 
-func TestStopChangesOnlyItsSessionToAttention(t *testing.T) {
+func TestStopChangesOnlyItsSessionToIdle(t *testing.T) {
 	store := newTestStore(t)
 	mustUpdate(t, store, Event{HookEventName: "UserPromptSubmit", SessionID: "a"})
 	mustUpdate(t, store, Event{HookEventName: "UserPromptSubmit", SessionID: "b"})
-	if got := mustUpdate(t, store, Event{HookEventName: "Stop", SessionID: "b"}); got != status.Attention {
-		t.Fatalf("aggregate = %q, want attention", got)
+	if got := mustUpdate(t, store, Event{HookEventName: "Stop", SessionID: "b"}); got != status.Working {
+		t.Fatalf("aggregate = %q, want working", got)
 	}
 	state := readState(t, store.path)
-	if state.Sessions["a"].State != status.Working || state.Sessions["b"].State != status.Attention {
+	if state.Sessions["a"].State != status.Working || state.Sessions["b"].State != status.Idle {
 		t.Fatalf("sessions = %#v", state.Sessions)
 	}
 }
@@ -77,7 +80,7 @@ func TestSessionEndRemovesOnlyMatchingSession(t *testing.T) {
 		want       status.State
 	}{
 		{name: "working remains", otherEvent: "UserPromptSubmit", want: status.Working},
-		{name: "attention remains", otherEvent: "Stop", want: status.Attention},
+		{name: "idle remains", otherEvent: "Stop", want: status.Idle},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

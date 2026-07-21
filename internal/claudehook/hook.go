@@ -29,6 +29,7 @@ type Event struct {
 	HookEventName    string `json:"hook_event_name"`
 	SessionID        string `json:"session_id"`
 	NotificationType string `json:"notification_type"`
+	ToolName         string `json:"tool_name"`
 }
 
 type EventAction struct {
@@ -152,18 +153,27 @@ func MapEvent(event Event) (EventAction, bool) {
 		return EventAction{State: status.Working}, true
 	case "Notification":
 		switch event.NotificationType {
-		case "permission_prompt", "idle_prompt":
+		case "permission_prompt":
 			return EventAction{State: status.Attention}, true
+		case "idle_prompt":
+			return EventAction{State: status.Idle}, true
 		default:
 			return EventAction{State: status.Attention}, true
 		}
+	case "PreToolUse":
+		if event.ToolName == "AskUserQuestion" {
+			return EventAction{State: status.Attention}, true
+		}
+	case "PostToolUse":
+		if event.ToolName == "AskUserQuestion" {
+			return EventAction{State: status.Working}, true
+		}
 	case "Stop":
-		return EventAction{State: status.Attention}, true
+		return EventAction{State: status.Idle}, true
 	case "StopFailure":
 		return EventAction{State: status.Error}, true
 	case "SessionEnd":
 		return EventAction{Remove: true}, true
-	default:
-		return EventAction{}, false
 	}
+	return EventAction{}, false
 }

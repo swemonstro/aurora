@@ -242,7 +242,7 @@ func TestConcurrentSessionFlow(t *testing.T) {
 	}{
 		{payload: `{"hook_event_name":"UserPromptSubmit","session_id":"session-a"}`, want: status.Working},
 		{payload: `{"hook_event_name":"UserPromptSubmit","session_id":"session-b"}`, want: status.Working},
-		{payload: `{"hook_event_name":"Stop","session_id":"session-b"}`, want: status.Attention},
+		{payload: `{"hook_event_name":"Stop","session_id":"session-b"}`, want: status.Working},
 		{payload: `{"hook_event_name":"SessionEnd","session_id":"session-b"}`, want: status.Working},
 		{payload: `{"hook_event_name":"SessionEnd","session_id":"session-a"}`, want: status.Idle},
 	}
@@ -297,7 +297,7 @@ func TestUnsupportedEventDoesNotPublish(t *testing.T) {
 		claudehook.StateFileEnv: filepath.Join(t.TempDir(), "sessions.json"),
 	}
 	run(context.Background(), strings.NewReader(
-		`{"hook_event_name":"PreToolUse","session_id":"session-a"}`,
+		`{"hook_event_name":"PreToolUse","session_id":"session-a","tool_name":"Bash"}`,
 	), func(key string) string { return values[key] })
 
 	select {
