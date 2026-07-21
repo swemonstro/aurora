@@ -13,7 +13,18 @@ Aurora must not transmit prompts, source code, file names, terminal output, or o
 ## Aurora Relay
 
 Aurora Relay is an in-memory HTTP service. Agents publish with `POST /presence`, and
-clients such as the ESP read the latest snapshot with `GET /presence`.
+clients such as the ESP read the current aggregate snapshot with `GET /presence`.
+
+The relay retains the latest snapshot separately for each `source`. With only one
+registered source, `GET /presence` returns that source's snapshot unchanged. With
+multiple sources, the relay returns a synthetic snapshot with
+`source="aurora-aggregate"` and aggregates states using this priority:
+
+    error > attention > working > idle
+
+A lower-priority update from one source therefore cannot hide a higher-priority
+state from another source. The aggregate timestamp is the newest timestamp among
+the sources currently contributing the winning state.
 
 ### Build and run locally
 

@@ -91,6 +91,82 @@ func TestPostThenGetPresence(t *testing.T) {
 	}
 }
 
+func TestPresenceAggregatesDifferentSources(t *testing.T) {
+	_, handler := newTestHandler(t)
+
+	snapshots := []presence.Snapshot{
+		{
+			Version:   presence.ProtocolVersion,
+			Source:    "claude-code",
+			State:     status.Attention,
+			Timestamp: time.Date(2026, 7, 20, 8, 0, 0, 0, time.UTC),
+		},
+		{
+			Version:   presence.ProtocolVersion,
+			Source:    "codex-api",
+			State:     status.Idle,
+			Timestamp: time.Date(2026, 7, 20, 8, 5, 0, 0, time.UTC),
+		},
+	}
+
+	for _, snapshot := range snapshots {
+		body, err := json.Marshal(snapshot)
+		if err != nil {
+			t.Fatalf("json.Marshal returned error: %v", err)
+		}
+
+		request := httptest.NewRequest(
+			http.MethodPost,
+			"/presence",
+			bytes.NewReader(body),
+		)
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+
+		handler.ServeHTTP(response, request)
+
+		if response.Code != http.StatusNoContent {
+			t.Fatalf(
+				"POST status = %d, want %d; body = %q",
+				response.Code,
+				http.StatusNoContent,
+				response.Body.String(),
+			)
+		}
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/presence", nil)
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf(
+			"GET status = %d, want %d; body = %q",
+			response.Code,
+			http.StatusOK,
+			response.Body.String(),
+		)
+	}
+
+	var got presence.Snapshot
+	if err := json.NewDecoder(response.Body).Decode(&got); err != nil {
+		t.Fatalf("decode GET response: %v", err)
+	}
+
+	if got.Source != aggregateSource {
+		t.Fatalf("Source = %q, want %q", got.Source, aggregateSource)
+	}
+	if got.State != status.Attention {
+		t.Fatalf("State = %q, want %q", got.State, status.Attention)
+	}
+
+	wantTimestamp := time.Date(2026, 7, 20, 8, 0, 0, 0, time.UTC)
+	if !got.Timestamp.Equal(wantTimestamp) {
+		t.Fatalf("Timestamp = %s, want %s", got.Timestamp, wantTimestamp)
+	}
+}
+
 func TestPostPresenceRejectsInvalidSnapshots(t *testing.T) {
 	tests := []struct {
 		name string
