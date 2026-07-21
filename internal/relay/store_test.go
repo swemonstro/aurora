@@ -154,3 +154,20 @@ func TestStoreRemovePreservesOtherSourcesAndCanBecomeEmpty(t *testing.T) {
 		t.Fatal("store remained online after final source removal")
 	}
 }
+
+func TestV1AggregatePriorityIsFrozen(t *testing.T) {
+	states := []status.State{status.Idle, status.Working, status.Attention, status.Error}
+	var store Store
+	for index, state := range states {
+		store.Set(presence.Snapshot{
+			Version:   presence.ProtocolVersion,
+			Source:    string(rune('a' + index)),
+			State:     state,
+			Timestamp: time.Date(2026, 7, 21, 10, index, 0, 0, time.UTC),
+		})
+		got, ok := store.Latest()
+		if !ok || got.State != state {
+			t.Fatalf("after %q aggregate = %#v, %t", state, got, ok)
+		}
+	}
+}

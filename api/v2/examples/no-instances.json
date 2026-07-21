@@ -1,0 +1,7 @@
+{
+  "api_version": 2,
+  "generated_at": "2026-07-21T10:00:00Z",
+  "presence": "sleeping",
+  "instances": [],
+  "slots": {"namespace": "default", "active_count": 0}
+}

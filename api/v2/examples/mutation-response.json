@@ -1,0 +1,5 @@
+{
+  "instance_id": "019c7c35-a001-7000-8000-000000000001",
+  "effective_state": "idle",
+  "revisions": {"producer_epoch": "epoch-alpha", "runtime_revision": 12, "hook_revision": 8}
+}

@@ -1,0 +1,19 @@
+{
+  "api_version": 2,
+  "generated_at": "2026-07-21T10:01:00Z",
+  "presence": "active",
+  "instances": [
+    {
+      "instance_id": "019c7c35-7d21-7ad1-9e52-52e7bd4a1559",
+      "tool": "claude",
+      "source": {"provider": "claude", "profile": "default", "collector_id": "collector-alpha"},
+      "state": "idle",
+      "slot": {"namespace": "default", "index": 0},
+      "revisions": {"producer_epoch": "epoch-alpha", "runtime_revision": 3, "hook_revision": 0},
+      "discovered_at": "2026-07-21T10:00:41Z",
+      "state_changed_at": "2026-07-21T10:00:41Z",
+      "lease_expires_at": "2026-07-21T10:01:15Z"
+    }
+  ],
+  "slots": {"namespace": "default", "active_count": 1}
+}

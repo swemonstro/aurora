@@ -1,0 +1,41 @@
+{
+  "api_version": 2,
+  "generated_at": "2026-07-21T10:05:00Z",
+  "presence": "active",
+  "instances": [
+    {
+      "instance_id": "019c7c35-a001-7000-8000-000000000001",
+      "tool": "claude",
+      "source": {"provider": "claude", "profile": "default", "collector_id": "collector-alpha"},
+      "state": "attention",
+      "slot": {"namespace": "default", "index": 0},
+      "revisions": {"producer_epoch": "epoch-alpha", "runtime_revision": 11, "hook_revision": 7},
+      "discovered_at": "2026-07-21T09:55:00Z",
+      "state_changed_at": "2026-07-21T10:04:58Z",
+      "lease_expires_at": "2026-07-21T10:05:15Z"
+    },
+    {
+      "instance_id": "019c7c35-a002-7000-8000-000000000002",
+      "tool": "codex",
+      "source": {"provider": "codex-api", "profile": "default", "collector_id": "collector-alpha"},
+      "state": "working",
+      "slot": {"namespace": "default", "index": 1},
+      "revisions": {"producer_epoch": "epoch-alpha", "runtime_revision": 8, "hook_revision": 5},
+      "discovered_at": "2026-07-21T09:57:00Z",
+      "state_changed_at": "2026-07-21T10:04:40Z",
+      "lease_expires_at": "2026-07-21T10:05:14Z"
+    },
+    {
+      "instance_id": "019c7c35-a003-7000-8000-000000000003",
+      "tool": "codex",
+      "source": {"provider": "codex-business", "profile": "business", "collector_id": "collector-beta"},
+      "state": "error",
+      "slot": {"namespace": "default", "index": 2},
+      "revisions": {"producer_epoch": "epoch-beta", "runtime_revision": 6, "hook_revision": 4},
+      "discovered_at": "2026-07-21T09:59:00Z",
+      "state_changed_at": "2026-07-21T10:04:20Z",
+      "lease_expires_at": "2026-07-21T10:05:13Z"
+    }
+  ],
+  "slots": {"namespace": "default", "active_count": 3}
+}

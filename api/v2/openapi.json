@@ -1,0 +1,54 @@
+{
+  "openapi": "3.1.0",
+  "info": {"title": "Aurora per-instance presence v2 contract", "version": "0.1.0-package-0"},
+  "paths": {
+    "/api/v2/presence/instances": {
+      "get": {
+        "summary": "Read a full canonical instance snapshot",
+        "description": "Returns HTTP 200 for both active data and a sleeping empty list; an empty registry is never 404 in v2.",
+        "responses": {
+          "200": {
+            "description": "Full canonical snapshot, including all active instances",
+            "content": {"application/json": {"schema": {"$ref": "presence.schema.json#/$defs/CanonicalSnapshot"}, "examples": {"empty": {"externalValue": "examples/no-instances.json"}, "active": {"externalValue": "examples/multiple-instances.json"}}}}
+          },
+          "default": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/api/v2/presence/instances/{instance_id}/runtime": {
+      "patch": {
+        "summary": "Mutate the process-owned runtime layer",
+        "parameters": [{"$ref": "#/components/parameters/InstanceID"}],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "presence.schema.json#/$defs/RuntimeMutation"}}}},
+        "responses": {"200": {"description": "Mutation accepted", "content": {"application/json": {"schema": {"$ref": "presence.schema.json#/$defs/MutationResponse"}}}}, "default": {"$ref": "#/components/responses/Error"}}
+      }
+    },
+    "/api/v2/presence/instances/{instance_id}/hook-state": {
+      "patch": {
+        "summary": "Mutate or clear the hook-owned claim",
+        "description": "The idle state clears the claim. Only instance_id addresses the mutation; provider, profile, and source are not keys.",
+        "parameters": [{"$ref": "#/components/parameters/InstanceID"}],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "presence.schema.json#/$defs/HookStateMutation"}}}},
+        "responses": {"200": {"description": "Mutation accepted", "content": {"application/json": {"schema": {"$ref": "presence.schema.json#/$defs/MutationResponse"}}}}, "default": {"$ref": "#/components/responses/Error"}}
+      }
+    },
+    "/api/v2/presence/presentation": {
+      "get": {
+        "summary": "Read a capacity-specific presentation",
+        "parameters": [
+          {"name": "mode", "in": "query", "required": true, "schema": {"type": "string", "const": "slots"}},
+          {"name": "pixel_capacity", "in": "query", "required": true, "schema": {"type": "integer", "minimum": 0}}
+        ],
+        "responses": {"200": {"description": "Presentation projection", "content": {"application/json": {"schema": {"$ref": "presence.schema.json#/$defs/Presentation"}}}}, "default": {"$ref": "#/components/responses/Error"}}
+      }
+    }
+  },
+  "components": {
+    "parameters": {
+      "InstanceID": {"name": "instance_id", "in": "path", "required": true, "description": "Canonical instance identity; source metadata is never accepted here.", "schema": {"type": "string", "minLength": 1}}
+    },
+    "responses": {
+      "Error": {"description": "Versioned v2 error", "content": {"application/json": {"schema": {"$ref": "presence.schema.json#/$defs/Error"}}}}
+    }
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "instance_id": "instance-invalid-response",
+  "effective_state": "working",
+  "revisions": {"producer_epoch": "epoch-alpha", "runtime_revision": 1, "hook_revision": 0}
+}

@@ -1,0 +1,168 @@
+[
+  {
+    "name": "one_claude",
+    "description": "One verified Claude executable before any hook event.",
+    "snapshots": [{
+      "observed_at": "2026-07-21T09:00:01Z",
+      "processes": [{
+        "process": {"pid": 101, "started_at": "2026-07-21T09:00:00Z"},
+        "executable_identity": "exe-claude-signed-a",
+        "process_group_or_job": "group-a",
+        "os_session": "session-a",
+        "terminal_fingerprint": "terminal-a",
+        "cwd_fingerprint": "cwd-repository-a",
+        "owner_identity": "owner-local-a"
+      }]
+    }],
+    "expected_families": [{
+      "instance_id": "instance-claude-alpha",
+      "tool": "claude",
+      "root": {"pid": 101, "started_at": "2026-07-21T09:00:00Z"},
+      "members": [{"pid": 101, "started_at": "2026-07-21T09:00:00Z"}]
+    }]
+  },
+  {
+    "name": "two_parallel_claude",
+    "description": "Two Claude roots share source metadata but remain separate runtimes.",
+    "snapshots": [{
+      "observed_at": "2026-07-21T09:05:02Z",
+      "processes": [
+        {
+          "process": {"pid": 201, "started_at": "2026-07-21T09:05:00Z"},
+          "executable_identity": "exe-claude-signed-a",
+          "process_group_or_job": "group-b1",
+          "os_session": "session-b1",
+          "terminal_fingerprint": "terminal-b1",
+          "cwd_fingerprint": "cwd-repository-shared",
+          "owner_identity": "owner-local-a"
+        },
+        {
+          "process": {"pid": 202, "started_at": "2026-07-21T09:05:01Z"},
+          "executable_identity": "exe-claude-signed-a",
+          "process_group_or_job": "group-b2",
+          "os_session": "session-b2",
+          "terminal_fingerprint": "terminal-b2",
+          "cwd_fingerprint": "cwd-repository-shared",
+          "owner_identity": "owner-local-a"
+        }
+      ]
+    }],
+    "expected_families": [
+      {"instance_id": "instance-claude-beta", "tool": "claude", "root": {"pid": 201, "started_at": "2026-07-21T09:05:00Z"}, "members": [{"pid": 201, "started_at": "2026-07-21T09:05:00Z"}]},
+      {"instance_id": "instance-claude-gamma", "tool": "claude", "root": {"pid": 202, "started_at": "2026-07-21T09:05:01Z"}, "members": [{"pid": 202, "started_at": "2026-07-21T09:05:01Z"}]}
+    ]
+  },
+  {
+    "name": "codex_node_native_family",
+    "description": "A Codex Node launcher and verified native child form one runtime family.",
+    "snapshots": [{
+      "observed_at": "2026-07-21T09:10:02Z",
+      "processes": [
+        {
+          "process": {"pid": 301, "started_at": "2026-07-21T09:10:00Z"},
+          "executable_identity": "exe-codex-node-launcher-a",
+          "process_group_or_job": "group-c1",
+          "os_session": "session-c1",
+          "owner_identity": "owner-local-a"
+        },
+        {
+          "process": {"pid": 302, "started_at": "2026-07-21T09:10:01Z"},
+          "parent": {"pid": 301, "started_at": "2026-07-21T09:10:00Z"},
+          "executable_identity": "exe-codex-native-a",
+          "process_group_or_job": "group-c1",
+          "os_session": "session-c1",
+          "owner_identity": "owner-local-a"
+        }
+      ]
+    }],
+    "expected_families": [{
+      "instance_id": "instance-codex-alpha",
+      "tool": "codex",
+      "root": {"pid": 301, "started_at": "2026-07-21T09:10:00Z"},
+      "members": [{"pid": 301, "started_at": "2026-07-21T09:10:00Z"}, {"pid": 302, "started_at": "2026-07-21T09:10:01Z"}]
+    }]
+  },
+  {
+    "name": "two_parallel_codex_families",
+    "description": "Two launcher/native pairs remain two Codex runtime families.",
+    "snapshots": [{
+      "observed_at": "2026-07-21T09:15:03Z",
+      "processes": [
+        {"process": {"pid": 401, "started_at": "2026-07-21T09:15:00Z"}, "executable_identity": "exe-codex-node-launcher-a", "process_group_or_job": "group-d1", "os_session": "session-d1", "owner_identity": "owner-local-a"},
+        {"process": {"pid": 402, "started_at": "2026-07-21T09:15:01Z"}, "parent": {"pid": 401, "started_at": "2026-07-21T09:15:00Z"}, "executable_identity": "exe-codex-native-a", "process_group_or_job": "group-d1", "os_session": "session-d1", "owner_identity": "owner-local-a"},
+        {"process": {"pid": 411, "started_at": "2026-07-21T09:15:00.500Z"}, "executable_identity": "exe-codex-node-launcher-a", "process_group_or_job": "group-d2", "os_session": "session-d2", "owner_identity": "owner-local-a"},
+        {"process": {"pid": 412, "started_at": "2026-07-21T09:15:01.500Z"}, "parent": {"pid": 411, "started_at": "2026-07-21T09:15:00.500Z"}, "executable_identity": "exe-codex-native-a", "process_group_or_job": "group-d2", "os_session": "session-d2", "owner_identity": "owner-local-a"}
+      ]
+    }],
+    "expected_families": [
+      {"instance_id": "instance-codex-beta", "tool": "codex", "root": {"pid": 401, "started_at": "2026-07-21T09:15:00Z"}, "members": [{"pid": 401, "started_at": "2026-07-21T09:15:00Z"}, {"pid": 402, "started_at": "2026-07-21T09:15:01Z"}]},
+      {"instance_id": "instance-codex-gamma", "tool": "codex", "root": {"pid": 411, "started_at": "2026-07-21T09:15:00.500Z"}, "members": [{"pid": 411, "started_at": "2026-07-21T09:15:00.500Z"}, {"pid": 412, "started_at": "2026-07-21T09:15:01.500Z"}]}
+    ]
+  },
+  {
+    "name": "pid_reuse",
+    "description": "The same PID in one boot has a new process generation after its start time changes.",
+    "snapshots": [
+      {"observed_at": "2026-07-21T09:20:01Z", "processes": [{"process": {"pid": 501, "started_at": "2026-07-21T09:20:00Z"}, "executable_identity": "exe-claude-signed-a", "owner_identity": "owner-local-a"}]},
+      {"observed_at": "2026-07-21T09:25:01Z", "processes": [{"process": {"pid": 501, "started_at": "2026-07-21T09:25:00Z"}, "executable_identity": "exe-claude-signed-a", "owner_identity": "owner-local-a"}]}
+    ],
+    "expected_families": [
+      {"instance_id": "instance-reused-old", "tool": "claude", "root": {"pid": 501, "started_at": "2026-07-21T09:20:00Z"}, "members": [{"pid": 501, "started_at": "2026-07-21T09:20:00Z"}]},
+      {"instance_id": "instance-reused-new", "tool": "claude", "root": {"pid": 501, "started_at": "2026-07-21T09:25:00Z"}, "members": [{"pid": 501, "started_at": "2026-07-21T09:25:00Z"}]}
+    ]
+  },
+  {
+    "name": "process_disappears_without_session_end",
+    "description": "A runtime exists in one process snapshot and is absent from the next without a hook event.",
+    "snapshots": [
+      {"observed_at": "2026-07-21T09:30:01Z", "processes": [{"process": {"pid": 601, "started_at": "2026-07-21T09:30:00Z"}, "executable_identity": "exe-claude-signed-a", "owner_identity": "owner-local-a"}]},
+      {"observed_at": "2026-07-21T09:30:03Z", "processes": []}
+    ],
+    "expected_families": [{"instance_id": "instance-disappearing", "tool": "claude", "root": {"pid": 601, "started_at": "2026-07-21T09:30:00Z"}, "members": [{"pid": 601, "started_at": "2026-07-21T09:30:00Z"}]}]
+  },
+  {
+    "name": "ambiguous_shared_fingerprints",
+    "description": "Two candidates share CWD and terminal fingerprints; neither may be selected.",
+    "snapshots": [{
+      "observed_at": "2026-07-21T09:35:02Z",
+      "processes": [
+        {"process": {"pid": 701, "started_at": "2026-07-21T09:35:00Z"}, "executable_identity": "exe-claude-signed-a", "terminal_fingerprint": "terminal-shared", "cwd_fingerprint": "cwd-shared", "owner_identity": "owner-local-a"},
+        {"process": {"pid": 702, "started_at": "2026-07-21T09:35:01Z"}, "executable_identity": "exe-claude-signed-a", "terminal_fingerprint": "terminal-shared", "cwd_fingerprint": "cwd-shared", "owner_identity": "owner-local-a"}
+      ]
+    }],
+    "expected_families": [
+      {"instance_id": "instance-ambiguous-a", "tool": "claude", "root": {"pid": 701, "started_at": "2026-07-21T09:35:00Z"}, "members": [{"pid": 701, "started_at": "2026-07-21T09:35:00Z"}]},
+      {"instance_id": "instance-ambiguous-b", "tool": "claude", "root": {"pid": 702, "started_at": "2026-07-21T09:35:01Z"}, "members": [{"pid": 702, "started_at": "2026-07-21T09:35:01Z"}]}
+    ],
+    "hook": {"tool": "claude", "hook_session_ref": "hook-ambiguous", "observed_at": "2026-07-21T09:35:03Z", "terminal_fingerprint": "terminal-shared", "cwd_fingerprint": "cwd-shared"},
+    "expected_correlation": {"outcome": "ambiguous", "candidates": ["instance-ambiguous-a", "instance-ambiguous-b"], "evidence": ["terminal_fingerprint", "cwd_fingerprint"]}
+  },
+  {
+    "name": "strong_ancestor_match",
+    "description": "A verified hook ancestor belongs to exactly one runtime family.",
+    "snapshots": [{
+      "observed_at": "2026-07-21T09:40:02Z",
+      "processes": [
+        {"process": {"pid": 801, "started_at": "2026-07-21T09:40:00Z"}, "executable_identity": "exe-claude-signed-a", "owner_identity": "owner-local-a"},
+        {"process": {"pid": 802, "started_at": "2026-07-21T09:40:01Z"}, "executable_identity": "exe-claude-signed-a", "owner_identity": "owner-local-a"}
+      ]
+    }],
+    "expected_families": [
+      {"instance_id": "instance-claude-alpha", "tool": "claude", "root": {"pid": 801, "started_at": "2026-07-21T09:40:00Z"}, "members": [{"pid": 801, "started_at": "2026-07-21T09:40:00Z"}]},
+      {"instance_id": "instance-claude-other", "tool": "claude", "root": {"pid": 802, "started_at": "2026-07-21T09:40:01Z"}, "members": [{"pid": 802, "started_at": "2026-07-21T09:40:01Z"}]}
+    ],
+    "hook": {"tool": "claude", "hook_session_ref": "hook-strong", "observed_at": "2026-07-21T09:40:03Z", "verified_ancestors": [{"pid": 801, "started_at": "2026-07-21T09:40:00Z"}]},
+    "expected_correlation": {"outcome": "uniquely_matched", "instance_id": "instance-claude-alpha", "candidates": ["instance-claude-alpha"], "evidence": ["verified_ancestor"]}
+  },
+  {
+    "name": "weak_signals_unmatched",
+    "description": "Only complementary fingerprints are present and automatic binding is forbidden.",
+    "snapshots": [{
+      "observed_at": "2026-07-21T09:45:01Z",
+      "processes": [{"process": {"pid": 901, "started_at": "2026-07-21T09:45:00Z"}, "executable_identity": "exe-codex-native-a", "terminal_fingerprint": "terminal-weak", "cwd_fingerprint": "cwd-weak", "owner_identity": "owner-local-a"}]
+    }],
+    "expected_families": [{"instance_id": "instance-codex-weak", "tool": "codex", "root": {"pid": 901, "started_at": "2026-07-21T09:45:00Z"}, "members": [{"pid": 901, "started_at": "2026-07-21T09:45:00Z"}]}],
+    "hook": {"tool": "codex", "hook_session_ref": "hook-weak", "observed_at": "2026-07-21T09:45:02Z", "terminal_fingerprint": "terminal-weak", "cwd_fingerprint": "cwd-weak", "transcript_fingerprint": "transcript-weak"},
+    "expected_correlation": {"outcome": "unmatched", "candidates": [], "evidence": ["terminal_fingerprint", "cwd_fingerprint", "transcript_fingerprint"]}
+  }
+]

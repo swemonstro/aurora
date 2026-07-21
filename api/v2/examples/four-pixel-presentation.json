@@ -1,0 +1,15 @@
+{
+  "api_version": 2,
+  "mode": "slots",
+  "pixel_capacity": 4,
+  "pixels": [
+    {"pixel": 0, "instance_id": "instance-1", "state": "working"},
+    {"pixel": 1, "instance_id": "instance-2", "state": "idle"},
+    {"pixel": 2, "instance_id": "instance-3", "state": "attention"},
+    {"pixel": 3, "instance_id": "instance-4", "state": "working"}
+  ],
+  "active_count": 6,
+  "visible_count": 4,
+  "overflow_count": 2,
+  "overflow_instance_ids": ["instance-5", "instance-6"]
+}

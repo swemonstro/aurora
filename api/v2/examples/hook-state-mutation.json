@@ -1,0 +1,7 @@
+{
+  "producer_epoch": "epoch-alpha",
+  "hook_revision": 8,
+  "state": "idle",
+  "observed_at": "2026-07-21T10:05:06Z",
+  "idempotency_key": "hook-event-8"
+}

@@ -1,0 +1,196 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aurora.invalid/schemas/presence-v2.json",
+  "title": "Aurora per-instance presence v2 contracts",
+  "$comment": "CanonicalSnapshot is a full snapshot. An empty canonical snapshot is successful data (HTTP 200 in OpenAPI), and sleeping is not an instance state.",
+  "oneOf": [
+    {"$ref": "#/$defs/CanonicalSnapshot"},
+    {"$ref": "#/$defs/Presentation"},
+    {"$ref": "#/$defs/RuntimeMutation"},
+    {"$ref": "#/$defs/HookStateMutation"},
+    {"$ref": "#/$defs/MutationResponse"},
+    {"$ref": "#/$defs/Error"}
+  ],
+  "$defs": {
+    "OpaqueID": {"type": "string", "minLength": 1, "pattern": ".*\\S.*"},
+    "Timestamp": {"type": "string", "format": "date-time"},
+    "ToolKind": {"type": "string", "enum": ["claude", "codex"]},
+    "InstanceState": {"type": "string", "enum": ["idle", "working", "attention", "error"]},
+    "RuntimeStatus": {"type": "string", "enum": ["alive", "suspect_missing", "ended"]},
+    "Source": {
+      "type": "object",
+      "description": "Provenance metadata only; never instance identity or a mutation key.",
+      "additionalProperties": false,
+      "required": ["provider", "profile", "collector_id"],
+      "properties": {
+        "provider": {"$ref": "#/$defs/OpaqueID"},
+        "profile": {"$ref": "#/$defs/OpaqueID"},
+        "collector_id": {"$ref": "#/$defs/OpaqueID"}
+      }
+    },
+    "Slot": {
+      "type": "object",
+      "description": "Unbounded logical slot; physical pixel capacity is absent by design.",
+      "additionalProperties": false,
+      "required": ["namespace", "index"],
+      "properties": {
+        "namespace": {"$ref": "#/$defs/OpaqueID"},
+        "index": {"type": "integer", "minimum": 0}
+      }
+    },
+    "Revisions": {
+      "type": "object",
+      "description": "Owner-layer revisions are ordered within producer_epoch, independently of client wall-clock timestamps.",
+      "additionalProperties": false,
+      "required": ["producer_epoch", "runtime_revision", "hook_revision"],
+      "properties": {
+        "producer_epoch": {"$ref": "#/$defs/OpaqueID"},
+        "runtime_revision": {"type": "integer", "minimum": 1},
+        "hook_revision": {"type": "integer", "minimum": 0}
+      }
+    },
+    "Instance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["instance_id", "tool", "source", "state", "slot", "revisions", "discovered_at", "state_changed_at", "lease_expires_at"],
+      "properties": {
+        "instance_id": {"$ref": "#/$defs/OpaqueID"},
+        "tool": {"$ref": "#/$defs/ToolKind"},
+        "source": {"$ref": "#/$defs/Source"},
+        "state": {"$ref": "#/$defs/InstanceState"},
+        "slot": {"$ref": "#/$defs/Slot"},
+        "revisions": {"$ref": "#/$defs/Revisions"},
+        "discovered_at": {"$ref": "#/$defs/Timestamp"},
+        "state_changed_at": {"$ref": "#/$defs/Timestamp"},
+        "lease_expires_at": {"$ref": "#/$defs/Timestamp"}
+      },
+      "if": {
+        "properties": {"state": {"enum": ["working", "attention", "error"]}},
+        "required": ["state"]
+      },
+      "then": {
+        "properties": {
+          "revisions": {
+            "properties": {"hook_revision": {"minimum": 1}}
+          }
+        }
+      }
+    },
+    "SlotSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["namespace", "active_count"],
+      "properties": {
+        "namespace": {"$ref": "#/$defs/OpaqueID"},
+        "active_count": {"type": "integer", "minimum": 0}
+      }
+    },
+    "CanonicalSnapshot": {
+      "type": "object",
+      "description": "Complete canonical list of all active instances. A sleeping empty list is valid HTTP 200 data.",
+      "additionalProperties": false,
+      "required": ["api_version", "generated_at", "presence", "instances", "slots"],
+      "properties": {
+        "api_version": {"const": 2},
+        "generated_at": {"$ref": "#/$defs/Timestamp"},
+        "presence": {"type": "string", "enum": ["sleeping", "active"]},
+        "instances": {"type": "array", "items": {"$ref": "#/$defs/Instance"}},
+        "slots": {"$ref": "#/$defs/SlotSummary"}
+      },
+      "oneOf": [
+        {
+          "properties": {"presence": {"const": "sleeping"}, "instances": {"maxItems": 0}}
+        },
+        {
+          "properties": {"presence": {"const": "active"}, "instances": {"minItems": 1}}
+        }
+      ]
+    },
+    "Pixel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pixel", "instance_id", "state"],
+      "properties": {
+        "pixel": {"type": "integer", "minimum": 0},
+        "instance_id": {"$ref": "#/$defs/OpaqueID"},
+        "state": {"$ref": "#/$defs/InstanceState"}
+      }
+    },
+    "Presentation": {
+      "type": "object",
+      "description": "Capacity-specific projection; pixel_capacity exists only here, never in canonical instances or slots.",
+      "additionalProperties": false,
+      "required": ["api_version", "mode", "pixel_capacity", "pixels", "active_count", "visible_count", "overflow_count", "overflow_instance_ids"],
+      "properties": {
+        "api_version": {"const": 2},
+        "mode": {"const": "slots"},
+        "pixel_capacity": {"type": "integer", "minimum": 0},
+        "pixels": {"type": "array", "items": {"$ref": "#/$defs/Pixel"}},
+        "active_count": {"type": "integer", "minimum": 0},
+        "visible_count": {"type": "integer", "minimum": 0},
+        "overflow_count": {"type": "integer", "minimum": 0},
+        "overflow_instance_ids": {"type": "array", "items": {"$ref": "#/$defs/OpaqueID"}, "uniqueItems": true}
+      }
+    },
+    "RuntimeMutation": {
+      "type": "object",
+      "description": "Runtime-owner mutation body. The target instance_id is the URL key; source metadata is forbidden by additionalProperties=false.",
+      "additionalProperties": false,
+      "required": ["producer_epoch", "runtime_revision", "status", "observed_at", "idempotency_key"],
+      "properties": {
+        "producer_epoch": {"$ref": "#/$defs/OpaqueID"},
+        "runtime_revision": {"type": "integer", "minimum": 1},
+        "status": {"$ref": "#/$defs/RuntimeStatus"},
+        "observed_at": {"$ref": "#/$defs/Timestamp"},
+        "idempotency_key": {"$ref": "#/$defs/OpaqueID"}
+      }
+    },
+    "HookStateMutation": {
+      "type": "object",
+      "description": "Hook-owner mutation. state=idle clears the hook claim; it does not create an idle owner layer.",
+      "additionalProperties": false,
+      "required": ["producer_epoch", "hook_revision", "state", "observed_at", "idempotency_key"],
+      "properties": {
+        "producer_epoch": {"$ref": "#/$defs/OpaqueID"},
+        "hook_revision": {"type": "integer", "minimum": 1},
+        "state": {"$ref": "#/$defs/InstanceState"},
+        "observed_at": {"$ref": "#/$defs/Timestamp"},
+        "idempotency_key": {"$ref": "#/$defs/OpaqueID"}
+      }
+    },
+    "MutationResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["instance_id", "effective_state", "revisions"],
+      "properties": {
+        "instance_id": {"$ref": "#/$defs/OpaqueID"},
+        "effective_state": {"$ref": "#/$defs/InstanceState"},
+        "revisions": {"$ref": "#/$defs/Revisions"}
+      },
+      "if": {
+        "properties": {"effective_state": {"enum": ["working", "attention", "error"]}},
+        "required": ["effective_state"]
+      },
+      "then": {
+        "properties": {
+          "revisions": {
+            "properties": {"hook_revision": {"minimum": 1}}
+          }
+        }
+      }
+    },
+    "ErrorCode": {
+      "type": "string",
+      "enum": ["invalid_request", "invalid_instance", "instance_not_found", "revision_conflict", "idempotency_conflict", "unauthorized", "forbidden", "unsupported_version", "internal_error"]
+    },
+    "Error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message"],
+      "properties": {
+        "code": {"$ref": "#/$defs/ErrorCode"},
+        "message": {"$ref": "#/$defs/OpaqueID"}
+      }
+    }
+  }
+}
