@@ -9,7 +9,7 @@ import (
 
 func TestParseEventFields(t *testing.T) {
 	event, err := ParseEvent([]byte(
-		`{"hook_event_name":" PermissionRequest ","session_id":" session-a ","turn_id":" turn-a ","source":" startup ","tool_name":" Bash ","ignored":"value"}`,
+		`{"hook_event_name":" PermissionRequest ","session_id":" session-a ","turn_id":" turn-a ","transcript_path":" /tmp/session.jsonl ","source":" startup ","tool_name":" Bash ","ignored":"value"}`,
 	))
 	if err != nil {
 		t.Fatalf("ParseEvent returned error: %v", err)
@@ -23,6 +23,9 @@ func TestParseEventFields(t *testing.T) {
 	}
 	if event.TurnID != "turn-a" {
 		t.Fatalf("TurnID = %q", event.TurnID)
+	}
+	if event.TranscriptPath != "/tmp/session.jsonl" {
+		t.Fatalf("TranscriptPath = %q", event.TranscriptPath)
 	}
 	if event.Source != "startup" {
 		t.Fatalf("Source = %q", event.Source)

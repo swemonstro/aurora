@@ -24,12 +24,27 @@ chmod 700 "$RUNTIME_BASE"
 SESSION_ID_FILE="$(mktemp "$RUNTIME_BASE/codex-session.XXXXXX")"
 chmod 600 "$SESSION_ID_FILE"
 export AURORA_CODEX_SESSION_ID_FILE="$SESSION_ID_FILE"
+export AURORA_CODEX_WATCHER_FILE="$SESSION_ID_FILE.watchers"
+export AURORA_CODEX_WRAPPER_PID="$$"
 
 cleanup() {
   local exit_status=$?
 
   if [ -s "$SESSION_ID_FILE" ] && [ -x "$HOOK_COMMAND" ]; then
     "$HOOK_COMMAND" --session-end-file "$SESSION_ID_FILE" >/dev/null 2>&1 || true
+  fi
+
+  if [ -d "$AURORA_CODEX_WATCHER_FILE" ]; then
+    for watcher_path in "$AURORA_CODEX_WATCHER_FILE"/*; do
+      [ -e "$watcher_path" ] || continue
+      watcher_pid="${watcher_path##*/}"
+      case "$watcher_pid" in
+        ''|*[!0-9]*) ;;
+        *) kill "$watcher_pid" 2>/dev/null || true ;;
+      esac
+      rm -f "$watcher_path"
+    done
+    rmdir "$AURORA_CODEX_WATCHER_FILE" 2>/dev/null || true
   fi
 
   rm -f "$SESSION_ID_FILE"

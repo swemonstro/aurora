@@ -138,3 +138,19 @@ func TestStoreReplacesOnlyMatchingSource(t *testing.T) {
 		t.Fatalf("State = %q, want %q", got.State, status.Attention)
 	}
 }
+
+func TestStoreRemovePreservesOtherSourcesAndCanBecomeEmpty(t *testing.T) {
+	var store Store
+	for _, source := range []string{"codex-api", "codex-business"} {
+		store.Set(presence.Snapshot{Source: source, State: status.Idle})
+	}
+	store.Remove("codex-api")
+	got, ok := store.Latest()
+	if !ok || got.Source != "codex-business" {
+		t.Fatalf("Latest = %#v, %t", got, ok)
+	}
+	store.Remove("codex-business")
+	if _, ok := store.Latest(); ok {
+		t.Fatal("store remained online after final source removal")
+	}
+}

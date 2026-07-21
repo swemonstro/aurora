@@ -21,12 +21,31 @@ const (
 )
 
 type Session struct {
-	State     status.State `json:"state"`
-	UpdatedAt time.Time    `json:"updated_at"`
+	State            status.State `json:"state"`
+	UpdatedAt        time.Time    `json:"updated_at"`
+	TurnID           string       `json:"turn_id,omitempty"`
+	TranscriptPath   string       `json:"transcript_path,omitempty"`
+	TranscriptOffset int64        `json:"transcript_offset,omitempty"`
+	Revision         uint64       `json:"revision,omitempty"`
 }
 
 type sessionState struct {
-	Sessions map[string]Session `json:"sessions"`
+	Sessions     map[string]Session `json:"sessions"`
+	NextRevision uint64             `json:"next_revision,omitempty"`
+}
+
+type PermissionWatch struct {
+	SessionID        string `json:"session_id"`
+	TurnID           string `json:"turn_id"`
+	TranscriptPath   string `json:"transcript_path"`
+	TranscriptOffset int64  `json:"transcript_offset"`
+	Revision         uint64 `json:"revision"`
+}
+
+type LifecycleUpdate struct {
+	State  status.State
+	Active bool
+	Watch  *PermissionWatch
 }
 
 type SessionStore struct {
@@ -51,45 +70,114 @@ func NewSessionStore(path string, ttl time.Duration) (*SessionStore, error) {
 }
 
 func (s *SessionStore) Update(event Event) (status.State, bool, error) {
+	update, supported, err := s.UpdateLifecycle(event)
+	return update.State, supported, err
+}
+
+func (s *SessionStore) UpdateLifecycle(event Event) (LifecycleUpdate, bool, error) {
 	action, supported := MapEvent(event)
 	if !supported {
-		return "", false, nil
+		return LifecycleUpdate{}, false, nil
 	}
 
 	directory := filepath.Dir(s.path)
 	if err := os.MkdirAll(directory, 0o700); err != nil {
-		return "", true, fmt.Errorf("create session state directory: %w", err)
+		return LifecycleUpdate{}, true, fmt.Errorf("create session state directory: %w", err)
 	}
 
 	lock, err := os.OpenFile(s.path+".lock", os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
-		return "", true, fmt.Errorf("open session state lock: %w", err)
+		return LifecycleUpdate{}, true, fmt.Errorf("open session state lock: %w", err)
 	}
 	defer lock.Close()
 
 	if err := lock.Chmod(0o600); err != nil {
-		return "", true, fmt.Errorf("set session state lock permissions: %w", err)
+		return LifecycleUpdate{}, true, fmt.Errorf("set session state lock permissions: %w", err)
 	}
 	if err := lockFile(lock, stateLockTimeout); err != nil {
-		return "", true, fmt.Errorf("lock session state: %w", err)
+		return LifecycleUpdate{}, true, fmt.Errorf("lock session state: %w", err)
 	}
 	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
 
 	state, err := s.read()
 	if err != nil {
-		return "", true, err
+		return LifecycleUpdate{}, true, err
 	}
 
 	now := s.now().UTC()
 	pruneStale(state.Sessions, now, s.ttl)
-	applyEvent(state.Sessions, event.SessionID, action, now)
+	watch := applyEvent(&state, event, action, now)
 	aggregate := Aggregate(state.Sessions)
 
 	if err := s.writeAtomic(directory, state); err != nil {
-		return "", true, err
+		return LifecycleUpdate{}, true, err
 	}
 
-	return aggregate, true, nil
+	return LifecycleUpdate{
+		State:  aggregate,
+		Active: len(state.Sessions) > 0,
+		Watch:  watch,
+	}, true, nil
+}
+
+func (s *SessionStore) PermissionPending(watch PermissionWatch) (bool, error) {
+	state, err := s.read()
+	if err != nil {
+		return false, err
+	}
+	return permissionMatches(state.Sessions[watch.SessionID], watch), nil
+}
+
+func (s *SessionStore) RecoverCancelled(watch PermissionWatch) (LifecycleUpdate, bool, error) {
+	directory := filepath.Dir(s.path)
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return LifecycleUpdate{}, false, fmt.Errorf("create session state directory: %w", err)
+	}
+
+	lock, err := os.OpenFile(s.path+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return LifecycleUpdate{}, false, fmt.Errorf("open session state lock: %w", err)
+	}
+	defer lock.Close()
+	if err := lock.Chmod(0o600); err != nil {
+		return LifecycleUpdate{}, false, fmt.Errorf("set session state lock permissions: %w", err)
+	}
+	if err := lockFile(lock, stateLockTimeout); err != nil {
+		return LifecycleUpdate{}, false, fmt.Errorf("lock session state: %w", err)
+	}
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+
+	state, err := s.read()
+	if err != nil {
+		return LifecycleUpdate{}, false, err
+	}
+	now := s.now().UTC()
+	pruneStale(state.Sessions, now, s.ttl)
+	session, exists := state.Sessions[watch.SessionID]
+	if !exists || !permissionMatches(session, watch) {
+		return LifecycleUpdate{}, false, nil
+	}
+
+	state.NextRevision++
+	state.Sessions[watch.SessionID] = Session{
+		State:     status.Idle,
+		UpdatedAt: now,
+		Revision:  state.NextRevision,
+	}
+	if err := s.writeAtomic(directory, state); err != nil {
+		return LifecycleUpdate{}, false, err
+	}
+	return LifecycleUpdate{
+		State:  Aggregate(state.Sessions),
+		Active: true,
+	}, true, nil
+}
+
+func permissionMatches(session Session, watch PermissionWatch) bool {
+	return session.State == status.Attention &&
+		session.TurnID == watch.TurnID &&
+		session.TranscriptPath == watch.TranscriptPath &&
+		session.Revision == watch.Revision
 }
 
 func (s *SessionStore) read() (sessionState, error) {
@@ -186,25 +274,55 @@ func (s *SessionStore) writeAtomic(directory string, state sessionState) error {
 }
 
 func applyEvent(
-	sessions map[string]Session,
-	rawSessionID string,
+	state *sessionState,
+	event Event,
 	action EventAction,
 	now time.Time,
-) {
-	sessionID := strings.TrimSpace(rawSessionID)
+) *PermissionWatch {
+	sessionID := strings.TrimSpace(event.SessionID)
 	if sessionID == "" {
-		return
+		return nil
 	}
 
 	if action.Remove {
-		delete(sessions, sessionID)
-		return
+		delete(state.Sessions, sessionID)
+		return nil
 	}
 
-	sessions[sessionID] = Session{
+	state.NextRevision++
+	session := Session{
 		State:     action.State,
 		UpdatedAt: now,
+		Revision:  state.NextRevision,
 	}
+	if event.HookEventName == "PermissionRequest" {
+		session.TurnID = strings.TrimSpace(event.TurnID)
+		session.TranscriptPath = strings.TrimSpace(event.TranscriptPath)
+		session.TranscriptOffset = transcriptEnd(session.TranscriptPath)
+	}
+	state.Sessions[sessionID] = session
+
+	if session.State != status.Attention || session.TurnID == "" || session.TranscriptPath == "" {
+		return nil
+	}
+	return &PermissionWatch{
+		SessionID:        sessionID,
+		TurnID:           session.TurnID,
+		TranscriptPath:   session.TranscriptPath,
+		TranscriptOffset: session.TranscriptOffset,
+		Revision:         session.Revision,
+	}
+}
+
+func transcriptEnd(path string) int64 {
+	if strings.TrimSpace(path) == "" {
+		return 0
+	}
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return 0
+	}
+	return info.Size()
 }
 
 func pruneStale(

@@ -12,8 +12,9 @@ Aurora must not transmit prompts, source code, file names, terminal output, or o
 
 ## Aurora Relay
 
-Aurora Relay is an in-memory HTTP service. Agents publish with `POST /presence`, and
-clients such as the ESP read the current aggregate snapshot with `GET /presence`.
+Aurora Relay is an in-memory HTTP service. Agents publish with `POST /presence`,
+remove an offline source with `DELETE /presence?source=<source>`, and clients such
+as the ESP read the current aggregate snapshot with `GET /presence`.
 
 The relay retains the latest snapshot separately for each `source`. With only one
 registered source, `GET /presence` returns that source's snapshot unchanged. With
@@ -168,9 +169,18 @@ Code sessions using this priority:
 error > attention > working > idle
 ```
 
+Hook delivery remains best effort and uses one bounded HTTP attempt. Lifecycle
+state is persisted before publication so concurrent hooks cannot publish stale
+revisions. If that attempt fails, the helper returns the error internally but the
+hook executable does not interrupt the source application; no durable retry is
+scheduled. A failed final deletion can therefore leave relay presence stale until
+a later lifecycle event corrects it or the in-memory relay restarts.
+
 Ending one session therefore does not publish idle while another session is working
-or needs attention. With no active sessions, the aggregate is idle. A missing
-session ID is not persisted as a synthetic global session.
+or needs attention. Idle means at least one recorded session is waiting. When the
+final session ends, the hook removes the Claude source from the relay instead of
+publishing idle. A missing session ID is not persisted as a synthetic global
+session.
 
 Hooks are global across Claude Code projects, so aggregation is keyed only by
 `session_id`; it is deliberately not scoped by working directory, repository,

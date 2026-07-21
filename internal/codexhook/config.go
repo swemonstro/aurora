@@ -14,6 +14,8 @@ const (
 	StateFileEnv     = "AURORA_CODEX_STATE_FILE"
 	SessionTTLEnv    = "AURORA_CODEX_SESSION_TTL"
 	SessionIDFileEnv = "AURORA_CODEX_SESSION_ID_FILE"
+	WatcherFileEnv   = "AURORA_CODEX_WATCHER_FILE"
+	WrapperPIDEnv    = "AURORA_CODEX_WRAPPER_PID"
 	DefaultSource    = "codex"
 	DefaultStateName = "codex-sessions.json"
 )

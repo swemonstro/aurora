@@ -48,6 +48,29 @@ func TestHTTPPublisherPostsSnapshot(t *testing.T) {
 	}
 }
 
+func TestHTTPPublisherDeletesOnlyRequestedSource(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete || r.URL.Path != "/presence" {
+			t.Errorf("request = %s %s", r.Method, r.URL.Path)
+		}
+		if got := r.URL.Query().Get("source"); got != "codex-business" {
+			t.Errorf("source = %q", got)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	publisher, err := NewHTTPPublisher(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := publisher.Remove(context.Background(), " codex-business "); err != nil {
+		t.Fatal(err)
+	}
+	if err := publisher.Remove(context.Background(), " "); err == nil {
+		t.Fatal("empty source was accepted")
+	}
+}
+
 func TestHTTPPublisherReturnsErrorForNon2xx(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "relay unavailable", http.StatusServiceUnavailable)

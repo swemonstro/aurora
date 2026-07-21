@@ -55,9 +55,30 @@ func (p *HTTPPublisher) Publish(ctx context.Context, snapshot presence.Snapshot)
 	}
 	request.Header.Set("Content-Type", "application/json")
 
+	return p.do(request, "post presence snapshot to relay")
+}
+
+func (p *HTTPPublisher) Remove(ctx context.Context, source string) error {
+	source = strings.TrimSpace(source)
+	if source == "" {
+		return fmt.Errorf("source must not be empty")
+	}
+
+	request, err := http.NewRequestWithContext(ctx, http.MethodDelete, p.endpoint, nil)
+	if err != nil {
+		return fmt.Errorf("create relay removal request: %w", err)
+	}
+	query := request.URL.Query()
+	query.Set("source", source)
+	request.URL.RawQuery = query.Encode()
+
+	return p.do(request, "delete presence source from relay")
+}
+
+func (p *HTTPPublisher) do(request *http.Request, operation string) error {
 	response, err := p.client.Do(request)
 	if err != nil {
-		return fmt.Errorf("post presence snapshot to relay: %w", err)
+		return fmt.Errorf("%s: %w", operation, err)
 	}
 	defer response.Body.Close()
 

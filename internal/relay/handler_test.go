@@ -167,6 +167,42 @@ func TestPresenceAggregatesDifferentSources(t *testing.T) {
 	}
 }
 
+func TestDeletePresenceRemovesOneSourceThenReturnsOffline(t *testing.T) {
+	store, handler := newTestHandler(t)
+	store.Set(presence.Snapshot{Source: "codex-api", State: status.Working})
+	store.Set(presence.Snapshot{Source: "claude-code", State: status.Idle})
+
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/presence?source=codex-api", nil))
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("DELETE status = %d", response.Code)
+	}
+	got, ok := store.Latest()
+	if !ok || got.Source != "claude-code" {
+		t.Fatalf("remaining presence = %#v, %t", got, ok)
+	}
+
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/presence?source=claude-code", nil))
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("final DELETE status = %d", response.Code)
+	}
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/presence", nil))
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("offline GET status = %d, want 404", response.Code)
+	}
+}
+
+func TestDeletePresenceRequiresSource(t *testing.T) {
+	_, handler := newTestHandler(t)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/presence", nil))
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", response.Code)
+	}
+}
+
 func TestPostPresenceRejectsInvalidSnapshots(t *testing.T) {
 	tests := []struct {
 		name string
@@ -323,7 +359,7 @@ func TestPostPresenceRejectsUnsupportedContentType(t *testing.T) {
 func TestPresenceRejectsUnsupportedMethod(t *testing.T) {
 	_, handler := newTestHandler(t)
 
-	request := httptest.NewRequest(http.MethodDelete, "/presence", nil)
+	request := httptest.NewRequest(http.MethodPatch, "/presence", nil)
 	response := httptest.NewRecorder()
 
 	handler.ServeHTTP(response, request)
@@ -335,8 +371,8 @@ func TestPresenceRejectsUnsupportedMethod(t *testing.T) {
 			http.StatusMethodNotAllowed,
 		)
 	}
-	if got := response.Header().Get("Allow"); got != "GET, POST" {
-		t.Fatalf("Allow = %q, want %q", got, "GET, POST")
+	if got := response.Header().Get("Allow"); got != "GET, POST, DELETE" {
+		t.Fatalf("Allow = %q, want %q", got, "GET, POST, DELETE")
 	}
 }
 

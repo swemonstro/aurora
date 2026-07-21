@@ -218,9 +218,72 @@ func TestPublicationFailureLeavesPersistedState(t *testing.T) {
 	}
 }
 
+func TestRunReturnsLifecyclePublicationAndRemovalFailures(t *testing.T) {
+	t.Run("publication", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(
+			writer http.ResponseWriter,
+			_ *http.Request,
+		) {
+			writer.WriteHeader(http.StatusServiceUnavailable)
+		}))
+		defer server.Close()
+		values := map[string]string{
+			claudehook.RelayURLEnv:  server.URL,
+			claudehook.StateFileEnv: filepath.Join(t.TempDir(), "sessions.json"),
+		}
+		err := run(
+			context.Background(),
+			strings.NewReader(`{"hook_event_name":"UserPromptSubmit","session_id":"session-a"}`),
+			func(key string) string { return values[key] },
+		)
+		if err == nil || !strings.Contains(err.Error(), "publish presence snapshot") {
+			t.Fatalf("error = %v, want publication failure", err)
+		}
+	})
+
+	t.Run("removal", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(
+			writer http.ResponseWriter,
+			request *http.Request,
+		) {
+			if request.Method == http.MethodDelete {
+				writer.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			writer.WriteHeader(http.StatusNoContent)
+		}))
+		defer server.Close()
+		values := map[string]string{
+			claudehook.RelayURLEnv:  server.URL,
+			claudehook.StateFileEnv: filepath.Join(t.TempDir(), "sessions.json"),
+		}
+		getenv := func(key string) string { return values[key] }
+		if err := run(
+			context.Background(),
+			strings.NewReader(`{"hook_event_name":"UserPromptSubmit","session_id":"session-a"}`),
+			getenv,
+		); err != nil {
+			t.Fatalf("seed lifecycle: %v", err)
+		}
+		err := run(
+			context.Background(),
+			strings.NewReader(`{"hook_event_name":"SessionEnd","session_id":"session-a"}`),
+			getenv,
+		)
+		if err == nil || !strings.Contains(err.Error(), "remove presence source") {
+			t.Fatalf("error = %v, want removal failure", err)
+		}
+	})
+}
+
 func TestConcurrentSessionFlow(t *testing.T) {
 	published := make(chan status.State, 5)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			published <- status.State("deleted")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		var snapshot presence.Snapshot
 		if err := json.NewDecoder(r.Body).Decode(&snapshot); err != nil {
 			t.Errorf("decode snapshot: %v", err)
@@ -244,7 +307,7 @@ func TestConcurrentSessionFlow(t *testing.T) {
 		{payload: `{"hook_event_name":"UserPromptSubmit","session_id":"session-b"}`, want: status.Working},
 		{payload: `{"hook_event_name":"Stop","session_id":"session-b"}`, want: status.Working},
 		{payload: `{"hook_event_name":"SessionEnd","session_id":"session-b"}`, want: status.Working},
-		{payload: `{"hook_event_name":"SessionEnd","session_id":"session-a"}`, want: status.Idle},
+		{payload: `{"hook_event_name":"SessionEnd","session_id":"session-a"}`, want: status.State("deleted")},
 	}
 	for index, event := range events {
 		run(context.Background(), strings.NewReader(event.payload), func(key string) string { return values[key] })

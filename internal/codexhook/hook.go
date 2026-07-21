@@ -11,11 +11,12 @@ import (
 )
 
 type Event struct {
-	HookEventName string `json:"hook_event_name"`
-	SessionID     string `json:"session_id"`
-	TurnID        string `json:"turn_id"`
-	Source        string `json:"source"`
-	ToolName      string `json:"tool_name"`
+	HookEventName  string `json:"hook_event_name"`
+	SessionID      string `json:"session_id"`
+	TurnID         string `json:"turn_id"`
+	TranscriptPath string `json:"transcript_path"`
+	Source         string `json:"source"`
+	ToolName       string `json:"tool_name"`
 }
 
 type EventAction struct {
@@ -50,6 +51,7 @@ func ParseEvent(input []byte) (Event, error) {
 	event.HookEventName = strings.TrimSpace(event.HookEventName)
 	event.SessionID = strings.TrimSpace(event.SessionID)
 	event.TurnID = strings.TrimSpace(event.TurnID)
+	event.TranscriptPath = strings.TrimSpace(event.TranscriptPath)
 	event.Source = strings.TrimSpace(event.Source)
 	event.ToolName = strings.TrimSpace(event.ToolName)
 

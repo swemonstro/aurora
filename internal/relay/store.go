@@ -24,6 +24,13 @@ func (s *Store) Set(snapshot presence.Snapshot) {
 	s.snapshots[snapshot.Source] = snapshot
 }
 
+func (s *Store) Remove(source string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	delete(s.snapshots, source)
+}
+
 func (s *Store) Latest() (presence.Snapshot, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

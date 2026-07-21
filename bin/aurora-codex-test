@@ -14,6 +14,11 @@ printf '%s\n' "$AURORA_CODEX_SOURCE" >"$TEST_OUTPUT/source"
 printf '%s\n' "$AURORA_CODEX_STATE_FILE" >"$TEST_OUTPUT/state"
 printf '%s\n' "$*" >"$TEST_OUTPUT/args"
 printf '%s\n' "session-test" >"$AURORA_CODEX_SESSION_ID_FILE"
+mkdir -p "$AURORA_CODEX_WATCHER_FILE"
+sleep 30 &
+watcher_pid=$!
+touch "$AURORA_CODEX_WATCHER_FILE/$watcher_pid"
+printf '%s\n' "$watcher_pid" >"$TEST_OUTPUT/watcher-pid"
 exit "${TEST_CODEX_EXIT:-0}"
 EOF
 
@@ -31,6 +36,7 @@ chmod +x "$TMP/fake-codex" "$TMP/fake-hook"
 mkdir -p "$TMP/output"
 
 set +e
+env -u AURORA_CODEX_SOURCE -u AURORA_CODEX_STATE_FILE \
 HOME="$TMP/home" \
 XDG_RUNTIME_DIR="$TMP/runtime" \
 CODEX_HOME="$TMP/home/.codex-business" \
@@ -53,6 +59,12 @@ test "$(cat "$TMP/output/hook-session")" = "session-test"
 
 if find "$TMP/runtime" -name 'codex-session.*' -print -quit | grep -q .; then
   echo "temporary session file was not removed" >&2
+  exit 1
+fi
+
+watcher_pid="$(cat "$TMP/output/watcher-pid")"
+if kill -0 "$watcher_pid" 2>/dev/null; then
+  echo "watcher process was not stopped" >&2
   exit 1
 fi
 

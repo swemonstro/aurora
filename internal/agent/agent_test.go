@@ -13,11 +13,17 @@ import (
 
 type recordingPublisher struct {
 	snapshot presence.Snapshot
+	removed  string
 	err      error
 }
 
 func (p *recordingPublisher) Publish(_ context.Context, snapshot presence.Snapshot) error {
 	p.snapshot = snapshot
+	return p.err
+}
+
+func (p *recordingPublisher) Remove(_ context.Context, source string) error {
+	p.removed = source
 	return p.err
 }
 
@@ -85,6 +91,20 @@ func TestHandleReturnsPublisherError(t *testing.T) {
 	err = instance.Handle(context.Background(), "working")
 	if !errors.Is(err, publishErr) {
 		t.Fatalf("Handle error = %v, want wrapped publisher error", err)
+	}
+}
+
+func TestHandleLifecycleRemovesInactiveSource(t *testing.T) {
+	publisher := &recordingPublisher{}
+	instance, err := New("codex-api", publisher, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := instance.HandleLifecycle(context.Background(), "idle", false); err != nil {
+		t.Fatal(err)
+	}
+	if publisher.removed != "codex-api" {
+		t.Fatalf("removed source = %q", publisher.removed)
 	}
 }
 

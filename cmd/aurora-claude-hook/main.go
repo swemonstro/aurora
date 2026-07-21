@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -10,18 +11,20 @@ import (
 	"github.com/swemonstro/aurora/internal/agent"
 	"github.com/swemonstro/aurora/internal/claudehook"
 	"github.com/swemonstro/aurora/internal/publish"
+	"github.com/swemonstro/aurora/internal/sourcelifecycle"
 )
 
 const hookTimeout = time.Second
+const lifecycleLockTimeout = 3 * time.Second
 
 func main() {
-	run(context.Background(), os.Stdin, os.Getenv)
+	_ = run(context.Background(), os.Stdin, os.Getenv)
 }
 
-func run(ctx context.Context, input io.Reader, getenv func(string) string) {
+func run(ctx context.Context, input io.Reader, getenv func(string) string) error {
 	rawInput, err := claudehook.ReadInput(input)
 	if err != nil {
-		return
+		return err
 	}
 
 	if captureDirectory := claudehook.CaptureDirectoryFromEnv(getenv); captureDirectory != "" {
@@ -30,34 +33,44 @@ func run(ctx context.Context, input io.Reader, getenv func(string) string) {
 
 	event, err := claudehook.ParseEvent(rawInput)
 	if err != nil {
-		return
+		return err
 	}
 	stateConfig, err := claudehook.StateConfigFromEnv(getenv, os.UserHomeDir)
 	if err != nil {
-		return
+		return err
 	}
 	store, err := claudehook.NewSessionStore(stateConfig.Path, stateConfig.TTL)
 	if err != nil {
-		return
+		return err
 	}
-	state, supported, err := store.Update(event)
-	if err != nil || !supported {
-		return
-	}
-
 	config := claudehook.ConfigFromEnv(getenv)
+	return sourcelifecycle.WithLock(stateConfig.Path, lifecycleLockTimeout, func() error {
+		update, supported, updateErr := store.UpdateLifecycle(event)
+		if updateErr != nil || !supported {
+			return updateErr
+		}
+		return publishLifecycle(ctx, config, update)
+	})
+}
+
+func publishLifecycle(
+	ctx context.Context,
+	config claudehook.Config,
+	update claudehook.LifecycleUpdate,
+) error {
 	client := &http.Client{Timeout: hookTimeout}
 	publisher, err := publish.NewHTTPPublisher(config.RelayURL, client)
 	if err != nil {
-		return
+		return fmt.Errorf("create lifecycle publisher: %w", err)
 	}
-
 	instance, err := agent.New(config.Source, publisher, time.Now)
 	if err != nil {
-		return
+		return fmt.Errorf("create lifecycle agent: %w", err)
 	}
-
 	publishCtx, cancel := context.WithTimeout(ctx, hookTimeout)
 	defer cancel()
-	_ = instance.Handle(publishCtx, string(state))
+	if err := instance.HandleLifecycle(publishCtx, string(update.State), update.Active); err != nil {
+		return fmt.Errorf("handle lifecycle: %w", err)
+	}
+	return nil
 }

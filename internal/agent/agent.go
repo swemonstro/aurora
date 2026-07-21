@@ -58,3 +58,20 @@ func (a *Agent) Handle(ctx context.Context, event string) error {
 
 	return nil
 }
+
+// HandleLifecycle publishes the aggregate while a source has sessions and
+// removes the source from the relay after its final session ends.
+func (a *Agent) HandleLifecycle(ctx context.Context, event string, active bool) error {
+	if active {
+		return a.Handle(ctx, event)
+	}
+
+	remover, ok := a.publisher.(publish.SourceRemover)
+	if !ok {
+		return fmt.Errorf("publisher does not support source removal")
+	}
+	if err := remover.Remove(ctx, a.source); err != nil {
+		return fmt.Errorf("remove presence source: %w", err)
+	}
+	return nil
+}

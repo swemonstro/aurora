@@ -42,6 +42,11 @@ type SessionStore struct {
 	now  func() time.Time
 }
 
+type LifecycleUpdate struct {
+	State  status.State
+	Active bool
+}
+
 func StateConfigFromEnv(getenv func(string) string, userHomeDir func() (string, error)) (StateConfig, error) {
 	home, err := userHomeDir()
 	if err != nil {
@@ -78,41 +83,46 @@ func NewSessionStore(path string, ttl time.Duration) (*SessionStore, error) {
 }
 
 func (s *SessionStore) Update(event Event) (status.State, bool, error) {
+	update, supported, err := s.UpdateLifecycle(event)
+	return update.State, supported, err
+}
+
+func (s *SessionStore) UpdateLifecycle(event Event) (LifecycleUpdate, bool, error) {
 	action, supported := MapEvent(event)
 	if !supported {
-		return "", false, nil
+		return LifecycleUpdate{}, false, nil
 	}
 
 	directory := filepath.Dir(s.path)
 	if err := os.MkdirAll(directory, 0o700); err != nil {
-		return "", true, fmt.Errorf("create session state directory: %w", err)
+		return LifecycleUpdate{}, true, fmt.Errorf("create session state directory: %w", err)
 	}
 
 	lock, err := os.OpenFile(s.path+".lock", os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
-		return "", true, fmt.Errorf("open session state lock: %w", err)
+		return LifecycleUpdate{}, true, fmt.Errorf("open session state lock: %w", err)
 	}
 	defer lock.Close()
 	if err := lock.Chmod(0o600); err != nil {
-		return "", true, fmt.Errorf("set session state lock permissions: %w", err)
+		return LifecycleUpdate{}, true, fmt.Errorf("set session state lock permissions: %w", err)
 	}
 	if err := lockFile(lock, stateLockTimeout); err != nil {
-		return "", true, fmt.Errorf("lock session state: %w", err)
+		return LifecycleUpdate{}, true, fmt.Errorf("lock session state: %w", err)
 	}
 	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
 
 	state, err := s.read()
 	if err != nil {
-		return "", true, err
+		return LifecycleUpdate{}, true, err
 	}
 	now := s.now().UTC()
 	pruneStale(state.Sessions, now, s.ttl)
 	applyEvent(state.Sessions, event.SessionID, action, now)
 	aggregate := Aggregate(state.Sessions)
 	if err := s.writeAtomic(directory, state); err != nil {
-		return "", true, err
+		return LifecycleUpdate{}, true, err
 	}
-	return aggregate, true, nil
+	return LifecycleUpdate{State: aggregate, Active: len(state.Sessions) > 0}, true, nil
 }
 
 func (s *SessionStore) read() (sessionState, error) {

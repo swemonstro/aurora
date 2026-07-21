@@ -40,10 +40,23 @@ func (h *Handler) handlePresence(w http.ResponseWriter, r *http.Request) {
 		h.getPresence(w)
 	case http.MethodPost:
 		h.postPresence(w, r)
+	case http.MethodDelete:
+		h.deletePresence(w, r)
 	default:
-		w.Header().Set("Allow", "GET, POST")
+		w.Header().Set("Allow", "GET, POST, DELETE")
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+func (h *Handler) deletePresence(w http.ResponseWriter, r *http.Request) {
+	source := strings.TrimSpace(r.URL.Query().Get("source"))
+	if source == "" {
+		writeError(w, http.StatusBadRequest, "source must not be empty")
+		return
+	}
+
+	h.store.Remove(source)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *Handler) getPresence(w http.ResponseWriter) {

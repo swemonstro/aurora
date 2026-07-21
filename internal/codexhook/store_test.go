@@ -120,6 +120,18 @@ func TestSessionEndRemovesOnlyMatchingSession(t *testing.T) {
 	}
 }
 
+func TestFinalSessionEndReportsInactiveSource(t *testing.T) {
+	store := newTestStore(t)
+	mustUpdate(t, store, Event{HookEventName: "SessionStart", SessionID: "a"})
+	update, supported, err := store.UpdateLifecycle(Event{HookEventName: "SessionEnd", SessionID: "a"})
+	if err != nil || !supported {
+		t.Fatalf("UpdateLifecycle: supported=%t err=%v", supported, err)
+	}
+	if update.Active {
+		t.Fatalf("update = %#v, want inactive", update)
+	}
+}
+
 func TestBlankSessionIDDoesNotCreateSession(t *testing.T) {
 	store := newTestStore(t)
 
