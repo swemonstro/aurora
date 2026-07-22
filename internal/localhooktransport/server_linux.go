@@ -27,6 +27,7 @@ type Logger interface {
 type Server struct {
 	config        Config
 	receiver      *Receiver
+	ingest        *IngestReceiver
 	authenticator Authenticator
 	logger        Logger
 	listener      *ownedListener
@@ -54,6 +55,28 @@ func NewServer(config Config, receiver *Receiver, authenticator Authenticator, l
 		listener: listener, semaphore: make(chan struct{}, config.MaximumConcurrent), done: make(chan struct{}),
 		closeFinished: make(chan struct{}),
 	}, nil
+}
+
+// EnableIngest attaches Package 6 observe-only ingress handling to this server.
+// Legacy v1 correlate_observation handling is unchanged.
+func (server *Server) EnableIngest(config IngestServerConfig) error {
+	if server == nil {
+		return errors.New("server must not be nil")
+	}
+	receiver, err := NewIngestReceiver(config)
+	if err != nil {
+		return err
+	}
+	server.ingest = receiver
+	return nil
+}
+
+// IngestReceiver returns the attached Package 6 receiver, if any.
+func (server *Server) IngestReceiver() *IngestReceiver {
+	if server == nil {
+		return nil
+	}
+	return server.ingest
 }
 
 func (server *Server) Serve(ctx context.Context) error {
@@ -112,6 +135,13 @@ func (server *Server) handleAuthenticated(connection *net.UnixConn) {
 		server.writeImmediate(connection, emptyResponse(StatusRejected, "", errorCode(err)))
 		return
 	}
+
+	version, versionErr := peekProtocolVersion(data)
+	if versionErr == nil && version == IngestProtocolVersion {
+		server.handleIngest(connection, data, started)
+		return
+	}
+
 	handleCtx, cancel := context.WithTimeout(context.Background(), server.config.MaximumHandlingTime)
 	response := server.receiver.HandleJSON(handleCtx, data)
 	cancel()
@@ -123,6 +153,51 @@ func (server *Server) handleAuthenticated(connection *net.UnixConn) {
 	}
 	_ = writeFrame(connection, encoded, server.config.MaximumResponseBytes)
 	server.logEventForResponse(response, server.config.Clock.Now().Sub(started))
+}
+
+func (server *Server) handleIngest(connection *net.UnixConn, data []byte, started time.Time) {
+	if server.ingest == nil {
+		response := emptyIngestResponse(StatusRejected, "", CodeUnsupportedOperation)
+		server.writeIngestImmediate(connection, response)
+		server.logIngestEvent(response, server.config.Clock.Now().Sub(started))
+		return
+	}
+	handleCtx, cancel := context.WithTimeout(context.Background(), server.ingest.config.MaximumHandlingTime)
+	response := server.ingest.HandleJSON(handleCtx, data)
+	cancel()
+	_ = connection.SetWriteDeadline(server.config.Clock.Now().Add(server.config.WriteDeadline))
+	encoded, err := EncodeIngestResponseJSON(response, server.ingest.config.MaximumResponseBytes)
+	if err != nil {
+		response = emptyIngestResponse(StatusError, response.RequestID, CodeResponseTooLarge)
+		encoded, _ = EncodeIngestResponseJSON(response, server.ingest.config.MaximumResponseBytes)
+	}
+	_ = writeFrame(connection, encoded, server.ingest.config.MaximumResponseBytes)
+	server.logIngestEvent(response, server.config.Clock.Now().Sub(started))
+}
+
+func (server *Server) writeIngestImmediate(connection *net.UnixConn, response IngestResponse) {
+	_ = connection.SetWriteDeadline(server.config.Clock.Now().Add(server.config.WriteDeadline))
+	maximum := uint32(DefaultIngestMaximumResponseBytes)
+	if server.ingest != nil {
+		maximum = server.ingest.config.MaximumResponseBytes
+	}
+	data, err := EncodeIngestResponseJSON(response, maximum)
+	if err == nil {
+		_ = writeFrame(connection, data, maximum)
+	}
+}
+
+func (server *Server) logIngestEvent(response IngestResponse, duration time.Duration) {
+	event := LogEvent{
+		Accepted:       response.Status == StatusOK || response.Status == StatusDuplicate,
+		Status:         response.Status,
+		Protocol:       response.ProtocolVersion,
+		DurationBucket: durationBucket(duration),
+	}
+	for _, code := range response.ErrorCodes {
+		event.ReasonCodes = append(event.ReasonCodes, string(code))
+	}
+	server.log(event)
 }
 
 func (server *Server) writeImmediate(connection *net.UnixConn, response Response) {

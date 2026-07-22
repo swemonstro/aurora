@@ -5,8 +5,12 @@ package main
 import (
 	"bytes"
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/swemonstro/aurora/internal/localhooktransport"
 )
 
 func TestRunRequiresExplicitIdentityAndSafeSocketDefault(t *testing.T) {
@@ -25,4 +29,122 @@ func TestHelpStatesObserveOnly(t *testing.T) {
 	if !strings.Contains(output.String(), "observe-only") || !strings.Contains(output.String(), "never performs a binding") {
 		t.Fatalf("help = %s", output.String())
 	}
+}
+
+func TestIngestRemainsDisabledWhenFeatureFlagUnsetOrFalse(t *testing.T) {
+	for _, value := range []string{"", "0", "false", "yes"} {
+		t.Run("value_"+value, func(t *testing.T) {
+			socketPath := testSocketPath(t)
+			var stderr bytes.Buffer
+			server, err := composeServer(
+				[]string{"-host-id", "host-fixture", "-socket", socketPath},
+				&stderr,
+				func(key string) string {
+					if key == localhooktransport.EnvLocalHookEnabled {
+						return value
+					}
+					return ""
+				},
+			)
+			if err != nil {
+				t.Fatalf("composeServer() error = %v stderr=%s", err, stderr.String())
+			}
+			defer server.Close()
+			if server.IngestReceiver() != nil {
+				t.Fatalf("ingest enabled for flag value %q", value)
+			}
+		})
+	}
+}
+
+func TestIngestEnabledWhenFeatureFlagTrue(t *testing.T) {
+	for _, value := range []string{"1", "true", "TRUE", " true "} {
+		t.Run("value_"+strings.TrimSpace(value), func(t *testing.T) {
+			socketPath := testSocketPath(t)
+			var stderr bytes.Buffer
+			server, err := composeServer(
+				[]string{"-host-id", "host-fixture", "-socket", socketPath},
+				&stderr,
+				func(key string) string {
+					if key == localhooktransport.EnvLocalHookEnabled {
+						return value
+					}
+					return ""
+				},
+			)
+			if err != nil {
+				t.Fatalf("composeServer() error = %v stderr=%s", err, stderr.String())
+			}
+			defer server.Close()
+			if server.IngestReceiver() == nil {
+				t.Fatalf("ingest disabled for flag value %q", value)
+			}
+		})
+	}
+}
+
+func TestLegacyStartupValidWithAndWithoutIngest(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		enabled string
+		want    bool
+	}{
+		{name: "legacy default", enabled: "", want: false},
+		{name: "package 6 enabled", enabled: "true", want: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			socketPath := testSocketPath(t)
+			var stderr bytes.Buffer
+			server, err := composeServer(
+				[]string{"-host-id", "host-fixture", "-socket", socketPath},
+				&stderr,
+				func(key string) string {
+					if key == localhooktransport.EnvLocalHookEnabled {
+						return test.enabled
+					}
+					return ""
+				},
+			)
+			if err != nil {
+				t.Fatalf("composeServer() error = %v stderr=%s", err, stderr.String())
+			}
+			defer server.Close()
+			if got := server.IngestReceiver() != nil; got != test.want {
+				t.Fatalf("ingest attached = %t, want %t", got, test.want)
+			}
+			// Serving must start and stop cleanly for both compositions.
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() { done <- server.Serve(ctx) }()
+			cancel()
+			if err := <-done; err != nil {
+				t.Fatalf("Serve() error = %v", err)
+			}
+		})
+	}
+}
+
+func testSocketPath(t *testing.T) string {
+	t.Helper()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	home, err = filepath.EvalSymlinks(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory, err := os.MkdirTemp(home, ".aurora-presence-local-server-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(directory); err != nil {
+			t.Errorf("remove test directory: %v", err)
+		}
+	})
+	return filepath.Join(directory, "presence-hook.sock")
 }

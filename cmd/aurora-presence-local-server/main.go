@@ -39,6 +39,16 @@ func main() {
 }
 
 func run(ctx context.Context, arguments []string, stdout, stderr io.Writer, getenv func(string) string) error {
+	server, err := composeServer(arguments, stderr, getenv)
+	if err != nil {
+		return err
+	}
+	defer server.Close()
+	fmt.Fprintln(stdout, "Aurora local hook receiver: observe-only, foreground, no binding performed")
+	return server.Serve(ctx)
+}
+
+func composeServer(arguments []string, stderr io.Writer, getenv func(string) string) (*localhooktransport.Server, error) {
 	flags := flag.NewFlagSet("aurora-presence-local-server", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	socketPath := flags.String("socket", "", "absolute private Unix socket path; defaults below XDG_RUNTIME_DIR")
@@ -51,21 +61,21 @@ func run(ctx context.Context, arguments []string, stdout, stderr io.Writer, gete
 		flags.PrintDefaults()
 	}
 	if err := flags.Parse(arguments); err != nil {
-		return err
+		return nil, err
 	}
 	if *hostID == "" {
 		flags.Usage()
-		return errors.New("host-id is required")
+		return nil, errors.New("host-id is required")
 	}
 	if *socketPath == "" {
 		runtimeDirectory := getenv("XDG_RUNTIME_DIR")
 		if runtimeDirectory == "" || !filepath.IsAbs(runtimeDirectory) {
-			return errors.New("socket is required when XDG_RUNTIME_DIR is unavailable")
+			return nil, errors.New("socket is required when XDG_RUNTIME_DIR is unavailable")
 		}
 		*socketPath = filepath.Join(runtimeDirectory, "aurora", "presence-hook.sock")
 	}
 	if err := localhooktransport.PrepareSocketDirectory(*socketPath); err != nil {
-		return err
+		return nil, err
 	}
 	clock := systemClock{}
 	adapter, err := linuxprocess.New(linuxprocess.Config{
@@ -73,31 +83,37 @@ func run(ctx context.Context, arguments []string, stdout, stderr io.Writer, gete
 		LaunchIdentityRules: append(claudehook.LaunchIdentityRules(), codexhook.LaunchIdentityRules()...),
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	correlator, err := instancecorrelation.New(instancecorrelation.DefaultConfig())
 	if err != nil {
-		return err
+		return nil, err
 	}
 	config := localhooktransport.DefaultConfig(clock)
 	config.SocketPath = *socketPath
 	runtimeSource, err := runtimerecognition.NewSource(adapter, *hostID, claudehook.RuntimeRecognizer(), codexhook.RuntimeRecognizer())
 	if err != nil {
-		return err
+		return nil, err
 	}
 	service, err := localhooktransport.NewCorrelationService(runtimeSource, correlator, clock, config.MaximumRuntimes)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	receiver, err := localhooktransport.NewReceiver(config, service)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	server, err := localhooktransport.NewServer(config, receiver, localhooktransport.DefaultAuthenticator(), nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer server.Close()
-	fmt.Fprintln(stdout, "Aurora local hook receiver: observe-only, foreground, no binding performed")
-	return server.Serve(ctx)
+	// Package 6 ingest stays off by default. Enable only when the same feature
+	// flag used by hook clients is explicitly on.
+	if localhooktransport.LocalHookEnabled(getenv(localhooktransport.EnvLocalHookEnabled)) {
+		if err := server.EnableIngest(localhooktransport.DefaultIngestServerConfig(clock)); err != nil {
+			_ = server.Close()
+			return nil, err
+		}
+	}
+	return server, nil
 }
