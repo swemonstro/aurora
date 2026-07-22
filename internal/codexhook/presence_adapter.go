@@ -17,6 +17,20 @@ func LocalHookObservation(event Event, metadata hookadapter.Metadata) (hookadapt
 	return hookadapter.ObservationFromLifecycle(instancepresence.ToolCodex, event.SessionID, action.Remove, action.State, metadata)
 }
 
+// LocalIngressObservation maps a verified Codex lifecycle event to the minimal
+// Package 6 ingress. Provider SessionEnd is intentionally not sent locally;
+// the wrapper's synthetic SessionEnd remains a legacy v1-only source.
+func LocalIngressObservation(event Event) (hookadapter.IngressObservation, error) {
+	if event.HookEventName == "SessionEnd" {
+		return hookadapter.IngressObservation{}, errors.New("Codex SessionEnd is not accepted for Package 6 ingress")
+	}
+	action, supported := MapEvent(event)
+	if !supported {
+		return hookadapter.IngressObservation{}, errors.New("unsupported Codex lifecycle event")
+	}
+	return hookadapter.IngressFromLifecycle(instancepresence.ToolCodex, event.SessionID, action.Remove, action.State)
+}
+
 func LaunchIdentityRules() []runtimerecognition.LaunchIdentityRule {
 	return []runtimerecognition.LaunchIdentityRule{
 		{Mode: runtimerecognition.LaunchRulePackagePath, Value: "@openai/codex", Identity: "launch:openai-codex", Argument: runtimerecognition.LaunchArgumentEntrypoint, Launchers: []string{"node", "nodejs"}},

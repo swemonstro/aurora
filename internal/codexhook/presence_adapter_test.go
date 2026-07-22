@@ -33,6 +33,25 @@ func TestLocalHookObservationRejectsMissingCodexSession(t *testing.T) {
 	}
 }
 
+func TestLocalIngressObservationRejectsSessionEndAndMapsLifecycle(t *testing.T) {
+	if _, err := LocalIngressObservation(Event{HookEventName: "SessionEnd", SessionID: "session-a"}); err == nil {
+		t.Fatal("Codex SessionEnd accepted for Package 6 ingress")
+	}
+	observation, err := LocalIngressObservation(Event{HookEventName: "UserPromptSubmit", SessionID: "session-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observation.Tool != instancepresence.ToolCodex || observation.HookSessionRef != "session-a" || observation.Lifecycle != instancecorrelation.LifecycleActive {
+		t.Fatalf("observation = %#v", observation)
+	}
+	if _, err := LocalIngressObservation(Event{HookEventName: "Stop", SessionID: "session-a"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LocalIngressObservation(Event{HookEventName: "FutureEvent", SessionID: "session-a"}); err == nil {
+		t.Fatal("unsupported event accepted")
+	}
+}
+
 func TestCodexWrapperLaunchRulesExcludeNPMAndAllowNPX(t *testing.T) {
 	var rule runtimerecognition.LaunchIdentityRule
 	for _, candidate := range LaunchIdentityRules() {

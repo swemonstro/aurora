@@ -45,6 +45,25 @@ func TestLocalHookObservationMapsClaudeActive(t *testing.T) {
 	}
 }
 
+func TestLocalIngressObservationMapsClaudeWithoutMetadata(t *testing.T) {
+	observation, err := LocalIngressObservation(Event{HookEventName: "UserPromptSubmit", SessionID: "session-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observation.Tool != instancepresence.ToolClaude || observation.HookSessionRef != "session-a" || observation.Lifecycle != instancecorrelation.LifecycleActive {
+		t.Fatalf("observation = %#v", observation)
+	}
+	if observation, err := LocalIngressObservation(Event{HookEventName: "SessionEnd", SessionID: "session-a"}); err != nil || observation.Lifecycle != instancecorrelation.LifecycleEnded {
+		t.Fatalf("session end = %#v err=%v", observation, err)
+	}
+	if _, err := LocalIngressObservation(Event{HookEventName: "unsupported", SessionID: "session-a"}); err == nil {
+		t.Fatal("unsupported event accepted")
+	}
+	if _, err := LocalIngressObservation(Event{HookEventName: "Stop"}); err == nil {
+		t.Fatal("missing session accepted")
+	}
+}
+
 func TestClaudeWrapperLaunchRulesExcludeNPMAndAllowNPX(t *testing.T) {
 	var rule runtimerecognition.LaunchIdentityRule
 	for _, candidate := range LaunchIdentityRules() {

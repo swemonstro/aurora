@@ -17,6 +17,16 @@ func LocalHookObservation(event Event, metadata hookadapter.Metadata) (hookadapt
 	return hookadapter.ObservationFromLifecycle(instancepresence.ToolClaude, event.SessionID, action.Remove, action.State, metadata)
 }
 
+// LocalIngressObservation maps a verified Claude event to the minimal Package 6
+// ingress. Unsupported events and missing sessions are not sent.
+func LocalIngressObservation(event Event) (hookadapter.IngressObservation, error) {
+	action, supported := MapEvent(event)
+	if !supported {
+		return hookadapter.IngressObservation{}, errors.New("unsupported Claude lifecycle event")
+	}
+	return hookadapter.IngressFromLifecycle(instancepresence.ToolClaude, event.SessionID, action.Remove, action.State)
+}
+
 func LaunchIdentityRules() []runtimerecognition.LaunchIdentityRule {
 	return []runtimerecognition.LaunchIdentityRule{
 		{Mode: runtimerecognition.LaunchRulePackagePath, Value: "@anthropic-ai/claude-code", Identity: "launch:anthropic-claude-code", Argument: runtimerecognition.LaunchArgumentEntrypoint, Launchers: []string{"node", "nodejs"}},

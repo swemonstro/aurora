@@ -152,21 +152,6 @@ func statSocketIdentity(path string, requirePermissions bool) (socketIdentity, e
 	return socketIdentity{device: uint64(stat.Dev), inode: stat.Ino, uid: stat.Uid}, nil
 }
 
-func validateSocketPathSyntax(socketPath string) error {
-	if socketPath == "" || !filepath.IsAbs(socketPath) || filepath.Clean(socketPath) != socketPath {
-		return ErrInsecureSocketPath
-	}
-	for _, component := range strings.Split(socketPath, string(filepath.Separator)) {
-		if component == ".." {
-			return ErrInsecureSocketPath
-		}
-	}
-	if filepath.Base(socketPath) == "." || filepath.Base(socketPath) == string(filepath.Separator) {
-		return ErrInsecureSocketPath
-	}
-	return nil
-}
-
 func validatePrivateDirectory(directory string, expectedUID uint32) error {
 	fd, err := openDirectoryNoFollow(directory)
 	if err != nil {
