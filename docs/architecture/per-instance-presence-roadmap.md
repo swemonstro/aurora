@@ -37,7 +37,7 @@ produktion.
 | 4.5 | Produktgräns, lagerkontrakt och kanonisk roadmap | ja | ja | ja | nej |
 | 5 | Refaktorer A–C: runtimekälla, recognition, agentadapters och transportgränser | ja | ja | ja | nej |
 | 6 | Verklig lokal hook-ingress med receiverägd sequencing och bounded best-effort-klient | ja | nej | nej | nej |
-| 7 | Säker binding policy och korrelationslivscykel | ja | nej | nej | nej |
+| 7 | Säker binding policy och korrelationslivscykel (docs-first kontrakt) | ja | delvis (docs) | nej | nej |
 | 8 | Registry- och slotmutation bakom separat aktivering | ja | nej | nej | nej |
 
 Paket 1:s register är inte kopplat till relayns v1-runtime eller till Paket
@@ -114,16 +114,36 @@ installera eller aktivera någon tjänst.
 
 ### Paket 7 — säker binding policy och korrelationslivscykel
 
-Paket 7 ska definiera och verifiera när en sanerad hookobservation över huvud
-taget får betraktas som bindningsbar, hur osäkerhet och lifecycle hanteras samt
-vilken starkare deduplicering och proveniens som krävs före mutation. Paketet
-får inte smyga in registrymutation; den hör till Paket 8.
+[Paket 7](per-instance-presence-package-7.md) definierar det normativa
+kontraktet för när en sanerad hookobservation får betraktas som säkert
+bindningsbar till exakt en lokal runtimeinstans. Kontraktet omfattar:
+
+- hård identitet och fail-closed-regler;
+- confidence- och ambiguitetsgränser;
+- noll/en/flera runtimes och samtidiga sessioner;
+- stale-fönster och lifecycle (`active` / `idle` / `ended`);
+- keep / suspend / replace / remove för befintliga beslut;
+- innehållsfri audit och bounded in-memory decision state;
+- strikt gräns mot Paket 8: beslut och förslag utan registry- eller slotmutation.
+
+Normativ dokumentation finns; implementation, integration och aktivering saknas.
+`would_bind_under_current_threshold` från Paket 3 förblir diagnostik och är inte
+bindningsauktorisation. Paket 6 som den är implementerad ger ingen
+serverattesterad hård processidentitet i ingressen; med endast Paket 0–6 ska
+Paket 7 fail-closed och inte avge `propose_bind` för nya associationer förrän en
+uttrycklig trusted identity-brygga finns. `replace` är ett atomärt
+policybeslut; Paket 8 styr mutationsapplikation. Åldersfönster, grace, TTL,
+kapaciteter och exact-vs-strong är föreslagna mätdefaults som kräver mänskligt
+godkännande före muterande konsumtion. Paket 7 får inte mutera registry, slots,
+hookclaims, runtimeclaims eller publicera till relay/v2. Implementeringsarbete
+förutsätter att Paket 6:s exitkriterier är uppfyllda och granskade.
 
 ### Paket 8 — registry- och slotmutation
 
 Paket 8 får först efter separat säkerhets- och rolloutbeslut koppla godkänd
-bindningspolicy till registry- och slotmutation. Mutationen ska ha egen feature
-flag, replay-/revisionspolicy, rollback och v1-isolering.
+Paket 7-bindningspolicy till registry- och slotmutation. Mutationen ska ha egen
+feature flag, replay-/revisionspolicy, rollback och v1-isolering. Paket 8 är den
+första punkten där ett `propose_bind`-beslut får bli synlig presence-state.
 
 ## Migrationsnotering för Paket 5 och 6
 

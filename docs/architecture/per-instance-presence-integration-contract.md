@@ -324,11 +324,62 @@ Godkänt Paket 6 godkänner inte bindning eller mutation. Säker binding policy
 och korrelationslivscykel hör till Paket 7; registry-/slotmutation hör till
 Paket 8.
 
+## Paket 7: bindande avgränsning
+
+Paket 7 definierar när en sanerad, serversekvenserad hookobservation får ge ett
+**bindningsbeslut** till exakt en lokal runtime. Det fullständiga kontraktet
+finns i [Paket 7](per-instance-presence-package-7.md) och är bindande för
+policyimplementationen.
+
+**Nuläge efter Paket 0–6:** Paket 6-ingressen bär endast `tool`,
+`hook_session_ref` och `lifecycle` plus serverägda epoch/revision/`ObservedAt`.
+Den ger ingen serverattesterad hård processidentitet (PID + starttid) på
+hooksidan. Med exakt den stacken ska Paket 7 fail-closed och får inte avge
+`propose_bind` (eller `replace` som skapar ny association) för en ny koppling
+förrän hård identitet kommer från en uttryckligen definierad, betrodd
+server-side källa. Payloadpåstådda PID-/starttidsfält förblir overifierade.
+Den saknade trusted identity-bryggan är en explicit förutsättning för nyttig
+Paket 7-implementation, inte en implicit Paket 7-antagande.
+
+Paket 7 får:
+
+- uttrycka fail-closed policy för exact/strong vs weak/ambiguous/rejected;
+- kräva betrodd hård processgeneration (PID + starttid) före
+  bindningsberättigande för nya associationer;
+- hantera keep/suspend/**atomär replace**/remove för korrelationslivscykel i
+  minnet (`replace` är ett Paket 7-beslut; Paket 8 styr hur mutation tillämpas);
+- producera innehållsfria beslut och auditposter;
+- förbereda rena beslut för senare Paket 8-konsumtion.
+
+Paket 7 får inte:
+
+- mutera registry, slots, hookclaims eller runtimestate;
+- publicera till relay, v2 eller annan presencebackend;
+- behandla Paket 3:s `would_bind_under_current_threshold` som automatisk
+  bindningsauktorisation;
+- binda på enbart mjuka signaler eller overifierade payload-hints;
+- anta att Paket 6 redan levererar hård hookidentitet;
+- behandla omätta åldersfönster, grace, TTL, kapacitet, ambiguitetsdelta eller
+  exact-vs-strong som slutliga produktsäkerhetströsklar utan mänskligt
+  godkännande;
+- ändra v1:s statusväg eller ESP-projektion;
+- aktivera mutation eller installation som default.
+
+Godkänt Paket 7-dokument godkänner inte registry-/slotmutation. Den hör till
+Paket 8 och kräver separat aktivering.
+
 ## Öppna produktbeslut efter Paket 6
 
 Följande ska beslutas före motsvarande framtida funktion:
 
-- accepterad false-positive-gräns och verifierad hard identity före Paket 7;
+- design och evidens för trusted hard identity-brygga (serverattestering och/eller
+  senare versionerad ingress) före att Paket 7 får avge `propose_bind`/`replace`
+  till en muterande konsument (se Paket 7 §2.0 och §16);
+- accepterad false-positive-gräns för automatisk bind;
+- om automatic bind tillåter `strong` (member) eller endast `exact`
+  (root/runtime), baserat på märkt evidence;
+- godkännande av numeriska fönster/TTL/kapaciteter i Paket 7 §5 (föreslagna
+  mätdefaults, inte slutliga trösklar);
 - starkare cross-process- och cross-restart-deduplicering före eller tillsammans
   med Paket 8;
 - driftmodell och persistent recovery innan en bridge installeras som produkt;
@@ -336,4 +387,4 @@ Följande ska beslutas före motsvarande framtida funktion:
 - ytterligare officiellt installerade agentrecognizers;
 - v1-kompatibilitetsperiod och presentation enligt befintliga ADR:n.
 
-Dessa frågor får inte lösas implicit genom lokala defaults i Paket 6.
+Dessa frågor får inte lösas implicit genom lokala defaults i Paket 6 eller 7.
