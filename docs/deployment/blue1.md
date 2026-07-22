@@ -5,7 +5,7 @@ Status: lokal deploymentdokumentation, inte normativ produktarkitektur
 Det här dokumentet samlar repositoryts Blue1-specifika exempel så att de inte
 misstas för produktdefault. Det flyttar eller ändrar inte befintlig README,
 wrapper, systemd-enhet eller installation. Operativ verklighet har inte
-verifierats i Paket 4.5; “nuvarande” nedan betyder nuvarande repositoryinnehåll,
+verifierats operativt av Paket 6; “nuvarande” nedan betyder repositoryinnehåll,
 inte att en tjänst är installerad eller aktiv.
 
 Normativa lager- och configregler finns i
@@ -19,14 +19,14 @@ Normativa lager- och configregler finns i
 | Codexbinär `/home/carl/.npm-global/bin/codex` | `bin/aurora-codex` | Personlig legacydefault; måste konfigureras för annan användare. |
 | Codexhook `/srv/dev/aurora/bin/aurora-codex-hook` | `bin/aurora-codex` | Lokal legacydefault; inte generell paketering. |
 | Wrapper `bin/aurora-codex` | wrapper och README | Befintlig migrations-/v1-mekanism; inte målkrav för per-instance presence. |
-| systemd-enhet `aurora-relay.service` | `deploy/systemd/aurora-relay.service` | Linuxdeployment för relayn; inte del av Paket 2–5:s kärna. |
+| systemd-enhet `aurora-relay.service` | `deploy/systemd/aurora-relay.service` | Linuxdeployment för relayn; inte del av Paket 2–6:s kärna. |
 | användare/grupp `carl` | samma systemd-enhet | Blue1-specifikt och inte produktdefault. |
 | relaylisten `0.0.0.0:8080` | systemd-enheten och README | Lokal LAN-exponering; kräver separat säkerhetsbedömning och är inte domänkontrakt. |
 | exempeladress `192.168.0.247` | README | Historiskt/lokalt nätverksexempel; inte default eller discoverymekanism. |
 | installation till `/usr/local/bin` och `/etc/systemd/system` | `scripts/install-aurora-relay.sh` | Linuxdistribution för v1-relay; inte lokal hooktransportinstallation. |
 
 Ingen av paths, användare, grupper, IP-adresser, portar eller enhetsnamn ovan får
-kopieras till generell Paket 5-kod eller configdefault.
+kopieras till generell Paket 6-kod eller configdefault.
 
 ## Historisk lokal evidens
 
@@ -49,8 +49,8 @@ Nuvarande repository har:
 - en systemd-enhet för v1-relayn;
 - manuella observe-only-kommandon för Paket 2–4.
 
-Målbilden för Paket 5 är däremot endast en avstängd, best-effort observe-only-
-sändning till en manuellt startad lokal receiver. Paket 5 ska inte installera en
+Målbilden för Paket 6 är däremot endast en avstängd, best-effort observe-only-
+sändning till en manuellt startad lokal receiver. Paket 6 ska inte installera en
 tjänst, använda produktionssocket, ändra wrappern till ett krav eller aktivera
 någon relay-/registrymutation.
 
@@ -61,7 +61,6 @@ En Blue1-operatör måste uttryckligen välja och verifiera:
 - faktisk binär- och hookinstallation i stället för checkoutpaths;
 - användare, grupp och filrättigheter;
 - privat runtimekatalog och lokal socketpath;
-- stabilt opakt host-ID;
 - relayns bindadress och nätverksexponering;
 - feature flag och rollback för observe-only-hookanslutning;
 - att befintligt v1-flöde fungerar oberoende.

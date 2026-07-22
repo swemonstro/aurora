@@ -1,6 +1,6 @@
 # Linuxbackend för lokal hooktransport
 
-Status: målgräns och nulägesinventering för Paket 4.5
+Status: backendkontrakt efter Paket 5 och säkerhetsgräns för Paket 6
 
 Det normativa kontraktet finns i
 [integrationskontraktet](../per-instance-presence-integration-contract.md).
@@ -61,9 +61,11 @@ Receiver-/protokollconfig omfattar:
 - replaydiagnostik;
 - runtime- och hookantal.
 
-Produktconfig väljer om observe-only-funktionen är aktiverad och vilka adapters
-som används. Lokal deploymentconfig anger den faktiska socketpathen och
-operatörens startkommando.
+Produktconfig väljer om observe-only-funktionen är aktiverad. Paket 6 använder
+`AURORA_LOCAL_HOOK_ENABLED`, av som default, och
+`AURORA_LOCAL_HOOK_SOCKET`, som måste vara en absolut path i en privat
+runtimekatalog. Kommandolagret väljer agentadapter; transportpaketet känner inte
+till Claude eller Codex.
 
 ## Nuläge
 
@@ -72,14 +74,35 @@ operatörens startkommando.
 | `internal/localhooktransport/types.go`, `PeerIdentity` och `Authenticator` | Det generella gränssnittet uttrycks direkt som UID/GID/PID. | Kan skjutas upp för Linux-MVP; måste ersättas före annan transportbackend eller stabilt auth-API. |
 | `internal/localhooktransport/config.go`, `Config` | Socketpath och Linuxkomposition blandas med generella receiver-/protokollimiter. | Kan skjutas upp; ska delas före produktinstallation eller named-pipe-backend. |
 | `internal/localhooktransport/server_linux.go`, `Server` | Servern kombinerar Linuxlistener, auth och receiver. Det är acceptabel komposition så länge wire- och receiverkontrakt inte kräver Linuxfält. | Behåll internt. |
-| `internal/localhooktransport/types.go`, transportens `HookObservation` | Payloaden kan bära process/runtimehint, men saknar proveniensnivå. | Proveniens måste säkras under Paket 5 innan en verklig hook ansluts eller observationen korreleras. |
+| Det befintliga interna `HookObservation`-flödet | Typen innehåller serverintern korrelationsmetadata och får därför inte återanvändas som hookingress med dummyvärden. | Paket 6 inför den separata operationen `ingest_hook_event`; servern skapar intern `HookObservation` efter accepterad ingress. |
 
 `PeerIdentity` och den sammanslagna `Config` är övergångsformer och får inte
 publiceras som slutliga produktkontrakt.
 
+## Paket 6:s socket- och trustgräns
+
+Den bindande klient-, ingress- och sequencingdefinitionen finns i
+[Paket 6](../per-instance-presence-package-6.md). Linuxtransporten använder Unix
+stream socket vid en absolut, normaliserad path. Den användarägda
+runtimekatalogen och Aurora-underkatalogen ska vara no-follow-kontrollerade,
+ägda av förväntad effektiv UID och privata med mode `0700`. Systemägda
+prefixkomponenter ska vara icke manipulerbara av den effektiva användaren.
+Socketfilen ska vara en Unix socket med förväntad ägare och mode `0600`.
+Servern verifierar `SO_PEERCRED` och same-effective-UID; klienten verifierar
+serverpeerens UID efter connect.
+
+Jämförelse av device/inode före och efter connect samt ytterligare socket-
+replacement-kontroller är defense in depth där stödd Linuxmiljö och API medger
+en robust implementation. De är inte ensamma ett absolut exitkriterium.
+
+Samma UID är inte processidentitet. Ingressen innehåller därför inga process-
+eller runtimehints, och transportautentisering kan inte ensam skapa bindning.
+Pathbaserad Unix socket har kvar en reducerad TOCTOU-risk även efter sådana
+kontroller; den risken ska redovisas och får inte döljas som hård identitet.
+
 ## Framtida named-pipe-backend
 
-Paket 4.5 implementerar och lovar inte Windowsstöd. En framtida named-pipe-
+Paket 6 implementerar och lovar inte Windowsstöd. En framtida named-pipe-
 backend ska dock kunna:
 
 1. återanvända det versionssatta generiska request-/responsekontraktet;

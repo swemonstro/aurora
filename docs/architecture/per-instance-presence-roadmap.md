@@ -18,14 +18,14 @@ Fyra statusar ska hållas åtskilda:
 - **active in production:** funktionen är installerad och uttryckligen aktiverad
   i en produktionsmiljö.
 
-`Implemented` eller `integrated` innebär alltså inte installerad eller aktiverad.
-Ett observe-only-verktyg kan vara integrerat utan att ingå i produktionsflödet.
+`Implemented` eller `integrated` innebär inte installerad eller aktiverad.
+Observe-only-kod kan vara integrerad utan att ingå i produktionsflödet.
 
 ## Aktuell paketstatus
 
-Statusen nedan avser baslinjen `main` vid `0e19843` samt Paket 4.5-
-dokumentationen i den här ändringen. Paket 4.5 är inte `integrated` förrän
-ändringen faktiskt finns på `main`.
+Statusen avser `main` vid `0b0fc65`. Paket 0–5 och Paket 4.5 är integrerade.
+Paket 2–6 är eller ska vara strikt observe-only och är inte aktiva i
+produktion.
 
 | Paket | Leverans | Planned | Implemented | Integrated | Active in production |
 | --- | --- | --- | --- | --- | --- |
@@ -34,15 +34,17 @@ dokumentationen i den här ändringen. Paket 4.5 är inte `integrated` förrän
 | 2 | Observe-only Linux-processadapter | ja | ja | ja | nej |
 | 3 | Observe-only korrelationsmotor | ja | ja | ja | nej |
 | 4 | Säker lokal observe-only hooktransport | ja | ja | ja | nej |
-| 4.5 | Produktgräns, lagerkontrakt och kanonisk roadmap | ja | ja | nej | nej |
-| 5 | Verklig observe-only hookanslutning bakom avstängd feature flag | ja | nej | nej | nej |
+| 4.5 | Produktgräns, lagerkontrakt och kanonisk roadmap | ja | ja | ja | nej |
+| 5 | Refaktorer A–C: runtimekälla, recognition, agentadapters och transportgränser | ja | ja | ja | nej |
+| 6 | Verklig lokal hook-ingress med receiverägd sequencing och bounded best-effort-klient | ja | nej | nej | nej |
+| 7 | Säker binding policy och korrelationslivscykel | ja | nej | nej | nej |
+| 8 | Registry- och slotmutation bakom separat aktivering | ja | nej | nej | nej |
 
-Paket 0–4 är integrerade i `main`. Paket 2–4 är uttryckligen observe-only,
-kräver manuell körning och är inte aktiva i produktion. Paket 1 är inte kopplat
-till relayns v1-runtime och registrerar inga endpoints. Ingen av statusarna ovan
-påstår att v2, collector, automatisk bindning eller registrymutation är aktiv.
+Paket 1:s register är inte kopplat till relayns v1-runtime eller till Paket
+2–6. Ingen status ovan påstår att v2, automatisk bindning eller registrymutation
+är aktiv.
 
-## Implementerade paket
+## Integrerade paket
 
 ### Paket 0 — kontrakt och mätplan
 
@@ -72,66 +74,76 @@ bindning.
 ### Paket 4 — säker lokal observe-only hooktransport
 
 [Paket 4](per-instance-presence-package-4.md) tillhandahåller en manuellt
-startad Linuxserver och klient över privat Unix-socket. Peer autentiseras,
-protokollet är begränsat och svaret är sanerat. Befintliga produktionshookar
-skickar inte till transporten.
+startad Linuxserver och en diagnostisk klient över privat Unix-socket. Peer
+autentiseras, protokollet är begränsat och svaret är sanerat. Befintliga
+produktionshookar skickar inte till transporten.
 
-## Paket 4.5 — produkt- och integrationskontrakt
+### Paket 4.5 — produkt- och integrationskontrakt
 
-Paket 4.5 består av dokumentation och gör ingen runtimeändring. Det:
-
-- låser de fem produktlagren och deras tillåtna beroenden;
-- beslutar en namespacad, utbyggbar agentidentifierare som långsiktig modell;
-- definierar ägarskap för host-ID, producer epoch och revision;
-- klassificerar nuvarande lageravvikelser och när de ska hanteras;
-- avgränsar första MVP till Linux utan att göra Linux till domänkontrakt;
-- definierar Paket 5:s inträdesvillkor, acceptanskriterier och rollback.
-
-Det normativa kontraktet finns i
+Paket 4.5 låste produktlagren, den långsiktiga agentidentifieraren,
+metadataägarskapet, Linux-MVP:n och Paket 5:s obligatoriska refaktorer. Det
+normativa kontraktet finns i
 [integrationskontraktet](per-instance-presence-integration-contract.md).
-Linux- och agentdetaljer finns i:
 
-- [Linux-processbackend](backends/linux-process.md)
-- [Linux lokal transport](backends/linux-local-transport.md)
-- [Claude-adapter](adapters/claude.md)
-- [Codex-adapter](adapters/codex.md)
-- [lokal Blue1-deployment](../deployment/blue1.md), som inte är normativ
+### Paket 5 — arkitekturrefaktorer A–C
 
-## Paket 5 — verklig observe-only hookanslutning
+[Paket 5](per-instance-presence-package-5.md) är integrerat i `main` vid
+`0b0fc65`. Paketet:
 
-Paket 5 ska ansluta verkliga Claude- och Codexhookar till den lokala receivern
-bakom en explicit feature flag vars default är av. Sändningen ska vara
-best-effort, agentägd och begränsad. Receivern startas fortsatt manuellt.
+- gjorde korrelationsservicens runtimekälla OS-neutral;
+- flyttade runtime recognition och familjebildning ur Linuxbackenden;
+- gav Claude- och Codexadaptrarna ägarskap över recognition och eventmapping;
+- gjorde hookadaptern transportneutral och lokaltransporten agentneutral.
 
-Paket 5 får inte införa:
+Paket 5 anslöt ingen verklig hook. Det införde ingen mutation, persistence,
+publicering, installation eller produktionsaktivering.
 
-- registry- eller slotmutation;
-- persistence eller bakgrundskö;
-- relay- eller v2-publicering;
-- automatisk bindning;
-- beroende från v1-flödet till observe-only-transporten;
-- installations-, daemon- eller systemdaktivering.
+## Planerade paket
 
-Paket 5 ska börja med de små, sammanhållna refaktorer som skiljer
-processinsamling, agentigenkänning, runtimekälla och hookadapters enligt
-[integrationskontraktets](per-instance-presence-integration-contract.md)
-lagerregler. Ingen verklig hook får anslutas innan dessa refaktorer är klara.
-Paket 5:s exakta acceptanskriterier finns i samma dokument.
+### Paket 6 — verklig lokal observe-only hook-ingress
 
-## Supersedad numrering
+[Paket 6](per-instance-presence-package-6.md) ska ansluta faktiska Claude- och
+Codexhookprocesser till den manuellt startade lokala mottagaren. Paketet inför
+en separat sanerad ingressoperation, receiverägd in-memory sequencing och en
+bounded best-effort-klient bakom `AURORA_LOCAL_HOOK_ENABLED`, vars default är
+av.
 
-Avsnitt 4 i `per-instance-presence-decisions.md` var en tidig plan och är inte
-längre paketindex. Följande namn får inte återanvändas som aktuella paket:
+Paket 6 utför ingen automatisk bindning och får inte mutera registry eller
+slots, persistera presence-state, publicera till relay/v2, ändra v1 eller
+installera eller aktivera någon tjänst.
 
-| Äldre plan | Faktiskt utfall och ny benämning |
+### Paket 7 — säker binding policy och korrelationslivscykel
+
+Paket 7 ska definiera och verifiera när en sanerad hookobservation över huvud
+taget får betraktas som bindningsbar, hur osäkerhet och lifecycle hanteras samt
+vilken starkare deduplicering och proveniens som krävs före mutation. Paketet
+får inte smyga in registrymutation; den hör till Paket 8.
+
+### Paket 8 — registry- och slotmutation
+
+Paket 8 får först efter separat säkerhets- och rolloutbeslut koppla godkänd
+bindningspolicy till registry- och slotmutation. Mutationen ska ha egen feature
+flag, replay-/revisionspolicy, rollback och v1-isolering.
+
+## Migrationsnotering för Paket 5 och 6
+
+Roadmapen och integrationskontraktet kallade tidigare både de obligatoriska
+refaktorerna A–C och den efterföljande verkliga hookanslutningen för Paket 5.
+Efter integrationen av A–C vid `0b0fc65` gäller följande kanoniska uppdelning:
+
+| Tidigare formulering | Kanonisk benämning |
 | --- | --- |
-| Äldre Paket 2: Linuxadapter och collector | Paket 2 levererade endast observe-only-adaptern. Collector är inte implementerad. |
-| Äldre Paket 3: lokal hook-IPC och säker bindning | Delades i Paket 3 korrelation, Paket 4 lokal observe-only-transport och planerat Paket 5 hookanslutning. Ingen säker bindningsmutation är implementerad. |
-| Äldre Paket 4: durable relay och shadow traffic | Inte implementerat och har inget nytt paketnummer ännu. |
-| Äldre Paket 5: fler-pixel-ESP | Inte implementerat och har inget nytt paketnummer ännu. |
-| Äldre Paket 6–8 | Framtida idéer utan aktuella paketnummer. |
+| “Paket 5:s första refaktorer A–C” | Paket 5 |
+| “Paket 5: verklig observe-only hookanslutning” | Paket 6 |
+| Framtida säker bindning | Paket 7 |
+| Framtida registry-/slotmutation | Paket 8 |
 
-När durable relay, ESP eller plattformsbackends planeras ska roadmapen först
-uppdateras med nya unika nummer. Äldre ADR-beslut om dessa ämnen är fortfarande
-giltiga där de uttryckligen är markerade som beslut; endast paketnumreringen och
-tidsordningen är supersedade.
+Äldre dokumentation får citeras som historik, men får inte användas för att
+namnge nya leveranser.
+
+## Äldre supersedad plan
+
+Avsnitt 4 i `per-instance-presence-decisions.md` är en historisk plan och inte
+paketindex. Durable relay, ESP och ytterligare plattformsbackends har fortfarande
+inga nya aktuella paketnummer. När de planeras ska roadmapen först uppdateras
+med unika nummer; de får inte återanvända Paket 5–8 ovan.

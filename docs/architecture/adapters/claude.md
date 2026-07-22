@@ -1,6 +1,6 @@
 # Claude-adapter
 
-Status: adapterkontrakt och nulägesinventering för Paket 4.5
+Status: adapterkontrakt efter Paket 5 och normativ ingressgräns för Paket 6
 
 Claude-adaptern ska följa det normativa
 [integrationskontraktet](../per-instance-presence-integration-contract.md).
@@ -39,7 +39,7 @@ Nuvarande `claudehook.MapEvent` ger följande generella betydelse:
 | `StopFailure` | `active`, hookclaim error |
 | `SessionEnd` | `ended` observation; processen avgör fortfarande runtime-exit |
 
-Paket 5 ska återanvända denna semantik utan att göra observe-only-leveransen
+Paket 6 ska återanvända denna semantik utan att göra observe-only-leveransen
 auktoritativ för v1 eller runtime-livscykel.
 
 ## Förbjudna data
@@ -50,7 +50,7 @@ generell miljö. Okända payloadfält ignoreras.
 
 `AURORA_CAPTURE_HOOKS` och `claudehook.Capture` är ett explicit lokalt
 diagnostikläge som kan skriva hela råpayloaden. Det ligger utanför per-instance-
-transporten, får aldrig aktiveras av Paket 5 och får inte användas som
+transporten, får aldrig aktiveras av Paket 6 och får inte användas som
 observationskälla.
 
 ## Saknad identitet och revision
@@ -68,20 +68,23 @@ Det observerade eventkontraktet innehåller ingen:
 generationssäker processidentitet eller Paket 3-revision. Session-ID är
 verktygsägt och räcker inte som hård identitet.
 
-En framtida långlivad bridge ska äga epoch och revision. Den kortlivade
-hookprocessen ska inte skapa en ny epoch per anrop. Processhint från payload är
-overifierad tills mottagaren attesterat den server-side.
+Presence-servern ska i Paket 6 äga producer epoch, revision och slutlig
+observationstid. Den kortlivade hookprocessen får inte skapa eller skicka dessa
+värden. Process- och runtimehints ingår inte i ingressen.
 
-## Lageravvikelse och Paket 5
+## Lagergräns efter Paket 5
 
-**Nuläge:** `internal/localhooktransport/adapters.go`, `ClaudeObservation`,
-importerar `internal/claudehook` från transportpaketet. Det vänder beroendet åt
-fel håll.
+Paket 5 flyttade Claude-mappingen till det agentägda paketet. `claudehook`
+mappar nu agentens event till den transportneutrala `hookadapter.Observation`;
+varken `claudehook` eller `hookadapter` importerar `localhooktransport`.
 
-Som första steg under Paket 5 ska mappingen flyttas till Claude-adapterlagret,
-innan en verklig hook ansluts. Adaptern får bero på en generell
-`HookObservation`- och klientgräns; transporten får inte importera Claudepaketet.
+Under Paket 6 ska kommandolagret projicera den neutrala ingressen till
+`ingest_hook_event` och använda den generella lokala klienten. Agentpaketet får
+inte känna till requesten, socketen eller transportens wiremodell.
 
 Observe-only-sändning ska vara avstängd som default och best-effort. Saknad
 receiver, authfel, timeout eller korrelationsfel får inte ändra befintlig
 v1-publicering, statefil eller hookens exitbeteende.
+
+Faktiska Claudeevent och den konfiguration som levererar dem ska verifieras
+manuellt innan Paket 6 godkänns. Rå capture ingår inte i verifieringen.

@@ -1,8 +1,9 @@
 # Integrationskontrakt för per-instance presence
 
-Status: normativt Paket 4.5-kontrakt
+Status: normativt integrationskontrakt för Paket 4.5–6
 
-Detta dokument definierar produktgränsen som ska gälla före och under Paket 5.
+Detta dokument definierar produktgränsen som gäller efter Paket 5 och under
+Paket 6.
 `SKA`, `FÅR INTE` och `KRÄVER` är bindande. Beskrivningar märkta **nuläge** är
 observerade avvikelser och gör dem inte till godkänd målarkitektur.
 
@@ -95,14 +96,15 @@ En `HookEventAdapter` SKA:
 
 - ägas av respektive agentadapter;
 - översätta ett agentspecifikt event till en sanerad generell
-  `HookObservation`;
+  transportneutral ingress;
 - uttryckligen allowlista de fält som används;
 - ignorera eller avvisa förbjudna fält utan att vidarebefordra rå payload;
 - vara oberoende av transportbackend.
 
 Transportpaket FÅR INTE importera Claude-, Codex-, Hermes- eller andra
-agentpaket. Agentadaptern får använda transportens generiska klientgräns, men
-transporten får inte känna till agentens eventmodell.
+agentpaket. Agentpaket och hookadaptern FÅR INTE importera
+`localhooktransport`. Cmd-lagret ska vara composition root och projicera den
+neutrala ingressen till transportens generiska klientgräns.
 
 ### Transport
 
@@ -132,12 +134,12 @@ servern gör inte påståendet betrott. Hård identitet kräver att mottagaren e
 en betrodd lokal bridge attesterar processgeneration och relation server-side.
 
 Korrelationsindata SKA bära proveniens så att en overifierad hint inte kan ge
-`exact`, `strong` eller `would_bind_under_current_threshold`. Paket 5 får inte
+`exact`, `strong` eller `would_bind_under_current_threshold`. Paket 6 får inte
 skapa hård identitet genom att kopiera payloadens PID/starttid till dagens
 `ProcessHint` eller `RuntimeHint`.
 
 `weak`, `ambiguous`, `rejected` och overifierade resultat FÅR ALDRIG mutera
-registry. Paket 5 får över huvud taget inte göra registrymutation.
+registry. Paket 6 får över huvud taget inte göra registrymutation.
 
 ## Agentidentifierare
 
@@ -174,7 +176,7 @@ av recognizer ger `unsupported`/`unmatched`, aldrig en gissad match.
 Paket 4.5 ändrar inte wireformatet. En senare migrering SKA vara versionssatt:
 den får inte tyst ändra betydelsen av `tool`, kringgå nuvarande strict schema
 eller få äldre klienter att acceptera okända värden. Under övergången ska
-mappingen ligga i en adapter/projektion. Paket 5 får initialt stödja de två
+mappingen ligga i en adapter/projektion. Paket 6 får initialt stödja de två
 legacyvärdena, men får inte definiera dem som slutlig generell agentmodell eller
 lägga fler slutna agentfall i transportkärnan.
 
@@ -183,20 +185,27 @@ lägga fler slutna agentfall i transportkärnan.
 - **Host-ID** ägs av installationen. Det SKA vara stabilt för samma lokala
   Aurora-installation, opakt och oberoende av hostname, MAC-adress och
   användarsökväg.
-- **Producer epoch** ägs av en långlivad agentbridge/collector. En ny epoch
-  skapas vid förlorad producentstate eller beslutad omregistrering, inte av
-  varje kortlivad hookprocess.
+- **Producer epoch** ägs av den långlivade mottagare som producerar interna
+  hookobservationer. I Paket 6 är detta presence-servern. En ny epoch skapas vid
+  serverstart, inte av varje kortlivad hookprocess.
 - **Revision** ökar monotont för en logisk hookström inom samma producer epoch.
   Revisioner från olika epochs jämförs inte.
 - **Kortlivade hookprocesser** ska lämna event till den långlivade ägaren och
   behöver inte själva upprätthålla permanent revisionsstate.
 
-Exakt lagringsformat, crash recovery och rotation implementeras inte i Paket
-4.5. I Paket 5 får den manuellt startade, långlivade receivern/bridgen äga en
-in-memory-epoch och monotona revisioner; restart skapar då en ny epoch. Hookens
-ingressenvelope ska inte kräva att varje kortlivad hook själv skapar dessa
-värden. Paket 5 får inte lösa detta med en per-invocation slump-epoch eller med
-väggklockan som revision.
+Paket 6 låser ägarskapet: den manuellt startade, långlivade presence-servern
+äger en kryptografiskt slumpad in-memory-epoch per serverstart, monotona
+revisioner per `(tool, hook_session_ref)` och slutlig observationstid. Revision
+och `ObservedAt` tilldelas vid samma atomiska acceptpunkt efter peer-auth,
+strikt frame/decode/validering samt replay-, conflict- och kapacitetskontroll,
+men före runtimeobservation och korrelation. Avvisade requests får ingetdera.
+Restart skapar en ny epoch. Hookens ingress innehåller inte dessa värden. Paket
+6 får inte lösa detta med per-invocation-epoch, väggklockerevision, dummyvärden
+som skrivs över eller genom att återanvända legacyagenternas statefiler.
+
+Sequencing- och replaystate är bounded och endast in-memory. Exakta bounds,
+overflow-, ended- och replayregler finns i
+[Paket 6-kontraktet](per-instance-presence-package-6.md).
 
 ## Konfigurationslager
 
@@ -238,7 +247,7 @@ paketen fortsatt ligger under `internal/`:
 - publishergränsen mellan domänsnapshot och publiceringsbackend.
 
 `internal/publish.Publisher` är i nuläget en stabil v1-gräns för
-`presence.Snapshot`, inte ett per-instance-v2-publisherkontrakt. Paket 5 ska inte
+`presence.Snapshot`, inte ett per-instance-v2-publisherkontrakt. Paket 6 ska inte
 använda eller utöka den. En framtida per-instance-publisher ska få ett eget
 generiskt, transportneutralt kontrakt före relayintegration.
 
@@ -254,94 +263,77 @@ Följande ska förbli interna implementationer:
 Stabil semantik betyder inte att interna Go-paket blir ett externt Go-API.
 Maskinläsbara wirekontrakt ska versionssättas separat.
 
-## Nulägesavvikelser och refaktorbeslut
+## Paket 5: integrerade refaktorer
 
-Varje avvikelse nedan är verifierad i baslinjen `0e19843`. Paket 4.5 gör ingen
-kodflytt eftersom en isolerad deländring skulle skapa dubbla eller halvfärdiga
-kontrakt.
+Refaktorerna A–C är implementerade och integrerade i `main` vid `0b0fc65`:
 
-| Refaktor | Fil och symbol/ansvar | Avvikelse | Klassificering | Krav på åtgärd |
-| --- | --- | --- | --- | --- |
-| A. OS-neutral runtimekälla | `internal/localhooktransport/service.go`, `SnapshotSource` och `CorrelationService` | Servicen importerar `linuxprocess` och tar `linuxprocess.Sample`. | **obligatorisk under Paket 5 före verklig hookanslutning** | Inför `RuntimeObservationSource`; Linuxkompositionen gör snapshot + recognition utanför servicen innan hookanslutning. |
-| B. Agentadapters ur transport | `internal/localhooktransport/adapters.go`, `ClaudeObservation` och `CodexObservation` | Transportpaketet importerar båda agentpaketen. | **obligatorisk under Paket 5 före verklig hookanslutning** | Flytta mapping till agentägda paket innan hookanslutning; transporten tar endast generell observation. |
-| C. Recognizers ur Linuxbackend | `internal/linuxprocess/classify.go`, `buildFamilies` i `families.go`, agentkoder i `types.go` | `/proc`-backend klassificerar Claude/Codex och bygger agentfamiljer. | **obligatorisk under Paket 5 före verklig hookanslutning** | Behåll procinsamling i backend; flytta identifiering/familjeregler till agentägda recognizers före verklig mätning. |
-| D. Transportneutral principal | `internal/localhooktransport/types.go`, `PeerIdentity`; `auth_linux.go` | Det generella authgränssnittet uttrycks som UID/GID/PID. | **kan skjutas upp** | Behåll internt för Linux-MVP; inför generell principal innan andra transportbackends eller publikt authkontrakt. |
-| E. Configdelning | `internal/localhooktransport/config.go`, `Config` | Socketpath, receiverlimiter, servicegräns och replay finns i samma typ. | **kan skjutas upp** | Paket 5 får endast komponera befintlig config; dela före produktinstallation eller ny backend. |
-| F. Agent-ID-migrering | `internal/instancepresence/domain.go`, `ToolKind.Validate`; `api/v2/presence.schema.json`, `ToolKind` | Kontraktet är stängt till Claude/Codex. | **kan skjutas upp** | Använd dokumenterad legacy-mapping i Paket 5; gör senare en samlad versionssatt domän-, transport- och schemamigrering. |
-| G. Registry från wiretyper | `internal/instanceregistry/registry.go`, mutationsmetoder; `projection.go` | Registry tar och returnerar `presencev2`-typer. | **utanför nuvarande scope** | Lös före aktivt v2-API eller alternativ publisher, inte i observe-only Paket 5. |
+| Refaktor | Integrerat resultat |
+| --- | --- |
+| A. OS-neutral runtimekälla | Korrelationsservicen konsumerar `RuntimeObservationSource`; Linuxsnapshot och recognition komponeras utanför servicen. |
+| B. Agentadapters ur transport | Claude- och Codexmapping ägs av agentpaketen; hookadaptern är transportneutral och transporten agentneutral. |
+| C. Recognizers ur Linuxbackend | Linuxbackenden samlar processdata; agentrecognizers och familjebildning ligger i agentägda respektive OS-neutrala lager. |
 
-Inga kodrefaktorer krävs i Paket 4.5. A–C är obligatoriska första steg i Paket 5
-och ska vara klara innan en verklig hook ansluts eller Paket 5 godkänns. Refaktor
-D bör göras under en framtida transportbackend, E under produktifiering och F
-som ett eget kompatibilitetspaket. Ingen av dem får användas som argument för
-att lägga nya plattforms- eller agentfall i dagens kärntyper.
+Paket 5 anslöt ingen verklig hook och ändrade inte wireformat, registry, v1,
+relay, persistence, installation eller produktion. Se
+[Paket 5](per-instance-presence-package-5.md).
 
-## Paket 5: bindande avgränsning
+Följande senare refaktorer är fortsatt separata:
 
-### Mål
+| Refaktor | Klassificering |
+| --- | --- |
+| Transportneutral principal före annan transportbackend eller stabilt auth-API | uppskjuten |
+| Delning av klient-, server-, receiver- och protokollconfig | tillåten i Paket 6 endast där den bounded klienten kräver det |
+| Migrering från legacy `ToolKind` till namespacad AgentID | eget versionssatt kompatibilitetspaket |
+| Registry bort från wiretyper | före aktivt v2-API eller Paket 8, inte i Paket 6 |
 
-Paket 5 ansluter verkliga Claude- och Codexevent till den manuellt startade
-observe-only-receivern. Anslutningen styrs av en explicit feature flag vars
-default är av. Agentadaptern skickar en enda sanerad observation best-effort och
-v1-flödet fortsätter oberoende.
+## Paket 6: bindande avgränsning
 
-### Tillåtet
+Paket 6 ansluter verkliga Claude- och Codexevent genom den separata versionerade
+operationen `ingest_hook_event`. Den kortlivade hookprocessen skickar endast
+`tool`, `hook_session_ref` och `lifecycle`. Den långlivade presence-servern
+tillför epoch, revision och slutlig observationstid före korrelation.
 
-- agentägda `HookEventAdapter`-implementationer;
-- refaktorer A–C ovan;
-- bounded lokal sändning via generisk klientgräns;
-- en sanerad ingressmodell där den långlivade receivern/bridgen tillför epoch,
-  revision och attesterad proveniens före Paket 3-korrelation;
-- explicit produkt- och agentconfig utan lokala hårdkodningar;
-- lokal mätning och märkta parallellfall;
-- innehållsfri diagnostik för leverans och korrelation.
+Det fullständiga ingress-, sequencing-, idempotens-, klient-, socket- och
+exitkontraktet finns i
+[Paket 6](per-instance-presence-package-6.md) och är bindande.
 
-### Förbjudet
+Paket 6 får:
 
-- registry-, slot-, hookclaim- eller runtimemutation;
-- persistence, durable retry eller bakgrundskö;
-- relay- eller v2-publicering;
-- automatisk bindning;
-- TCP, fjärrtransport, installation, daemon eller systemdaktivering;
-- beroende från v1-publicering till observe-only-sändningen;
-- prompt, transcript, CWD, argv, kommandorad, terminalinnehåll eller generell
-  miljö i transport, logg eller fixture;
-- lokala paths, maskinnamn, UID/GID, IP eller serviceenhetsnamn i generell kod.
+- införa den minimala transportneutrala ingressmodellen och en versionerad lokal
+  operation;
+- hårdgöra den generella lokala klienten;
+- hålla bounded sequencing och replay endast i serverminne;
+- komponera agentadapter och transport i hookkommandona bakom en avstängd
+  feature flag;
+- utföra innehållsfri diagnostik, manuell verifiering och observe-only soak.
 
-### Acceptanskriterier
+Paket 6 får inte:
 
-1. Feature flag av ger bit-identiskt eller semantiskt oförändrat v1-beteende.
-2. Saknad receiver, authnekande, malformed svar och timeout påverkar inte v1.
-3. Generell kod innehåller ingen lokal deploymentkonfiguration.
-4. Transportpaketet importerar inga agentpaket.
-5. Korrelationsservicen importerar inte `linuxprocess`.
-6. Agentklassificering ägs inte av `ProcessBackend`.
-7. Overifierade processhints kan inte bli hård identitet eller `would_bind`.
-8. Faktiska parallella Claude- och Codexsessioner kan observeras och märkas
-   utan innehållsdata.
-9. Inga förbjudna data skickas eller loggas.
-10. Ingen kodväg kan mutera registry, slots, relay eller v2-state.
-11. Rollback består enbart av att stänga feature flag; v1 kräver ingen migration.
-12. Receivern startas manuellt och inget installeras eller aktiveras automatiskt.
-13. Epoch och revision ägs av den långlivade bridgen; kortlivade hooks skapar
-    inte egna epochs eller väggklockebaserade revisioner.
+- mutera registry, slots, hookclaims eller runtimestate;
+- persistera sequencing-, replay- eller presence-state eller införa durable
+  retry/bakgrundskö;
+- använda `Publisher`, relay eller v2-publicering;
+- skapa automatisk bindning;
+- ändra v1:s state, publicering eller exitbeteende;
+- installera, daemonisera eller systemdaktivera server eller hooks;
+- transportera prompt, transcript, CWD, argv, kommandorad, tool input,
+  terminalinnehåll, generell miljö eller fri metadata;
+- skapa epoch/revision i kortlivade hooks eller skicka dummyvärden.
 
-Att Paket 5 passerar dessa kriterier godkänner inte automatisk bindning. Ett
-senare mutationspaket kräver separat beslut, mätdata, replaypolicy, feature flag,
-rollback och end-to-end-bevis för registryisolering.
+Godkänt Paket 6 godkänner inte bindning eller mutation. Säker binding policy
+och korrelationslivscykel hör till Paket 7; registry-/slotmutation hör till
+Paket 8.
 
-## Öppna produktbeslut
+## Öppna produktbeslut efter Paket 6
 
-Inget produktägarbeslut blockerar Paket 4.5 eller ett strikt observe-only Paket
-5. Följande beslut ska tas först när motsvarande produktfunktion planeras:
+Följande ska beslutas före motsvarande framtida funktion:
 
-- accepterad false-positive-gräns och krav på verifierad hard identity före
-  någon bindningsmutation;
-- driftmodell, lagring och återställning för host-ID, producer epoch och revision
-  innan en långlivad bridge installeras som produkt;
-- tidpunkt och kompatibilitetsperiod för wiremigrering från legacy `ToolKind`
-  till namespacad `AgentID`;
-- vilka ytterligare agent-ID:n som ska ha officiellt installerade recognizers;
-- v1-kompatibilitetsperiod och presentationsbeslut enligt befintliga ADR:n.
+- accepterad false-positive-gräns och verifierad hard identity före Paket 7;
+- starkare cross-process- och cross-restart-deduplicering före eller tillsammans
+  med Paket 8;
+- driftmodell och persistent recovery innan en bridge installeras som produkt;
+- kompatibilitetsperiod för migrering från legacy `ToolKind` till AgentID;
+- ytterligare officiellt installerade agentrecognizers;
+- v1-kompatibilitetsperiod och presentation enligt befintliga ADR:n.
 
-Dessa frågor får inte lösas implicit genom lokala defaults i Paket 5.
+Dessa frågor får inte lösas implicit genom lokala defaults i Paket 6.

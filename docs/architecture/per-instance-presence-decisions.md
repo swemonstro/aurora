@@ -79,7 +79,9 @@ diagnostik", aldrig "gissa och mutera".
 > migreringsplanen och är inte längre aktuell. Den får inte användas för att
 > namnge nya leveranser. Se den
 > [kanoniska roadmapen](per-instance-presence-roadmap.md) för implementerade
-> Paket 0–4, Paket 4.5 och det planerade Paket 5. ADR-besluten och tekniska
+> Paket 0–4, Paket 4.5, det integrerade Paket 5 och planerade Paket 6–8.
+> Verklig lokal hooking, som äldre texter kallade Paket 5, heter kanoniskt
+> Paket 6. ADR-besluten och tekniska
 > säkerhetskraven nedan förblir relevanta även när deras gamla paketnummer har
 > supersedats.
 
