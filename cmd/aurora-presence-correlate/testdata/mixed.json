@@ -1,0 +1,92 @@
+{
+  "evaluated_at": "2026-07-22T10:00:10Z",
+  "runtimes": [
+    {
+      "runtime_ref": "runtime-exact",
+      "tool": "claude",
+      "runtime": {
+        "host_id": "host-fixture",
+        "boot_id": "boot-fixture",
+        "root_process": {"pid": 101, "started_at": "2026-07-22T10:00:00Z"}
+      },
+      "members": [{"pid": 101, "started_at": "2026-07-22T10:00:00Z"}],
+      "observed_at": "2026-07-22T10:00:05Z",
+      "lifecycle": "active"
+    },
+    {
+      "runtime_ref": "runtime-ambiguous-a",
+      "tool": "codex",
+      "runtime": {
+        "host_id": "host-fixture",
+        "boot_id": "boot-fixture",
+        "root_process": {"pid": 201, "started_at": "2026-07-22T10:00:00Z"}
+      },
+      "members": [{"pid": 201, "started_at": "2026-07-22T10:00:00Z"}],
+      "observed_at": "2026-07-22T10:00:05Z",
+      "lifecycle": "active",
+      "process_group_or_job": "group-shared",
+      "os_session": "session-shared"
+    },
+    {
+      "runtime_ref": "runtime-ambiguous-b",
+      "tool": "codex",
+      "runtime": {
+        "host_id": "host-fixture",
+        "boot_id": "boot-fixture",
+        "root_process": {"pid": 301, "started_at": "2026-07-22T10:00:00Z"}
+      },
+      "members": [{"pid": 301, "started_at": "2026-07-22T10:00:00Z"}],
+      "observed_at": "2026-07-22T10:00:05Z",
+      "lifecycle": "active",
+      "process_group_or_job": "group-shared",
+      "os_session": "session-shared"
+    },
+    {
+      "runtime_ref": "runtime-rejected",
+      "tool": "claude",
+      "runtime": {
+        "host_id": "host-fixture",
+        "boot_id": "boot-fixture",
+        "root_process": {"pid": 401, "started_at": "2026-07-22T10:00:00Z"}
+      },
+      "members": [{"pid": 401, "started_at": "2026-07-22T10:00:00Z"}],
+      "observed_at": "2026-07-22T10:00:05Z",
+      "lifecycle": "active"
+    }
+  ],
+  "hooks": [
+    {
+      "tool": "claude",
+      "hook_session_ref": "hook-exact",
+      "producer_epoch": "epoch-fixture",
+      "revision": 1,
+      "observed_at": "2026-07-22T10:00:06Z",
+      "lifecycle": "active",
+      "process_hint": {"pid": 101, "started_at": "2026-07-22T10:00:00Z"}
+    },
+    {
+      "tool": "codex",
+      "hook_session_ref": "hook-ambiguous",
+      "producer_epoch": "epoch-fixture",
+      "revision": 1,
+      "observed_at": "2026-07-22T10:00:06Z",
+      "lifecycle": "active",
+      "process_group_or_job": "group-shared",
+      "os_session": "session-shared"
+    },
+    {
+      "tool": "claude",
+      "hook_session_ref": "hook-rejected",
+      "producer_epoch": "epoch-fixture",
+      "revision": 1,
+      "observed_at": "2026-07-22T10:00:06Z",
+      "lifecycle": "active",
+      "host_id": "host-conflict",
+      "process_hint": {"pid": 401, "started_at": "2026-07-22T10:00:00Z"}
+    }
+  ],
+  "expected_matches": [
+    {"hook_ref": "claude:hook-exact", "runtime_ref": "runtime-exact"},
+    {"hook_ref": "claude:hook-rejected"}
+  ]
+}
