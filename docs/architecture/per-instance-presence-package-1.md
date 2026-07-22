@@ -65,5 +65,5 @@ overflowlistan. Kapacitet 0 är giltig.
 Paketet registrerar inga HTTP-endpoints och är inte kopplat till relayns v1-
 runtime. Det innehåller ingen persistence, feature flag, auth, processadapter,
 processpollning, collector-daemon, hook-IPC, korrelation eller bindningströskel.
-Det installerar, deployar eller startar inte om något. Paket 2 är fortsatt
-observe-only-arbete för OS-adaptern och får inte skriva produktionsstatus.
+Det installerar, deployar eller startar inte om något. Paket 2 är observe-only
+och får inte skriva produktionsstatus.

@@ -4,7 +4,11 @@ Status: föreslagen arkitektur
 
 Mål: nästa generations närvaromodell
 
-Kompletterande dokument: [beslut och migrering](per-instance-presence-decisions.md)
+Kompletterande dokument:
+
+- [beslut och migrering](per-instance-presence-decisions.md)
+- [kanonisk roadmap](per-instance-presence-roadmap.md)
+- [normativt integrationskontrakt](per-instance-presence-integration-contract.md)
 
 ## 1. Syfte och produktgräns
 
@@ -198,10 +202,11 @@ Följande är mätbaselines, inte fattade arkitekturparametrar:
 - tombstone: 30 sekunder efter `ended_at` för felsökning och deltaflöden;
 - slotten frigörs när instansen övergår till `ended`, efter sexsekundersgracen.
 
-Paket 2 ska mäta poll/missing och ge underlag inför Paket 3. Lease, recovery och
-tombstone ska kalibreras före Paket 4. Tiderna ska vara konfigurerbara och mätas
-med monotona lokala timers där det går. `observed_at` är diagnostik; ordning
-avgörs inte av väggklockor.
+Observe-only-processmätning ska ge underlag för poll/missing innan en collector
+får äga runtime-livscykel. Lease, recovery och tombstone ska kalibreras innan
+durable relaystate införs. Tiderna ska vara konfigurerbara och mätas med monotona
+lokala timers där det går. `observed_at` är diagnostik; ordning avgörs inte av
+väggklockor.
 
 ## 4. Processdetektering och identitetskoppling
 
@@ -685,8 +690,8 @@ Det förhindrar att ett source-namn felaktigt blir en instansidentitet.
 ## 9. En-LED-presentation
 
 En LED är ett sekundärt presentationsläge; fler-pixel är huvudprodukten. ADR-12,
-valet av standardläge för en LED, är öppet till Paket 6. Lägena nedan är
-produktalternativ, inte konkurrerande domänmodeller.
+valet av standardläge för en LED, ska avgöras innan en-LED-v2 implementeras.
+Lägena nedan är produktalternativ, inte konkurrerande domänmodeller.
 
 Alla lägen läser en immutable snapshot av instansregistret:
 

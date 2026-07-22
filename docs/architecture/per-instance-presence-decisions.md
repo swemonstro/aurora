@@ -4,6 +4,12 @@ Status: föreslagen arkitektur med fattade och öppna beslut
 
 Huvuddesign: [per-instance presence](per-instance-presence.md)
 
+Kanonisk aktuell paketnumrering:
+[roadmap för per-instance presence](per-instance-presence-roadmap.md).
+Roadmapen supersedar paketnamn och tidsordning i avsnitt 4 nedan. Fattade ADR-
+principer i detta dokument gäller fortsatt om roadmapen inte uttryckligen säger
+annat.
+
 ## 1. Beslutsklasser
 
 Dokumentet skiljer på fyra kategorier:
@@ -35,7 +41,7 @@ anger att just den principen är låst inom förslaget.
 | ADR-09 | V2 har separat instans-API och presentations-API; `/presence` är legacyprojektion. | Hindrar en-LED-aggregat från att bli domänmodell. | **BESLUTAD** |
 | ADR-10 | En tom v2-lista ger HTTP 200 och betyder `sleeping`; offline, 5xx och schemafel är separata klienttillstånd. | Tomt register är ett normalt produkttillstånd. | **BESLUTAD** |
 | ADR-11 | Relay använder minimal persistence plus leases och full re-registration. | In-memory ensamt tappar slotstabilitet; persistence ensam kan behålla spökinstanser. | **BESLUTAD** |
-| ADR-12 | Standardläge för en LED är ännu inte valt. Fler-pixel är huvudprodukten; en-LED-läget är endast presentation och får aldrig påverka kanonisk modell, status eller slots. | Valet mellan priority, cycle, pinned och summary kräver produkt-/användartest. | **ÖPPET PRODUKT-/PRESENTATIONSBESLUT — senast före Paket 6** |
+| ADR-12 | Standardläge för en LED är ännu inte valt. Fler-pixel är huvudprodukten; en-LED-läget är endast presentation och får aldrig påverka kanonisk modell, status eller slots. | Valet mellan priority, cycle, pinned och summary kräver produkt-/användartest. | **ÖPPET PRODUKT-/PRESENTATIONSBESLUT — före en-LED-v2** |
 | ADR-13 | Linux är första adapter; kärna, adapterkontrakt och fixtures är plattformsneutrala. | Ger leveransbar omfattning utan att låsa arkitekturen eller påstå färdigt Windows/macOS-stöd. | **BESLUTAD** |
 | ADR-14 | Rå argv, CWD, transcript-path, prompt, terminaloutput och generell miljödata lämnar aldrig klientmaskinen. | Upprätthåller README:s integritetslöfte och minskar läckagerisk. | **BESLUTAD** |
 
@@ -69,10 +75,18 @@ diagnostik", aldrig "gissa och mutera".
 
 ## 4. Migreringsplan
 
+> **Historisk plan:** Paketnumreringen i detta avsnitt beskriver den ursprungliga
+> migreringsplanen och är inte längre aktuell. Den får inte användas för att
+> namnge nya leveranser. Se den
+> [kanoniska roadmapen](per-instance-presence-roadmap.md) för implementerade
+> Paket 0–4, Paket 4.5 och det planerade Paket 5. ADR-besluten och tekniska
+> säkerhetskraven nedan förblir relevanta även när deras gamla paketnummer har
+> supersedats.
+
 Varje arbetspaket ska kunna verifieras och rullas tillbaka utan att kräva att
 nästa paket redan finns.
 
-### Paket 0: kontrakt och fixtures
+### Historiskt steg 0: kontrakt och fixtures
 
 - Definiera plattformsneutrala domän-, adapter-, korrelations- och
   coordinatorgränssnitt.
@@ -90,7 +104,7 @@ Paket 0 ska inte låsa den slutliga automatiska bindningströskeln. Verifiering:
 gränssnitt, invariants och fixtures kan testas utan daemon, verkliga processer
 eller ESP, och mätplanen innehåller inga förbjudna datafält.
 
-### Paket 1: domänkärna och in-memory v2 bakom feature flag
+### Historiskt steg 1: domänkärna och in-memory v2 bakom feature flag
 
 - Inför `Instance`, skilda runtime/hookclaims, revisioner och lifecycle state.
 - Implementera korrelations- och slotcoordinatorgränssnitt som rena komponenter.
@@ -100,7 +114,7 @@ eller ESP, och mätplanen innehåller inga förbjudna datafält.
 Verifiering: två instanser med samma provider förblir separata; processpoll kan
 inte sänka hookstate; slotar kompakteras inte; stale revision ger konflikt.
 
-### Paket 2: Linux processadapter och collector, observe-only
+### Historiskt steg 2: Linux processadapter och collector, observe-only
 
 - Implementera samma-användare-observation via `/proc`, starttid och processfamilj.
 - Klassificera Claude samt Codex Node/native utan att kräva wrapper.
@@ -114,7 +128,7 @@ inte sänka hookstate; slotar kompakteras inte; stale revision ger konflikt.
 Verifiering: fixtures plus riktiga parallella starter; inga kommandorader,
 sökvägar eller miljövärden förekommer i logg eller nättrafik.
 
-### Paket 3: lokal hook-IPC och säker bindning
+### Historiskt steg 3: lokal hook-IPC och säker bindning
 
 - Lås den automatiska bindningströskeln från Paket 2:s observe-only-underlag
   innan Paket 3 börjar.
@@ -129,7 +143,7 @@ samma terminalmiljö; ingen avsiktligt tvetydig hook får mutera en kandidat.
 Det här paketet får inte kräva `bin/aurora-codex`. Wrappern kan finnas kvar som
 legacy under övergången, men vanliga `codex` måste ge full processlivscykel.
 
-### Paket 4: durable relay, leases och v2 shadow traffic
+### Historiskt steg 4: durable relay, leases och v2 shadow traffic
 
 - Lägg minimal atomisk persistence, recovery window och collector
   re-registration.
@@ -142,7 +156,7 @@ Verifiering: samma instance-ID och slots återkommer efter relayrestart; ej
 återregistrerade poster försvinner efter lease/recovery; ingen tombstone
 återupplivas med återanvänd PID.
 
-### Paket 5: fler-pixel-ESP på v2
+### Historiskt steg 5: fler-pixel-ESP på v2
 
 - Implementera full snapshot, slotrendering, overflow och strikt schemavalidering.
 - Skilj sleeping, offline, 5xx, 4xx och invalid-data visuellt.
@@ -151,7 +165,7 @@ Verifiering: samma instance-ID och slots återkommer efter relayrestart; ej
 Verifiering: 0, 1, 4 och 6 instanser på en fyrpixelsenhet; ESP-omstart behåller
 placering; avslutad mitteninstans flyttar inte andra pixlar.
 
-### Paket 6: v1 som projektion och en-LED-v2
+### Historiskt steg 6: v1 som projektion och en-LED-v2
 
 - Låt `GET /presence` projicera v2 med exakt dagens format och prioritet.
 - Isolera legacy POST/DELETE så att source-writes aldrig blir v2-instanser.
@@ -162,7 +176,7 @@ placering; avslutad mitteninstans flyttar inte andra pixlar.
 Verifiering: dagens relay/agent-integrationstester fortsätter passera; gammal ESP
 ser ingen wire-förändring; ny en-LED-ESP ändrar aldrig kanonisk state.
 
-### Paket 7: plattformsadaptrar
+### Historiskt steg 7: plattformsadaptrar
 
 - Implementera och validera macOS-adaptern mot samma kontraktsfixtures.
 - Implementera och validera Windows-adaptern med creation time,
@@ -173,7 +187,7 @@ ser ingen wire-förändring; ny en-LED-ESP ändrar aldrig kanonisk state.
 Windows och macOS är arkitekturellt inrymda från paket 0 men inte levererade bara
 för att Linux-adaptern finns.
 
-### Paket 8: avveckla legacy
+### Historiskt steg 8: avveckla legacy
 
 - Ta bort wrapperkravet och sedan wrappern först när processdetekteringens
   acceptanskriterier är uppfyllda i stödda miljöer.
@@ -202,26 +216,26 @@ presentationsvägar, inte genom osäker sourcebaserad deduplicering.
 
 | Fråga | Vad återstår | Måste vara avgjort senast |
 | --- | --- | --- |
-| Runtime root-regler | Verifierade executable-identiteter och kända Claude-/Codex-Node/native-topologier för Linux; processnamn ensamt är otillräckligt. | Före Paket 2 |
-| Automatisk bindningströskel | Vilka kombinationer av ancestor, processgrupp, session, TTY och starttid som efter observe-only-mätning får räknas som exakt en säker instans. | Före Paket 3 |
-| V2 write-schema och auth-roller | Exakta requestfält, idempotensfel och maskinell separation mellan runtime- och hookägarskap. | Före Paket 1 |
-| Tillåten fjärrmetadata | Allowlist för opaka ID:n, provider/profile och eventuell grov version. De data som förbjuds av ADR-14 är inte öppna för omprövning. | Före Paket 1 |
-| Credential/bootstrap | Hur en per-user-collector autentiseras mot relay på loopback, betrott LAN och andra nät. | Före Paket 4 |
-| Persistenceformat | Embedded/atomiskt format, schemaevolution och crash consistency för beslutad minimal persistence. | Före Paket 4 |
-| Slotnamespace | Om global `default` räcker eller om en deployment behöver flera namngivna globala layouter; relayn förblir ägare. | Före Paket 1 |
-| Sen återkomst efter lease-expiry | Maximal reservation och reactivation-policy utan att skriva över en ny instans. | Före Paket 4 |
-| Kompatibilitetsperiod | Kalenderlängd, releasevillkor och mätbart villkor för att avveckla legacy-writes/read. | Före Paket 6 |
+| Runtime root-regler | Verifierade executable-identiteter och kända Claude-/Codex-Node/native-topologier för Linux; processnamn ensamt är otillräckligt. | Före verklig hookanslutning |
+| Automatisk bindningströskel | Vilka kombinationer av ancestor, processgrupp, session, TTY och starttid som efter observe-only-mätning får räknas som exakt en säker instans. | Före bindningsmutation |
+| V2 write-schema och auth-roller | Exakta requestfält, idempotensfel och maskinell separation mellan runtime- och hookägarskap. | Före aktivt v2-write-API |
+| Tillåten fjärrmetadata | Allowlist för opaka ID:n, provider/profile och eventuell grov version. De data som förbjuds av ADR-14 är inte öppna för omprövning. | Före aktiv v2-publicering |
+| Credential/bootstrap | Hur en per-user-collector autentiseras mot relay på loopback, betrott LAN och andra nät. | Före collector–relay-integration |
+| Persistenceformat | Embedded/atomiskt format, schemaevolution och crash consistency för beslutad minimal persistence. | Före durable relaystate |
+| Slotnamespace | Om global `default` räcker eller om en deployment behöver flera namngivna globala layouter; relayn förblir ägare. | Före aktiv global slottilldelning |
+| Sen återkomst efter lease-expiry | Maximal reservation och reactivation-policy utan att skriva över en ny instans. | Före durable relaystate |
+| Kompatibilitetsperiod | Kalenderlängd, releasevillkor och mätbart villkor för att avveckla legacy-writes/read. | Före v1-avveckling |
 
 ### 6.2 Parametrar som ska mätas
 
 | Parameter/fråga | Underlag | Måste vara kalibrerad/avgjord senast |
 | --- | --- | --- |
-| Pollintervall och antal missar | Paket 2 mäter exitlatens och falska missing vid Ctrl+C, krasch, SSH- och terminalbortfall. | Före Paket 3 |
-| Automatisk bindningströskel | Paket 2 mäter signalernas entydighet utan produktionsmutationer. | Före Paket 3 |
-| Relay-lease och recovery window | Disconnect-/restarttester och önskad stale-tid. | Före Paket 4 |
-| Tombstone-retention | Restart-, delta- och supportbehov. | Före Paket 4 |
-| Behov av delta-/streaming-API | Snapshotstorlek, instansantal och enheternas nätbudget. | Före Paket 5 |
-| Säker insamling av `tool.version` | Adaptermätning utan argv eller annan ADR-14-data; `unknown` förblir giltigt. | Före Paket 2 |
+| Pollintervall och antal missar | Observe-only-adaptern mäter exitlatens och falska missing vid Ctrl+C, krasch, SSH- och terminalbortfall. | Före collector-livscykel |
+| Automatisk bindningströskel | Observe-only-korrelation mäter signalernas entydighet utan produktionsmutationer. | Före bindningsmutation |
+| Relay-lease och recovery window | Disconnect-/restarttester och önskad stale-tid. | Före durable relaystate |
+| Tombstone-retention | Restart-, delta- och supportbehov. | Före durable relaystate |
+| Behov av delta-/streaming-API | Snapshotstorlek, instansantal och enheternas nätbudget. | Före klient som kräver delta/streaming |
+| Säker insamling av `tool.version` | Adaptermätning utan argv eller annan ADR-14-data; `unknown` förblir giltigt. | Före publicering av tool-version |
 
 Mätning får justera numeriska parametrar men aldrig luckra upp invarianten att en
 osäker hook inte muterar någon kandidat.
@@ -230,10 +244,10 @@ osäker hook inte muterar någon kandidat.
 
 | Fråga | Avgränsning | Måste vara avgjord senast |
 | --- | --- | --- |
-| ADR-12: standard för en LED | Välj mellan priority, cycle, pinned eller summary och eventuell akut preemption. Fler-pixel är huvudprodukt; valet ändrar inte kanonisk data. | Före Paket 6 |
-| Overflow-animation | Hur en enhet med färre pixlar än instanser signalerar overflow. | Före Paket 5 |
-| Sleeping/offline/felfärger | Visuell och tillgänglighetsmässig kodning; semantisk åtskillnad är redan beslutad. | Före Paket 5 |
-| Cycle dwell och preemption | Behövs endast om ADR-12 väljer cycle eller en valbar cycle-mode. | Före Paket 6 |
+| ADR-12: standard för en LED | Välj mellan priority, cycle, pinned eller summary och eventuell akut preemption. Fler-pixel är huvudprodukt; valet ändrar inte kanonisk data. | Före en-LED-v2 |
+| Overflow-animation | Hur en enhet med färre pixlar än instanser signalerar overflow. | Före fler-pixel-v2 |
+| Sleeping/offline/felfärger | Visuell och tillgänglighetsmässig kodning; semantisk åtskillnad är redan beslutad. | Före v2-firmware |
+| Cycle dwell och preemption | Behövs endast om ADR-12 väljer cycle eller en valbar cycle-mode. | Före cycle-presentation |
 
 ## 7. Acceptanskriterier för arkitekturen
 

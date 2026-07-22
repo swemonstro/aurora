@@ -103,13 +103,15 @@ bakgrundsprocess eller filutdata:
 Ingen rå kommandorad, miljö, sökväg eller annan känslig processdata skrevs ut
 eller sparades.
 
-## Öppet inför Paket 3 och medvetet ej implementerat
+## Fortsatt öppet efter Paket 2 och medvetet ej implementerat
 
 Observe-only-underlaget behöver fler märkta parallell-, wrapper-, reparenting-,
 Ctrl+C-, krasch-, SSH- och terminaldödsfall för false-positive/negative-tal och
 exit-latens. Verifierade executable-signaturer, USER_HZ per stödd arkitektur och
 exakta Linux runtime-root-regler behöver kalibreras. Automatisk
-hookbindningströskel beslutas först från detta underlag före Paket 3.
+hookbindningströskel beslutas först från representativt underlag och före ett
+framtida muterande bindningspaket. Paket 3:s senare korrelation och Paket 4:s
+lokala transport förblir observe-only och utgör inte ett sådant beslut.
 
 Paket 2 implementerar ingen hookkorrelation eller bindning, collector, polling i
 bakgrunden, registry-/slotmutation, relay-/v2-endpoint, persistence, feature flag,

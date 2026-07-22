@@ -45,5 +45,6 @@ Node/native-familjer, PID-återanvändning, Ctrl+C, krasch, SSH-bortfall och
 terminaldöd. Osäker korrelation muterar fortfarande ingen kandidat.
 
 Den slutliga automatiska bindningströskeln är avsiktligt inte definierad i
-Paket 0. Den beslutas först efter Paket 2:s observe-only-resultat och måste vara
-låst innan Paket 3 inför lokal hook-IPC och automatisk bindning.
+Paket 0. Paket 3 och Paket 4 är fortsatt observe-only och har inte låst eller
+aktiverat automatisk bindning. Tröskeln får beslutas först efter representativa
+mätresultat och måste vara låst före ett framtida muterande bindningspaket.
