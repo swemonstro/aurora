@@ -10,6 +10,7 @@ import (
 
 	"github.com/swemonstro/aurora/internal/agent"
 	"github.com/swemonstro/aurora/internal/claudehook"
+	"github.com/swemonstro/aurora/internal/localhooktransport"
 	"github.com/swemonstro/aurora/internal/publish"
 	"github.com/swemonstro/aurora/internal/sourcelifecycle"
 )
@@ -34,6 +35,10 @@ func run(ctx context.Context, input io.Reader, getenv func(string) string) error
 	event, err := claudehook.ParseEvent(rawInput)
 	if err != nil {
 		return err
+	}
+	// Package 6 local ingress is fail-open and independent of v1 state/relay.
+	if ingress, ingressErr := claudehook.LocalIngressObservation(event); ingressErr == nil {
+		localhooktransport.TryDeliverIngress(ctx, getenv, ingress)
 	}
 	stateConfig, err := claudehook.StateConfigFromEnv(getenv, os.UserHomeDir)
 	if err != nil {

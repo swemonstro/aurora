@@ -8,6 +8,9 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	"github.com/swemonstro/aurora/internal/instancecorrelation"
+	"github.com/swemonstro/aurora/internal/instancepresence"
 )
 
 type LogEvent struct {
@@ -25,18 +28,19 @@ type Logger interface {
 }
 
 type Server struct {
-	config        Config
-	receiver      *Receiver
-	ingest        *IngestReceiver
-	authenticator Authenticator
-	logger        Logger
-	listener      *ownedListener
-	semaphore     chan struct{}
-	done          chan struct{}
-	closeFinished chan struct{}
-	closeOnce     sync.Once
-	closeErr      error
-	wait          sync.WaitGroup
+	config           Config
+	receiver         *Receiver
+	ingest           *IngestReceiver
+	authenticator    Authenticator
+	logger           Logger
+	identityObserver IngestIdentityObserver
+	listener         *ownedListener
+	semaphore        chan struct{}
+	done             chan struct{}
+	closeFinished    chan struct{}
+	closeOnce        sync.Once
+	closeErr         error
+	wait             sync.WaitGroup
 }
 
 func NewServer(config Config, receiver *Receiver, authenticator Authenticator, logger Logger) (*Server, error) {
@@ -79,6 +83,20 @@ func (server *Server) IngestReceiver() *IngestReceiver {
 	return server.ingest
 }
 
+// SetIdentityObserver attaches an optional Package 7.0 diagnostic observer.
+// Nil disables measurement. The observer must not affect Package 6 responses.
+func (server *Server) SetIdentityObserver(observer IngestIdentityObserver) {
+	if server == nil {
+		return
+	}
+	server.identityObserver = observer
+}
+
+// IdentityObserverEnabled reports whether a diagnostic observer is attached.
+func (server *Server) IdentityObserverEnabled() bool {
+	return server != nil && server.identityObserver != nil
+}
+
 func (server *Server) Serve(ctx context.Context) error {
 	stop := make(chan struct{})
 	go func() {
@@ -117,7 +135,7 @@ func (server *Server) authorizeAndDispatch(connection *net.UnixConn) {
 		go func() {
 			defer server.wait.Done()
 			defer func() { <-server.semaphore }()
-			server.handleAuthenticated(connection)
+			server.handleAuthenticated(connection, peer)
 		}()
 	default:
 		server.writeImmediate(connection, emptyResponse(StatusRejected, "", CodeConcurrencyLimit))
@@ -126,8 +144,18 @@ func (server *Server) authorizeAndDispatch(connection *net.UnixConn) {
 	}
 }
 
-func (server *Server) handleAuthenticated(connection *net.UnixConn) {
+func (server *Server) handleAuthenticated(connection *net.UnixConn, peer PeerIdentity) {
 	defer connection.Close()
+	// Package 7.0 diagnostic ordering: capture peer generation and bounded
+	// verified parent chain immediately after auth, before request frame read,
+	// while the hook helper is still expected to be alive. Connection-local only.
+	var peerCapture IdentityPeerCapture
+	var haveCapture bool
+	if server.identityObserver != nil {
+		peerCapture = server.safeCapturePeer(peer)
+		haveCapture = true
+	}
+
 	started := server.config.Clock.Now()
 	_ = connection.SetReadDeadline(started.Add(server.config.ReadDeadline))
 	data, err := readFrame(connection, server.config.MaximumRequestBytes)
@@ -138,7 +166,7 @@ func (server *Server) handleAuthenticated(connection *net.UnixConn) {
 
 	version, versionErr := peekProtocolVersion(data)
 	if versionErr == nil && version == IngestProtocolVersion {
-		server.handleIngest(connection, data, started)
+		server.handleIngest(connection, data, started, peerCapture, haveCapture)
 		return
 	}
 
@@ -155,11 +183,14 @@ func (server *Server) handleAuthenticated(connection *net.UnixConn) {
 	server.logEventForResponse(response, server.config.Clock.Now().Sub(started))
 }
 
-func (server *Server) handleIngest(connection *net.UnixConn, data []byte, started time.Time) {
+func (server *Server) handleIngest(connection *net.UnixConn, data []byte, started time.Time, peerCapture IdentityPeerCapture, haveCapture bool) {
 	if server.ingest == nil {
 		response := emptyIngestResponse(StatusRejected, "", CodeUnsupportedOperation)
 		server.writeIngestImmediate(connection, response)
 		server.logIngestEvent(response, server.config.Clock.Now().Sub(started))
+		if haveCapture {
+			server.safeCompleteIngest(peerCapture, "", "", false)
+		}
 		return
 	}
 	handleCtx, cancel := context.WithTimeout(context.Background(), server.ingest.config.MaximumHandlingTime)
@@ -173,6 +204,55 @@ func (server *Server) handleIngest(connection *net.UnixConn, data []byte, starte
 	}
 	_ = writeFrame(connection, encoded, server.ingest.config.MaximumResponseBytes)
 	server.logIngestEvent(response, server.config.Clock.Now().Sub(started))
+
+	// Join uses the pre-captured ancestry + validated tool only. Never rewrite
+	// the Package 6 response on measurement failure or success.
+	if haveCapture {
+		tool, lifecycle, validated := ingestValidationFrom(data, response)
+		server.safeCompleteIngest(peerCapture, tool, lifecycle, validated)
+	}
+}
+
+func ingestValidationFrom(data []byte, response IngestResponse) (instancepresence.ToolKind, instancecorrelation.Lifecycle, bool) {
+	// StatusOK and StatusDuplicate both imply the request body was accepted as
+	// a valid Package 6 ingress envelope (duplicate still carried a valid body).
+	if response.Status != StatusOK && response.Status != StatusDuplicate {
+		return "", "", false
+	}
+	request, err := DecodeIngestRequestJSON(data)
+	if err != nil {
+		return "", "", false
+	}
+	if err := request.Payload.Tool.Validate(); err != nil {
+		return "", "", false
+	}
+	if err := request.Payload.Lifecycle.Validate(); err != nil {
+		return "", "", false
+	}
+	return request.Payload.Tool, request.Payload.Lifecycle, true
+}
+
+func (server *Server) safeCapturePeer(peer PeerIdentity) (capture IdentityPeerCapture) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			capture = IdentityPeerCapture{
+				PeerUID: peer.UID, PeerGID: peer.GID, PeerPID: peer.PID,
+				ReasonCodes: []string{"attestation_internal_error"},
+			}
+		}
+	}()
+	if server.identityObserver == nil {
+		return IdentityPeerCapture{}
+	}
+	return server.identityObserver.CapturePeer(peer)
+}
+
+func (server *Server) safeCompleteIngest(capture IdentityPeerCapture, tool instancepresence.ToolKind, lifecycle instancecorrelation.Lifecycle, validated bool) {
+	defer func() { _ = recover() }()
+	if server.identityObserver == nil {
+		return
+	}
+	server.identityObserver.CompleteIngest(capture, tool, lifecycle, validated)
 }
 
 func (server *Server) writeIngestImmediate(connection *net.UnixConn, response IngestResponse) {

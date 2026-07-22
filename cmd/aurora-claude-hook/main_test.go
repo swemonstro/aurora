@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -15,6 +17,9 @@ import (
 	"time"
 
 	"github.com/swemonstro/aurora/internal/claudehook"
+	"github.com/swemonstro/aurora/internal/instancecorrelation"
+	"github.com/swemonstro/aurora/internal/instancepresence"
+	"github.com/swemonstro/aurora/internal/localhooktransport"
 	"github.com/swemonstro/aurora/internal/presence"
 	"github.com/swemonstro/aurora/internal/status"
 )
@@ -376,4 +381,252 @@ func TestHookHelperProcess(t *testing.T) {
 	}
 	run(context.Background(), os.Stdin, os.Getenv)
 	os.Exit(0)
+}
+
+func TestLocalIngressDeliveryEnabledReachesSocket(t *testing.T) {
+	requests := make(chan localhooktransport.IngestRequest, 1)
+	socketPath := startLocalIngestSocket(t, requests)
+
+	relayHits := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		relayHits <- struct{}{}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	values := map[string]string{
+		claudehook.RelayURLEnv:                 server.URL,
+		claudehook.StateFileEnv:                filepath.Join(t.TempDir(), "sessions.json"),
+		localhooktransport.EnvLocalHookEnabled: "1",
+		localhooktransport.EnvLocalHookSocket:  socketPath,
+	}
+	if err := run(
+		context.Background(),
+		strings.NewReader(`{"hook_event_name":"UserPromptSubmit","session_id":"session-a"}`),
+		func(key string) string { return values[key] },
+	); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	select {
+	case request := <-requests:
+		if request.ProtocolVersion != localhooktransport.IngestProtocolVersion {
+			t.Fatalf("protocol_version = %d, want %d", request.ProtocolVersion, localhooktransport.IngestProtocolVersion)
+		}
+		if request.Operation != localhooktransport.OperationIngestHookEvent {
+			t.Fatalf("operation = %q, want %q", request.Operation, localhooktransport.OperationIngestHookEvent)
+		}
+		if request.Payload.Tool != instancepresence.ToolClaude {
+			t.Fatalf("tool = %q, want %q", request.Payload.Tool, instancepresence.ToolClaude)
+		}
+		if request.Payload.HookSessionRef != "session-a" {
+			t.Fatalf("hook_session_ref = %q, want session-a", request.Payload.HookSessionRef)
+		}
+		if request.Payload.Lifecycle != instancecorrelation.LifecycleActive {
+			t.Fatalf("lifecycle = %q, want %q", request.Payload.Lifecycle, instancecorrelation.LifecycleActive)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("enabled local delivery did not reach socket")
+	}
+
+	select {
+	case <-relayHits:
+	case <-time.After(time.Second):
+		t.Fatal("relay did not receive publication")
+	}
+}
+
+func TestLocalIngressDeliveryDisabledDoesNothing(t *testing.T) {
+	requests := make(chan localhooktransport.IngestRequest, 1)
+	socketPath := startLocalIngestSocket(t, requests)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	values := map[string]string{
+		claudehook.RelayURLEnv:                 server.URL,
+		claudehook.StateFileEnv:                filepath.Join(t.TempDir(), "sessions.json"),
+		localhooktransport.EnvLocalHookEnabled: "0",
+		localhooktransport.EnvLocalHookSocket:  socketPath,
+	}
+	if err := run(
+		context.Background(),
+		strings.NewReader(`{"hook_event_name":"UserPromptSubmit","session_id":"session-a"}`),
+		func(key string) string { return values[key] },
+	); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	select {
+	case request := <-requests:
+		t.Fatalf("disabled local delivery reached socket: %#v", request)
+	case <-time.After(150 * time.Millisecond):
+	}
+}
+
+func TestLocalIngressUnavailableSocketDoesNotAffectRelay(t *testing.T) {
+	directory := secureTempDir(t)
+	socketPath := filepath.Join(directory, "missing.sock")
+
+	relayHits := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		relayHits <- struct{}{}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	values := map[string]string{
+		claudehook.RelayURLEnv:                 server.URL,
+		claudehook.StateFileEnv:                filepath.Join(t.TempDir(), "sessions.json"),
+		localhooktransport.EnvLocalHookEnabled: "1",
+		localhooktransport.EnvLocalHookSocket:  socketPath,
+	}
+	if err := run(
+		context.Background(),
+		strings.NewReader(`{"hook_event_name":"UserPromptSubmit","session_id":"session-a"}`),
+		func(key string) string { return values[key] },
+	); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	select {
+	case <-relayHits:
+	case <-time.After(time.Second):
+		t.Fatal("relay publication failed when local socket was unavailable")
+	}
+}
+
+func TestLocalIngressUnsupportedEventIsNotDelivered(t *testing.T) {
+	requests := make(chan localhooktransport.IngestRequest, 1)
+	socketPath := startLocalIngestSocket(t, requests)
+
+	relayHits := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		relayHits <- struct{}{}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	values := map[string]string{
+		claudehook.RelayURLEnv:                 server.URL,
+		claudehook.StateFileEnv:                filepath.Join(t.TempDir(), "sessions.json"),
+		localhooktransport.EnvLocalHookEnabled: "1",
+		localhooktransport.EnvLocalHookSocket:  socketPath,
+	}
+	if err := run(
+		context.Background(),
+		strings.NewReader(`{"hook_event_name":"PreToolUse","session_id":"session-a","tool_name":"Bash"}`),
+		func(key string) string { return values[key] },
+	); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	select {
+	case request := <-requests:
+		t.Fatalf("unsupported event was delivered locally: %#v", request)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	select {
+	case <-relayHits:
+		t.Fatal("unsupported event was published to relay")
+	default:
+	}
+}
+
+func startLocalIngestSocket(t *testing.T, requests chan<- localhooktransport.IngestRequest) string {
+	t.Helper()
+	directory := secureTempDir(t)
+	socketPath := filepath.Join(directory, "hook.sock")
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: socketPath, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(socketPath, 0o600); err != nil {
+		listener.Close()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = listener.Close()
+		_ = os.Remove(socketPath)
+	})
+
+	go func() {
+		connection, acceptErr := listener.AcceptUnix()
+		if acceptErr != nil {
+			return
+		}
+		defer connection.Close()
+		_ = connection.SetDeadline(time.Now().Add(time.Second))
+
+		var header [4]byte
+		if _, err := io.ReadFull(connection, header[:]); err != nil {
+			return
+		}
+		size := binary.BigEndian.Uint32(header[:])
+		if size == 0 || size > localhooktransport.DefaultIngestMaximumRequestBytes {
+			return
+		}
+		payload := make([]byte, size)
+		if _, err := io.ReadFull(connection, payload); err != nil {
+			return
+		}
+		request, err := localhooktransport.DecodeIngestRequestJSON(payload)
+		if err != nil {
+			return
+		}
+		response := localhooktransport.IngestResponse{
+			ProtocolVersion:    localhooktransport.IngestProtocolVersion,
+			RequestID:          request.RequestID,
+			Status:             localhooktransport.StatusOK,
+			ErrorCodes:         []localhooktransport.ErrorCode{},
+			NoBindingPerformed: true,
+		}
+		encoded, err := localhooktransport.EncodeIngestResponseJSON(response, localhooktransport.DefaultIngestMaximumResponseBytes)
+		if err != nil {
+			return
+		}
+		var responseHeader [4]byte
+		binary.BigEndian.PutUint32(responseHeader[:], uint32(len(encoded)))
+		if _, err := connection.Write(responseHeader[:]); err != nil {
+			return
+		}
+		if _, err := connection.Write(encoded); err != nil {
+			return
+		}
+		select {
+		case requests <- request:
+		default:
+		}
+	}()
+	return socketPath
+}
+
+// secureTempDir creates a private directory under the home path. Package 6
+// rejects sockets under /tmp, so t.TempDir() is not usable for local delivery.
+func secureTempDir(t *testing.T) string {
+	t.Helper()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	home, err = filepath.EvalSymlinks(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory, err := os.MkdirTemp(home, ".aurora-claude-hook-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(directory); err != nil {
+			t.Errorf("remove secure test directory: %v", err)
+		}
+	})
+	return directory
 }

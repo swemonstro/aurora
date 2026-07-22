@@ -881,7 +881,111 @@ Docs-first Package 7.0 does not activate anything.
   peer generation capture follows immediately after auth.
 - Process backend and recognition remain the only agent classification path.
 
-## 16. Unresolved questions requiring Blue1 measurements
+## 16. Manual Blue1 measurement diagnostic (read-only)
+
+A default-off, manually invoked diagnostic is available on the local presence
+server for collecting Package 7.0 evidence on Blue1. It is **not** production
+attestation authorization and does **not** emit `propose_bind`.
+
+### 16.1 Enablement
+
+Off unless an absolute JSONL path is provided via:
+
+- flag: `-identity-measure-file /absolute/path/to/identity-measure.jsonl`
+- or env: `AURORA_IDENTITY_MEASURE_FILE` (same absolute path semantics)
+
+Package 6 ingest still requires `AURORA_LOCAL_HOOK_ENABLED=true` on both the
+server process environment (for composition) and the hook client environment.
+
+### 16.2 First Claude measurement command
+
+In a dedicated shell (foreground server; no systemd install):
+
+```bash
+# Terminal A — local server with Package 6 ingest + Package 7.0 measure
+export AURORA_LOCAL_HOOK_ENABLED=true
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+MEASURE_FILE="${XDG_RUNTIME_DIR}/aurora/package70-identity-measure.jsonl"
+mkdir -p "${XDG_RUNTIME_DIR}/aurora"
+chmod 700 "${XDG_RUNTIME_DIR}/aurora"
+: > "$MEASURE_FILE"
+chmod 600 "$MEASURE_FILE"
+
+go run ./cmd/aurora-presence-local-server \
+  -host-id blue1-manual \
+  -socket "${XDG_RUNTIME_DIR}/aurora/presence-hook.sock" \
+  -identity-measure-file "$MEASURE_FILE"
+```
+
+In another shell, run a real Claude session whose hooks deliver Package 6
+ingress to that socket (feature flag on, same socket path). Then inspect:
+
+```bash
+# Terminal B — after Claude hook events fire
+wc -l "$MEASURE_FILE"
+tail -n 5 "$MEASURE_FILE" | python3 -m json.tool
+```
+
+### 16.3 Stop without changing installed services
+
+The diagnostic runs only in the foreground process that was started with the
+flag/env. Stop it with Ctrl-C or `SIGTERM` on that process. Do **not** change
+systemd units, installed hooks, or production defaults. Leaving
+`-identity-measure-file` unset (and unsetting `AURORA_IDENTITY_MEASURE_FILE`)
+keeps the observer off on the next start.
+
+### 16.4 Capture timing (measurement)
+
+On each authenticated connection when the diagnostic is enabled:
+
+1. **Immediately after peer auth, before reading the request frame:** capture
+   peer generation (`PID` + start time) and a bounded verified parent chain.
+   This must not wait until after the Package 6 response — the hook helper may
+   exit then.
+2. **After strict Package 6 request validation:** use validated `tool` only as
+   a candidate **namespace** to join the **pre-captured** chain against current
+   recognized runtime candidates (long-lived agent processes).
+3. Append one JSONL record. Measurement failure or success **must not** change
+   the Package 6 wire response.
+
+This diagnostic is **not** approved production attestation. A single candidate
+link must not be labeled as production `trusted_hard_identity_present`.
+
+### 16.5 JSON Lines output schema
+
+Each Package 6 handling path may append one JSON object (schema
+`aurora.package70.identity_measure.v1`) with content-free fields including:
+
+| Field | Meaning |
+| --- | --- |
+| `schema` | `aurora.package70.identity_measure.v1` |
+| `measured_at` | UTC timestamp |
+| `tool` / `lifecycle` | Validated Package 6 namespace only when `validated_ingress` |
+| `validated_ingress` | Request was a valid Package 6 body |
+| `peer_uid` / `peer_pid` | From `SO_PEERCRED` |
+| `peer_generation_ok` / `peer_started_at` | Server-side generation capture (pre-request) |
+| `ancestry` | Pre-request verified PID+start hops; root/member match flags after join |
+| `possible_links` | Candidate L1/L2/L3 links (diagnostic, not bind) |
+| `matching_runtime_count` | Zero / one / multiple |
+| `link_rules` | Sorted rule names present |
+| `reason_codes` | Sorted content-free codes |
+| `capture_duration_micros` / `measure_duration_micros` | Timing |
+| `duration_bucket` | Coarse latency bucket |
+| `diagnostic_unique_link` | True only when exactly one candidate link was observed; **not** production hard identity |
+| `package6_sequencing_independent` | Always `true` |
+| `no_mutation_performed` | Always `true` |
+
+Related diagnostic reason codes include `diagnostic_unique_link`,
+`diagnostic_no_unique_link`, and `diagnostic_ambiguous_link`. Do not treat these
+as Package 7 authorization.
+
+Implementation: `internal/linuxidentitymeasure` observer attached from
+`cmd/aurora-presence-local-server` only when the path is set. Peer generation and
+ancestry use `linuxprocess.CaptureAncestryChain` immediately after auth.
+Measurement failure never rejects an otherwise valid Package 6 observe-only
+ingress.
+
+## 17. Unresolved questions requiring Blue1 measurements
 
 These are **evidence gaps**, not permission to weaken fail-closed behavior or to
 trust client fields.
@@ -910,10 +1014,11 @@ trust client fields.
 10. **False-link scenarios** under shared TTY/process group with distinct
     families — confirm soft context constraints do not over-merge.
 
-Until (1)–(4) and (9)–(10) are answered with labeled evidence, Package 7 must
-not treat the bridge as production-authorizing even if code lands behind flags.
+Use section 16’s diagnostic to collect labeled JSONL for (1)–(5) and (9)–(10).
+Until those are answered with evidence, Package 7 must not treat the bridge as
+production-authorizing even if code lands behind flags.
 
-## 17. Worked examples
+## 18. Worked examples
 
 ### Example A — Packages 0–6 only
 
@@ -977,18 +1082,17 @@ hold.
 
 → Registry unchanged; `no_mutation_performed=true` end-to-end until Package 8.
 
-## 18. Implementation sketch (non-normative placement)
-
-Future code ownership hint only:
+## 19. Implementation sketch (non-normative placement)
 
 | Layer | Responsibility |
 | --- | --- |
-| `localhooktransport` (Linux) | Accept, peer creds, frame read; no agent rules |
-| `linuxprocess` / small attestor helper | Generation double-read; verified parent edges |
-| Composition (`cmd/aurora-presence-local-server`) | Ordered transaction: generation → validate → join → checkpoint |
-| Neutral result type | Success evidence **or** explicit absence with reason codes |
+| `localhooktransport` (Linux) | Accept, peer creds, optional `IngestIdentityObserver`; no agent rules |
+| `linuxprocess.CaptureGeneration` | Generation double-read for peer PID |
+| `linuxidentitymeasure` | Read-only Blue1 diagnostic: ancestry + L1/L2/L3 JSONL |
+| Composition (`cmd/aurora-presence-local-server`) | Attach observer only when `-identity-measure-file` / env set |
 | Package 6 sequencer | Independent observe-only sequencing of valid ingress |
-| `bindingpolicy` (Package 7) | Consume checkpoint result; never produce hard identity from soft scores |
+| Future `bindingpolicy` (Package 7) | Consume trusted evidence; never produce hard identity from soft scores |
 | Registry / publish | Untouched until Package 8 |
 
 No import cycle from policy to registry; no agent import into generic transport.
+The measurement diagnostic must remain default-off and never authorize bind.

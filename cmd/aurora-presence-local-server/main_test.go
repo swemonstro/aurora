@@ -36,7 +36,7 @@ func TestIngestRemainsDisabledWhenFeatureFlagUnsetOrFalse(t *testing.T) {
 		t.Run("value_"+value, func(t *testing.T) {
 			socketPath := testSocketPath(t)
 			var stderr bytes.Buffer
-			server, err := composeServer(
+			server, cleanup, err := composeServer(
 				[]string{"-host-id", "host-fixture", "-socket", socketPath},
 				&stderr,
 				func(key string) string {
@@ -49,9 +49,15 @@ func TestIngestRemainsDisabledWhenFeatureFlagUnsetOrFalse(t *testing.T) {
 			if err != nil {
 				t.Fatalf("composeServer() error = %v stderr=%s", err, stderr.String())
 			}
+			if cleanup != nil {
+				defer cleanup()
+			}
 			defer server.Close()
 			if server.IngestReceiver() != nil {
 				t.Fatalf("ingest enabled for flag value %q", value)
+			}
+			if server.IdentityObserverEnabled() {
+				t.Fatal("identity measure enabled without flag")
 			}
 		})
 	}
@@ -62,7 +68,7 @@ func TestIngestEnabledWhenFeatureFlagTrue(t *testing.T) {
 		t.Run("value_"+strings.TrimSpace(value), func(t *testing.T) {
 			socketPath := testSocketPath(t)
 			var stderr bytes.Buffer
-			server, err := composeServer(
+			server, cleanup, err := composeServer(
 				[]string{"-host-id", "host-fixture", "-socket", socketPath},
 				&stderr,
 				func(key string) string {
@@ -75,11 +81,61 @@ func TestIngestEnabledWhenFeatureFlagTrue(t *testing.T) {
 			if err != nil {
 				t.Fatalf("composeServer() error = %v stderr=%s", err, stderr.String())
 			}
+			if cleanup != nil {
+				defer cleanup()
+			}
 			defer server.Close()
 			if server.IngestReceiver() == nil {
 				t.Fatalf("ingest disabled for flag value %q", value)
 			}
 		})
+	}
+}
+
+func TestIdentityMeasureDefaultOffAndExplicitEnable(t *testing.T) {
+	socketPath := testSocketPath(t)
+	measurePath := filepath.Join(filepath.Dir(socketPath), "identity-measure.jsonl")
+
+	var stderr bytes.Buffer
+	server, cleanup, err := composeServer(
+		[]string{"-host-id", "host-fixture", "-socket", socketPath},
+		&stderr,
+		func(string) string { return "" },
+	)
+	if err != nil {
+		t.Fatalf("composeServer() error = %v", err)
+	}
+	if cleanup != nil {
+		cleanup()
+	}
+	server.Close()
+	if server.IdentityObserverEnabled() {
+		t.Fatal("identity measure should be off by default")
+	}
+
+	stderr.Reset()
+	server, cleanup, err = composeServer(
+		[]string{"-host-id", "host-fixture", "-socket", socketPath, "-identity-measure-file", measurePath},
+		&stderr,
+		func(key string) string {
+			if key == localhooktransport.EnvLocalHookEnabled {
+				return "true"
+			}
+			return ""
+		},
+	)
+	if err != nil {
+		t.Fatalf("composeServer() with measure error = %v stderr=%s", err, stderr.String())
+	}
+	if cleanup != nil {
+		defer cleanup()
+	}
+	defer server.Close()
+	if !server.IdentityObserverEnabled() {
+		t.Fatal("identity measure not enabled with flag")
+	}
+	if !strings.Contains(stderr.String(), "identity measure JSONL") {
+		t.Fatalf("stderr = %s", stderr.String())
 	}
 }
 
@@ -95,7 +151,7 @@ func TestLegacyStartupValidWithAndWithoutIngest(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			socketPath := testSocketPath(t)
 			var stderr bytes.Buffer
-			server, err := composeServer(
+			server, cleanup, err := composeServer(
 				[]string{"-host-id", "host-fixture", "-socket", socketPath},
 				&stderr,
 				func(key string) string {
@@ -107,6 +163,9 @@ func TestLegacyStartupValidWithAndWithoutIngest(t *testing.T) {
 			)
 			if err != nil {
 				t.Fatalf("composeServer() error = %v stderr=%s", err, stderr.String())
+			}
+			if cleanup != nil {
+				defer cleanup()
 			}
 			defer server.Close()
 			if got := server.IngestReceiver() != nil; got != test.want {

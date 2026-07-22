@@ -23,12 +23,13 @@ var (
 type ReasonCode string
 
 const (
-	ReasonUnknownProcess      ReasonCode = "unknown_process"
-	ReasonProcessDisappeared  ReasonCode = "process_disappeared_during_read"
-	ReasonInvalidProcData     ReasonCode = "invalid_proc_data"
-	ReasonPIDReused           ReasonCode = "pid_reused"
-	ReasonPermissionDenied    ReasonCode = "permission_denied"
-	ReasonArgvPrefixTruncated ReasonCode = "argv_prefix_truncated"
+	ReasonUnknownProcess        ReasonCode = "unknown_process"
+	ReasonProcessDisappeared    ReasonCode = "process_disappeared_during_read"
+	ReasonInvalidProcData       ReasonCode = "invalid_proc_data"
+	ReasonPIDReused             ReasonCode = "pid_reused"
+	ReasonPermissionDenied      ReasonCode = "permission_denied"
+	ReasonArgvPrefixTruncated   ReasonCode = "argv_prefix_truncated"
+	ReasonAncestryDepthExceeded ReasonCode = "ancestry_depth_exceeded"
 )
 
 type Diagnostic struct {
