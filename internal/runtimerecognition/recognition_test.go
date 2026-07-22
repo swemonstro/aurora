@@ -1,0 +1,351 @@
+package runtimerecognition_test
+
+import (
+	"context"
+	"errors"
+	"reflect"
+	"testing"
+	"time"
+
+	"github.com/swemonstro/aurora/internal/claudehook"
+	"github.com/swemonstro/aurora/internal/codexhook"
+	"github.com/swemonstro/aurora/internal/instancepresence"
+	"github.com/swemonstro/aurora/internal/runtimerecognition"
+)
+
+func TestRecognizePreservesWrapperNodeNativeFamilies(t *testing.T) {
+	for _, test := range []struct {
+		name, launch, native string
+		tool                 instancepresence.ToolKind
+	}{
+		{"Claude", "launch:anthropic-claude-code", "claude-native-worker", instancepresence.ToolClaude},
+		{"Codex", "launch:openai-codex", "codex-linux-x86_64", instancepresence.ToolCodex},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := runtimerecognition.Recognize(fixtureSnapshot(test.launch, test.native), "host-a", claudehook.RuntimeRecognizer(), codexhook.RuntimeRecognizer())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(result.Families) != 1 || len(result.Observations) != 1 {
+				t.Fatalf("result = %#v", result)
+			}
+			family := result.Families[0]
+			if family.Candidate.Tool != test.tool || family.Candidate.Runtime.RootProcess.PID != 101 || len(family.Candidate.Members) != 3 || family.Shape != "wrapper+node_launcher+native_child" {
+				t.Fatalf("family = %#v", family)
+			}
+			if !contains(family.ReasonCodes, runtimerecognition.ReasonIdentifiedAgentFamily) {
+				t.Fatalf("reason codes = %v", family.ReasonCodes)
+			}
+		})
+	}
+}
+
+func TestSourceUsesAtomicRuntimeSnapshotAndPerSampleBootID(t *testing.T) {
+	first := fixtureSnapshot("launch:anthropic-claude-code", "claude-native-worker")
+	second := fixtureSnapshot("launch:anthropic-claude-code", "claude-native-worker")
+	second.BootID = "boot-b"
+	sourceImpl := &atomicSource{snapshots: []runtimerecognition.Snapshot{first, second}}
+	source, err := runtimerecognition.NewSource(sourceImpl, "host-a", claudehook.RuntimeRecognizer(), codexhook.RuntimeRecognizer())
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstObservations, err := source.Observe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondObservations, err := source.Observe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sourceImpl.calls != 2 || firstObservations[0].Candidate.Runtime.BootID != "boot-a" || secondObservations[0].Candidate.Runtime.BootID != "boot-b" || firstObservations[0].Candidate.InstanceID == secondObservations[0].Candidate.InstanceID {
+		t.Fatalf("atomic source results = %#v %#v, calls=%d", firstObservations, secondObservations, sourceImpl.calls)
+	}
+}
+
+func TestRecognizeGenerationSafeParentsAndIDs(t *testing.T) {
+	start := fixtureTime()
+	oldParent := process(101, start, nil, 1, "claude", "claude")
+	newParent := process(101, start.Add(time.Hour), nil, 1, "claude", "claude")
+	wrongParent := oldParent.Process
+	child := process(102, start.Add(2*time.Hour), &wrongParent, 101, "claude-native-worker", "claude-native-worker")
+	snapshot := runtimeSnapshot([]runtimerecognition.ProcessObservation{newParent, child})
+	result, err := runtimerecognition.Recognize(snapshot, "host-a", claudehook.RuntimeRecognizer(), codexhook.RuntimeRecognizer())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Families) != 0 || len(result.UncertainFamilies) != 1 {
+		t.Fatalf("wrong generation was not kept conservative: %#v", result)
+	}
+	oldResult, err := runtimerecognition.Recognize(runtimeSnapshot([]runtimerecognition.ProcessObservation{oldParent}), "host-a", claudehook.RuntimeRecognizer(), codexhook.RuntimeRecognizer())
+	if err != nil {
+		t.Fatal(err)
+	}
+	newResult, err := runtimerecognition.Recognize(runtimeSnapshot([]runtimerecognition.ProcessObservation{newParent}), "host-a", claudehook.RuntimeRecognizer(), codexhook.RuntimeRecognizer())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oldResult.Families[0].Candidate.InstanceID == newResult.Families[0].Candidate.InstanceID {
+		t.Fatalf("reused PID collided: %#v %#v", oldResult, newResult)
+	}
+	repeated, err := runtimerecognition.Recognize(runtimeSnapshot([]runtimerecognition.ProcessObservation{newParent}), "host-a", claudehook.RuntimeRecognizer(), codexhook.RuntimeRecognizer())
+	if err != nil || repeated.Families[0].Candidate.InstanceID != newResult.Families[0].Candidate.InstanceID {
+		t.Fatalf("ID not stable: %#v, %v", repeated, err)
+	}
+}
+
+func TestRecognizeTreatsReusedParentPIDAsAmbiguous(t *testing.T) {
+	start := fixtureTime()
+	missingParent := instancepresence.ProcessIdentity{PID: 999, StartedAt: start}
+	reused := process(999, start.Add(time.Hour), nil, 1, "worker", "worker")
+	child := process(102, start.Add(2*time.Hour), &missingParent, 999, "claude", "claude")
+	if child.Parent == nil || child.Parent.PID != reused.Process.PID || child.Parent.StartedAt.Equal(reused.Process.StartedAt) || child.ParentPIDHint != reused.Process.PID {
+		t.Fatalf("fixture does not contain a missing parent generation and a reused PID: %#v %#v", child, reused)
+	}
+	result, err := runtimerecognition.Recognize(runtimeSnapshot([]runtimerecognition.ProcessObservation{reused, child}), "host-a", claudehook.RuntimeRecognizer(), codexhook.RuntimeRecognizer())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Families) != 0 || len(result.UncertainFamilies) != 1 {
+		t.Fatalf("reused parent PID became a safe family: %#v", result)
+	}
+	family := result.UncertainFamilies[0]
+	wantReasons := []runtimerecognition.ReasonCode{runtimerecognition.ReasonAmbiguousRoot, runtimerecognition.ReasonRootMissingChildAlive}
+	if family.Tool != instancepresence.ToolClaude || len(family.PossibleRoots) != 1 || family.PossibleRoots[0] != child.Process || len(family.Members) != 1 || family.Members[0] != child.Process || !reflect.DeepEqual(family.ReasonCodes, wantReasons) {
+		t.Fatalf("uncertain family = %#v", family)
+	}
+}
+
+func TestRecognizeConservativeFamilyCases(t *testing.T) {
+	t.Run("short lived unknown intermediate", func(t *testing.T) {
+		start := fixtureTime()
+		root := process(101, start, nil, 1, "bash", "bash")
+		root.LaunchIdentities = []instancepresence.OpaqueIdentity{"launch:openai-codex"}
+		middleParent := root.Process
+		middle := process(102, start.Add(time.Second), &middleParent, 101, "sh", "sh")
+		nativeParent := middle.Process
+		native := process(103, start.Add(2*time.Second), &nativeParent, 102, "codex-linux-x86_64", "codex-linux-x86_64")
+		result, err := runtimerecognition.Recognize(runtimeSnapshot([]runtimerecognition.ProcessObservation{native, root, middle}), "host-a", claudehook.RuntimeRecognizer(), codexhook.RuntimeRecognizer())
+		if err != nil || len(result.Families) != 1 || len(result.Families[0].Candidate.Members) != 3 {
+			t.Fatalf("result=%#v err=%v", result, err)
+		}
+		for index, want := range []uint64{101, 102, 103} {
+			if got := result.Families[0].Candidate.Members[index].PID; got != want {
+				t.Fatalf("member order = %#v", result.Families[0].Candidate.Members)
+			}
+		}
+		rootCount := 0
+		for _, member := range result.Families[0].Candidate.Members {
+			if member == result.Families[0].Candidate.Runtime.RootProcess {
+				rootCount++
+			}
+		}
+		if rootCount != 1 {
+			t.Fatalf("root count = %d", rootCount)
+		}
+	})
+	t.Run("disappeared intermediate is uncertain", func(t *testing.T) {
+		start := fixtureTime()
+		root := process(101, start, nil, 1, "bash", "bash")
+		root.ParentPIDHint = 1
+		root.LaunchIdentities = []instancepresence.OpaqueIdentity{"launch:openai-codex"}
+		missing := instancepresence.ProcessIdentity{PID: 102, StartedAt: start.Add(time.Second)}
+		native := process(103, start.Add(2*time.Second), &missing, 102, "codex-linux-x86_64", "codex-linux-x86_64")
+		result, err := runtimerecognition.Recognize(runtimeSnapshot([]runtimerecognition.ProcessObservation{root, native}), "host-a", claudehook.RuntimeRecognizer(), codexhook.RuntimeRecognizer())
+		if err != nil || len(result.Families) != 0 || len(result.UncertainFamilies) != 1 {
+			t.Fatalf("result=%#v err=%v", result, err)
+		}
+		family := result.UncertainFamilies[0]
+		if family.Tool != instancepresence.ToolCodex || len(family.PossibleRoots) != 2 || len(family.Members) != 2 || family.PossibleRoots[0] != root.Process || family.PossibleRoots[1] != native.Process || !contains(family.ReasonCodes, runtimerecognition.ReasonAmbiguousRoot) || !contains(family.ReasonCodes, runtimerecognition.ReasonMultipleRoots) {
+			t.Fatalf("uncertain family=%#v", family)
+		}
+	})
+	t.Run("parallel and deterministic", func(t *testing.T) {
+		for _, test := range []struct {
+			tool       instancepresence.ToolKind
+			executable string
+		}{{instancepresence.ToolClaude, "claude"}, {instancepresence.ToolCodex, "codex"}} {
+			t.Run(string(test.tool), func(t *testing.T) {
+				start := fixtureTime()
+				first := process(202, start.Add(time.Second), nil, 1, test.executable, test.executable)
+				second := process(101, start, nil, 1, test.executable, test.executable)
+				first.ProcessGroupOrJob, first.OSSession = "pgrp:202", "session:20"
+				result, err := runtimerecognition.Recognize(runtimeSnapshot([]runtimerecognition.ProcessObservation{first, second}), "host-a", claudehook.RuntimeRecognizer(), codexhook.RuntimeRecognizer())
+				if err != nil || len(result.Families) != 2 {
+					t.Fatalf("result=%#v err=%v", result, err)
+				}
+				for index, wantRoot := range []instancepresence.ProcessIdentity{second.Process, first.Process} {
+					family := result.Families[index]
+					if family.Candidate.Tool != test.tool || family.Candidate.Runtime.RootProcess != wantRoot || len(family.Candidate.Members) != 1 || family.Candidate.Members[0] != wantRoot || family.Shape != string(runtimerecognition.RoleDirect) {
+						t.Fatalf("family %d = %#v", index, family)
+					}
+				}
+				if result.Families[0].Candidate.InstanceID == result.Families[1].Candidate.InstanceID {
+					t.Fatalf("parallel candidates collided: %#v", result.Families)
+				}
+			})
+		}
+	})
+	t.Run("missing root with one living child", func(t *testing.T) {
+		start := fixtureTime()
+		child := process(102, start, nil, 999, "claude", "claude")
+		nativeParent := child.Process
+		native := process(103, start.Add(time.Second), &nativeParent, 102, "claude-native-worker", "claude-native-worker")
+		result, err := runtimerecognition.Recognize(runtimeSnapshot([]runtimerecognition.ProcessObservation{native, child}), "host-a", claudehook.RuntimeRecognizer(), codexhook.RuntimeRecognizer())
+		if err != nil || len(result.Families) != 1 || !contains(result.Families[0].ReasonCodes, runtimerecognition.ReasonRootMissingChildAlive) {
+			t.Fatalf("result=%#v err=%v", result, err)
+		}
+	})
+}
+
+func TestRecognizeRejectsInvalidRecognizersAndConflicts(t *testing.T) {
+	snapshot := runtimeSnapshot([]runtimerecognition.ProcessObservation{process(101, fixtureTime(), nil, 1, "x", "x")})
+	if _, err := runtimerecognition.Recognize(snapshot, "host-a"); err == nil {
+		t.Fatal("empty recognizer list accepted")
+	}
+	if _, err := runtimerecognition.NewSource(nil, "host-a", claudehook.RuntimeRecognizer()); err == nil {
+		t.Fatal("nil source accepted")
+	}
+	var nilSource *nilSnapshotSource
+	if _, err := runtimerecognition.NewSource(nilSource, "host-a", claudehook.RuntimeRecognizer()); err == nil {
+		t.Fatal("typed nil source accepted")
+	}
+	var nilRecognizer *nilRuntimeRecognizer
+	if _, err := runtimerecognition.Recognize(snapshot, "host-a", nilRecognizer); err == nil {
+		t.Fatal("typed nil recognizer accepted")
+	}
+	for _, recognizer := range []runtimerecognition.AgentRuntimeRecognizer{badRecognizer{runtimerecognition.Recognition{}}, badRecognizer{runtimerecognition.Recognition{Tool: instancepresence.ToolClaude, Role: "bad", Priority: 1}}, badRecognizer{runtimerecognition.Recognition{Tool: instancepresence.ToolClaude, Role: runtimerecognition.RoleDirect, Priority: 9}}} {
+		if _, err := runtimerecognition.Recognize(snapshot, "host-a", recognizer); err == nil {
+			t.Fatalf("invalid recognizer accepted: %#v", recognizer)
+		}
+	}
+	result, err := runtimerecognition.Recognize(snapshot, "host-a", badRecognizer{runtimerecognition.Recognition{Tool: instancepresence.ToolClaude, Role: runtimerecognition.RoleDirect, Priority: 2}}, badRecognizer{runtimerecognition.Recognition{Tool: instancepresence.ToolCodex, Role: runtimerecognition.RoleDirect, Priority: 2}})
+	if err != nil || len(result.Families) != 0 || result.UnknownProcesses != 1 {
+		t.Fatalf("conflict = %#v, %v", result, err)
+	}
+}
+
+func TestRecognizerClassificationSignalsRemainConservative(t *testing.T) {
+	tests := []struct {
+		name, comm, executable string
+		launches               []instancepresence.OpaqueIdentity
+		want                   instancepresence.ToolKind
+		role                   runtimerecognition.Role
+	}{
+		{"Claude direct", "claude", "other", nil, instancepresence.ToolClaude, runtimerecognition.RoleDirect},
+		{"Claude uppercase", "Claude", "other", nil, instancepresence.ToolClaude, runtimerecognition.RoleDirect},
+		{"Claude code uppercase", "CLAUDE-CODE", "other", nil, instancepresence.ToolClaude, runtimerecognition.RoleDirect},
+		{"Claude direct plus native comm", "claude-native-worker", "claude", nil, instancepresence.ToolClaude, runtimerecognition.RoleNative},
+		{"Claude Aurora executable", "aurora-claude", "aurora-claude", nil, instancepresence.ToolClaude, runtimerecognition.RoleDirect},
+		{"Codex native", "x", "CODEX-LINUX-X86_64", nil, instancepresence.ToolCodex, runtimerecognition.RoleNative},
+		{"Codex Aurora executable", "aurora-codex", "aurora-codex", nil, instancepresence.ToolCodex, runtimerecognition.RoleDirect},
+		{"Claude node package", "node", "node", []instancepresence.OpaqueIdentity{"launch:anthropic-claude-code"}, instancepresence.ToolClaude, runtimerecognition.RoleNode},
+		{"aurora codex wrapper", "sh", "sh", []instancepresence.OpaqueIdentity{"launch:aurora-codex"}, instancepresence.ToolCodex, runtimerecognition.RoleWrapper},
+		{"aurora claude wrapper", "sh", "sh", []instancepresence.OpaqueIdentity{"launch:aurora-claude"}, instancepresence.ToolClaude, runtimerecognition.RoleWrapper},
+		{"unknown node", "node", "node", nil, "", ""},
+		{"conflicting agent markers", "sh", "sh", []instancepresence.OpaqueIdentity{"launch:aurora-claude", "launch:aurora-codex"}, "", ""},
+		{"conflicting executable signals", "CLAUDE", "CODEX", nil, "", ""},
+		{"Claude executable wins over Codex launch", "claude", "claude", []instancepresence.OpaqueIdentity{"launch:openai-codex"}, instancepresence.ToolClaude, runtimerecognition.RoleDirect},
+		{"Codex executable wins over Claude launch", "codex", "codex", []instancepresence.OpaqueIdentity{"launch:anthropic-claude-code"}, instancepresence.ToolCodex, runtimerecognition.RoleDirect},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			p := process(101, fixtureTime(), nil, 1, test.comm, test.executable)
+			p.LaunchIdentities = test.launches
+			result, err := runtimerecognition.Recognize(runtimeSnapshot([]runtimerecognition.ProcessObservation{p}), "host-a", claudehook.RuntimeRecognizer(), codexhook.RuntimeRecognizer())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.want == "" {
+				if result.UnknownProcesses != 1 {
+					t.Fatalf("unknown = %#v", result)
+				}
+				return
+			}
+			if len(result.Families) != 1 || result.Families[0].Candidate.Tool != test.want || result.Families[0].Shape != string(test.role) {
+				t.Fatalf("result=%#v", result)
+			}
+		})
+	}
+}
+
+func TestRecognizerNormalizesMixedCaseExecutablePrefixes(t *testing.T) {
+	for _, test := range []struct {
+		name, comm, executable string
+		tool                   instancepresence.ToolKind
+		role                   runtimerecognition.Role
+	}{
+		{"Claude uppercase prefix", "EXE:CLAUDE", "Exe:Claude-Code", instancepresence.ToolClaude, runtimerecognition.RoleDirect},
+		{"Codex uppercase prefix", "other", "EXE:CODEX-LINUX-X86_64", instancepresence.ToolCodex, runtimerecognition.RoleNative},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			p := process(101, fixtureTime(), nil, 1, "other", "other")
+			p.CommIdentity = instancepresence.OpaqueIdentity(test.comm)
+			p.ExecutableIdentity = instancepresence.OpaqueIdentity(test.executable)
+			result, err := runtimerecognition.Recognize(runtimeSnapshot([]runtimerecognition.ProcessObservation{p}), "host-a", claudehook.RuntimeRecognizer(), codexhook.RuntimeRecognizer())
+			if err != nil || len(result.Families) != 1 || result.Families[0].Candidate.Tool != test.tool || result.Families[0].Shape != string(test.role) {
+				t.Fatalf("result=%#v err=%v", result, err)
+			}
+		})
+	}
+}
+
+type atomicSource struct {
+	snapshots []runtimerecognition.Snapshot
+	calls     int
+}
+
+func (source *atomicSource) RuntimeSnapshot(context.Context) (runtimerecognition.Snapshot, error) {
+	if source.calls >= len(source.snapshots) {
+		return runtimerecognition.Snapshot{}, errors.New("no snapshot")
+	}
+	result := source.snapshots[source.calls]
+	source.calls++
+	return result, nil
+}
+
+type badRecognizer struct {
+	recognition runtimerecognition.Recognition
+}
+
+type nilRuntimeRecognizer struct{}
+
+func (*nilRuntimeRecognizer) Recognize(runtimerecognition.ProcessObservation) (runtimerecognition.Recognition, bool) {
+	return runtimerecognition.Recognition{}, false
+}
+
+type nilSnapshotSource struct{}
+
+func (*nilSnapshotSource) RuntimeSnapshot(context.Context) (runtimerecognition.Snapshot, error) {
+	return runtimerecognition.Snapshot{}, nil
+}
+
+func (r badRecognizer) Recognize(runtimerecognition.ProcessObservation) (runtimerecognition.Recognition, bool) {
+	return r.recognition, true
+}
+
+func fixtureSnapshot(launch, native string) runtimerecognition.Snapshot {
+	start := fixtureTime()
+	root := process(101, start, nil, 1, "bash", "bash")
+	root.LaunchIdentities = []instancepresence.OpaqueIdentity{instancepresence.OpaqueIdentity(launch)}
+	rootID := root.Process
+	node := process(102, start.Add(time.Second), &rootID, 101, "node", "node")
+	node.LaunchIdentities = []instancepresence.OpaqueIdentity{instancepresence.OpaqueIdentity(launch)}
+	nodeID := node.Process
+	child := process(103, start.Add(2*time.Second), &nodeID, 102, native, native)
+	return runtimeSnapshot([]runtimerecognition.ProcessObservation{root, node, child})
+}
+func runtimeSnapshot(processes []runtimerecognition.ProcessObservation) runtimerecognition.Snapshot {
+	return runtimerecognition.Snapshot{ObservedAt: fixtureTime().Add(10 * time.Second), BootID: "boot-a", Processes: processes}
+}
+func process(pid uint64, started time.Time, parent *instancepresence.ProcessIdentity, parentHint uint64, comm, executable string) runtimerecognition.ProcessObservation {
+	return runtimerecognition.ProcessObservation{Process: instancepresence.ProcessIdentity{PID: pid, StartedAt: started}, Parent: parent, ParentPIDHint: parentHint, CommIdentity: instancepresence.OpaqueIdentity("exe:" + comm), ExecutableIdentity: instancepresence.OpaqueIdentity("exe:" + executable), ProcessGroupOrJob: "pgrp:101", OSSession: "session:10", OwnerIdentity: "owner:fixture"}
+}
+func fixtureTime() time.Time { return time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC) }
+func contains(codes []runtimerecognition.ReasonCode, want runtimerecognition.ReasonCode) bool {
+	for _, code := range codes {
+		if code == want {
+			return true
+		}
+	}
+	return false
+}

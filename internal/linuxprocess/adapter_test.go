@@ -3,11 +3,17 @@ package linuxprocess
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/swemonstro/aurora/internal/instancepresence"
+	"github.com/swemonstro/aurora/internal/runtimerecognition"
 )
 
 type fixedClock struct{ now time.Time }
@@ -16,7 +22,7 @@ func (clock fixedClock) Now() time.Time { return clock.now }
 
 func TestAdapterBuildsValidatedSnapshotFromInjectedProcRoot(t *testing.T) {
 	root := newProcFixture(t)
-	writeProcessFixture(t, root, 101, "claude", 1, 101, 10, 0, 250, []string{"/opaque/bin/claude", "--safe"})
+	writeProcessFixture(t, root, 101, "worker", 1, 101, 10, 0, 250, []string{"/opaque/bin/worker", "--safe"})
 	clock := fixedClock{now: time.Date(2026, 7, 22, 10, 0, 0, 0, time.UTC)}
 	adapter, err := New(Config{ProcRoot: root, HostID: "host-a", BootID: "boot-a", Clock: clock, ClockTicks: 100})
 	if err != nil {
@@ -32,11 +38,160 @@ func TestAdapterBuildsValidatedSnapshotFromInjectedProcRoot(t *testing.T) {
 	if len(sample.Snapshot.Processes) != 1 || sample.Snapshot.Processes[0].Process.PID != 101 {
 		t.Fatalf("snapshot = %#v", sample.Snapshot)
 	}
-	if got := sample.Snapshot.Processes[0].ExecutableIdentity; got != "exe:claude" {
+	if got := sample.Snapshot.Processes[0].ExecutableIdentity; got != "exe:worker" {
 		t.Fatalf("executable identity = %q", got)
 	}
-	if len(sample.Families) != 1 || sample.Summary.ClaudeFamilies != 1 {
-		t.Fatalf("sample families = %#v, summary = %#v", sample.Families, sample.Summary)
+	if len(sample.Recognition.Processes[0].LaunchIdentities) != 0 {
+		t.Fatalf("Linux backend assigned launch identities without configured rules: %#v", sample.Recognition.Processes[0])
+	}
+}
+
+func TestAdapterKeepsCommAndArgvSignalsSeparateAndSanitized(t *testing.T) {
+	root := newProcFixture(t)
+	writeProcessFixture(t, root, 101, "worker", 1, 101, 10, 0, 250, []string{"/opaque/node", "/work/node_modules/@vendor/agent/bin.js", "--api-key=secret"})
+	adapter, err := New(Config{ProcRoot: root, HostID: "host-a", BootID: "boot-a", Clock: fixedClock{now: time.Date(2026, 7, 22, 10, 0, 0, 0, time.UTC)}, LaunchIdentityRules: []runtimerecognition.LaunchIdentityRule{{Mode: runtimerecognition.LaunchRulePackagePath, Value: "@vendor/agent", Identity: "launch:agent", Argument: runtimerecognition.LaunchArgumentEntrypoint, Launchers: []string{"node"}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sample, err := adapter.Observe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	process := sample.Recognition.Processes[0]
+	if process.CommIdentity != "exe:worker" || process.ExecutableIdentity != "exe:node" || len(process.LaunchIdentities) != 1 {
+		t.Fatalf("recognition process = %#v", process)
+	}
+	if strings.Contains(fmt.Sprintf("%#v", process), "secret") || strings.Contains(fmt.Sprintf("%#v", process), "api-key") {
+		t.Fatalf("sensitive argv was retained: %#v", process)
+	}
+}
+
+func TestLaunchExecutableHandlesEmptyRelativeAndOddArguments(t *testing.T) {
+	for _, test := range []struct{ input, want string }{
+		{"", ""},
+		{"claude\x00", "claude"},
+		{"./odd name!?\x00", "odd name!?"},
+	} {
+		if got := launchExecutable([]byte(test.input)); got != test.want {
+			t.Fatalf("launchExecutable(%q) = %q, want %q", test.input, got, test.want)
+		}
+	}
+}
+
+func TestLaunchIdentitiesUseOnlyDocumentedPositions(t *testing.T) {
+	rules := []runtimerecognition.LaunchIdentityRule{
+		{Mode: runtimerecognition.LaunchRuleExactBasename, Value: "wrapper-agent", Identity: "launch:wrapper", Argument: runtimerecognition.LaunchArgumentArgv0},
+		{Mode: runtimerecognition.LaunchRulePackagePath, Value: "@vendor/agent", Identity: "launch:package", Argument: runtimerecognition.LaunchArgumentEntrypoint, Launchers: []string{"node"}},
+	}
+	tests := []struct {
+		name string
+		argv []string
+		want []instancepresence.OpaqueIdentity
+	}{
+		{"wrapper argv0", []string{"/opaque/wrapper-agent"}, []instancepresence.OpaqueIdentity{"launch:wrapper"}},
+		{"wrapper option is ignored", []string{"node", "--output=/tmp/wrapper-agent"}, nil},
+		{"package entrypoint", []string{"node", "/work/node_modules/@vendor/agent/bin.js"}, []instancepresence.OpaqueIdentity{"launch:package"}},
+		{"package cache is ignored", []string{"node", "--cache=/tmp/@vendor/agent/data"}, nil},
+		{"empty argument cannot bypass bound", []string{"node", "", "--output=/tmp/wrapper-agent", "/work/node_modules/@vendor/agent/bin.js"}, nil},
+		{"unrelated substring", []string{"/tmp/not-wrapper-agent-helper"}, nil},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := launchIdentities([]byte(joinCmdline(test.argv)), rules); len(got) != len(test.want) || len(got) > 0 && !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("launchIdentities(%q) = %v, want %v", test.argv, got, test.want)
+			}
+		})
+	}
+}
+
+func TestAdapterRetainsSafeCommWhenArgvIsUnavailable(t *testing.T) {
+	root := newProcFixture(t)
+	writeProcessFixture(t, root, 101, "worker", 1, 101, 10, 0, 250, []string{"/private/worker", "--secret=value"})
+	adapter, err := newWithReader(Config{ProcRoot: root, HostID: "host-a", BootID: "boot-a", Clock: fixedClock{now: time.Date(2026, 7, 22, 10, 0, 0, 0, time.UTC)}}, func() (procReader, error) {
+		base, err := openProcRoot(root)
+		if err != nil {
+			return nil, err
+		}
+		return &faultReader{procReader: base, path: "101/cmdline", call: 1, err: fs.ErrPermission, calls: make(map[string]int)}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sample, err := adapter.Observe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	process := sample.Recognition.Processes[0]
+	if process.CommIdentity != "exe:worker" || process.ExecutableIdentity != "exe:unknown" || !hasDiagnostic(sample.Diagnostics, ReasonPermissionDenied) {
+		t.Fatalf("sample = %#v", sample)
+	}
+}
+
+func TestAdapterDoesNotExposeManipulatedSensitiveArgv0(t *testing.T) {
+	for _, test := range []struct {
+		argv0 string
+		want  instancepresence.OpaqueIdentity
+	}{
+		{"/private/secret-tool", "exe:secret-tool"},
+		{"/private/token-helper", "exe:token-helper"},
+		{"/private/password-store", "exe:password-store"},
+		{"/private/monkey", "exe:monkey"},
+		{"/private/turnkey", "exe:turnkey"},
+		{"/private/keyring", "exe:keyring"},
+		{"--api-key=secret-value", "exe:unknown"},
+	} {
+		t.Run(test.argv0, func(t *testing.T) {
+			root := newProcFixture(t)
+			writeProcessFixture(t, root, 101, "worker", 1, 101, 10, 0, 250, []string{test.argv0, "--token=also-secret"})
+			adapter, err := New(Config{ProcRoot: root, HostID: "host-a", BootID: "boot-a", Clock: fixedClock{now: time.Date(2026, 7, 22, 10, 0, 0, 0, time.UTC)}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			sample, err := adapter.Observe(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			public := sample.Snapshot.Processes[0]
+			recognition := sample.Recognition.Processes[0]
+			if public.ExecutableIdentity != test.want || recognition.ExecutableIdentity != test.want || strings.Contains(fmt.Sprintf("%#v %#v", public, recognition), "/private/") || strings.Contains(fmt.Sprintf("%#v %#v", public, recognition), "also-secret") {
+				t.Fatalf("sensitive argv0 escaped: %#v %#v", public, recognition)
+			}
+		})
+	}
+}
+
+func TestAdapterExposesParentOnlyAfterGenerationValidation(t *testing.T) {
+	root := newProcFixture(t)
+	writeProcessFixture(t, root, 101, "parent", 1, 101, 10, 0, 250, []string{"parent"})
+	writeProcessFixture(t, root, 102, "child", 101, 101, 10, 0, 300, []string{"child"})
+	adapter, err := New(Config{ProcRoot: root, HostID: "host-a", BootID: "boot-a", Clock: fixedClock{now: time.Date(2026, 7, 22, 10, 0, 0, 0, time.UTC)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sample, err := adapter.Observe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sample.Recognition.Processes[1].Parent == nil || sample.Recognition.Processes[1].Parent.PID != 101 {
+		t.Fatalf("parent was not verified: %#v", sample.Recognition.Processes)
+	}
+
+	faulty, err := newWithReader(Config{ProcRoot: root, HostID: "host-a", BootID: "boot-a", Clock: fixedClock{now: time.Date(2026, 7, 22, 10, 0, 0, 0, time.UTC)}}, func() (procReader, error) {
+		base, openErr := openProcRoot(root)
+		if openErr != nil {
+			return nil, openErr
+		}
+		return &faultReader{procReader: base, path: "101/stat", call: 3, err: fs.ErrNotExist, calls: make(map[string]int)}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sample, err = faulty.Observe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sample.Recognition.Processes[1].Parent != nil {
+		t.Fatalf("unverified parent was retained: %#v", sample.Recognition.Processes[1])
 	}
 }
 
@@ -55,67 +210,6 @@ func TestAdapterReadsBootIdentityFromNarrowProcSource(t *testing.T) {
 	}
 }
 
-func TestAdapterGroupsClaudeAndCodexWrapperNodeNativeFamilies(t *testing.T) {
-	tests := []struct {
-		name       string
-		tool       string
-		wrapperArg string
-		nodeArg    string
-		native     string
-	}{
-		{name: "claude", tool: "claude", wrapperArg: "/opaque/aurora-claude", nodeArg: "/opaque/@anthropic-ai/claude-code/cli.js", native: "claude-native-worker"},
-		{name: "codex", tool: "codex", wrapperArg: "/opaque/aurora-codex", nodeArg: "/opaque/@openai/codex/bin/codex.js", native: "codex-linux-x86_64"},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			root := newProcFixture(t)
-			writeProcessFixture(t, root, 101, "bash", 1, 101, 10, 0, 250, []string{"bash", test.wrapperArg})
-			writeProcessFixture(t, root, 102, "node", 101, 101, 10, 0, 251, []string{"node", test.nodeArg})
-			writeProcessFixture(t, root, 103, test.native, 102, 101, 10, 0, 252, []string{"/opaque/" + test.native})
-			adapter, err := New(Config{
-				ProcRoot: root, HostID: "host-a", BootID: "boot-a",
-				Clock: fixedClock{now: time.Date(2026, 7, 22, 10, 0, 0, 0, time.UTC)},
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			sample, err := adapter.Observe(context.Background())
-			if err != nil {
-				t.Fatal(err)
-			}
-			if len(sample.Families) != 1 || string(sample.Families[0].Candidate.Tool) != test.tool ||
-				len(sample.Families[0].Candidate.Members) != 3 {
-				t.Fatalf("families = %#v", sample.Families)
-			}
-		})
-	}
-}
-
-func TestAdapterKeepsParallelToolFamiliesSeparate(t *testing.T) {
-	for _, tool := range []string{"claude", "codex"} {
-		t.Run(tool, func(t *testing.T) {
-			root := newProcFixture(t)
-			writeProcessFixture(t, root, 101, tool, 1, 101, 10, 0, 250, []string{tool})
-			writeProcessFixture(t, root, 202, tool, 1, 202, 20, 0, 300, []string{tool})
-			adapter, err := New(Config{
-				ProcRoot: root, HostID: "host-a", BootID: "boot-a",
-				Clock: fixedClock{now: time.Date(2026, 7, 22, 10, 0, 0, 0, time.UTC)},
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			sample, err := adapter.Observe(context.Background())
-			if err != nil {
-				t.Fatal(err)
-			}
-			if len(sample.Families) != 2 || sample.Families[0].Candidate.Runtime.RootProcess.PID != 101 ||
-				sample.Families[1].Candidate.Runtime.RootProcess.PID != 202 {
-				t.Fatalf("parallel families = %#v", sample.Families)
-			}
-		})
-	}
-}
-
 func TestAdapterHandlesPerProcessRacesConservatively(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -129,7 +223,7 @@ func TestAdapterHandlesPerProcessRacesConservatively(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			root := newProcFixture(t)
-			writeProcessFixture(t, root, 101, "claude", 1, 101, 10, 0, 250, []string{"claude"})
+			writeProcessFixture(t, root, 101, "worker", 1, 101, 10, 0, 250, []string{"worker"})
 			writeProcessFixture(t, root, 202, "other", 1, 202, 20, 0, 300, []string{"other"})
 			config := Config{
 				ProcRoot: root, HostID: "host-a", BootID: "boot-a",
@@ -187,7 +281,7 @@ func TestAdapterRejectsSymlinkProcRoot(t *testing.T) {
 func TestAdapterRejectsSymlinkProcessFilesAndContinues(t *testing.T) {
 	root := newProcFixture(t)
 	outside := filepath.Join(t.TempDir(), "outside-stat")
-	if err := os.WriteFile(outside, []byte(statLine(101, "claude", 1, 101, 10, 0, 250)), 0o644); err != nil {
+	if err := os.WriteFile(outside, []byte(statLine(101, "worker", 1, 101, 10, 0, 250)), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.MkdirAll(filepath.Join(root, "101"), 0o755); err != nil {

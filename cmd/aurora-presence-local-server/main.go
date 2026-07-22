@@ -14,10 +14,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/swemonstro/aurora/internal/claudehook"
+	"github.com/swemonstro/aurora/internal/codexhook"
 	"github.com/swemonstro/aurora/internal/instancecorrelation"
 	"github.com/swemonstro/aurora/internal/instancepresence"
 	"github.com/swemonstro/aurora/internal/linuxprocess"
 	"github.com/swemonstro/aurora/internal/localhooktransport"
+	"github.com/swemonstro/aurora/internal/runtimerecognition"
 )
 
 type systemClock struct{}
@@ -67,6 +70,7 @@ func run(ctx context.Context, arguments []string, stdout, stderr io.Writer, gete
 	clock := systemClock{}
 	adapter, err := linuxprocess.New(linuxprocess.Config{
 		ProcRoot: *procRoot, HostID: *hostID, BootID: instancepresence.BootIdentity(*bootID), Clock: clock,
+		LaunchIdentityRules: append(claudehook.LaunchIdentityRules(), codexhook.LaunchIdentityRules()...),
 	})
 	if err != nil {
 		return err
@@ -77,7 +81,11 @@ func run(ctx context.Context, arguments []string, stdout, stderr io.Writer, gete
 	}
 	config := localhooktransport.DefaultConfig(clock)
 	config.SocketPath = *socketPath
-	service, err := localhooktransport.NewCorrelationService(adapter, correlator, clock, config.MaximumRuntimes)
+	runtimeSource, err := runtimerecognition.NewSource(adapter, *hostID, claudehook.RuntimeRecognizer(), codexhook.RuntimeRecognizer())
+	if err != nil {
+		return err
+	}
+	service, err := localhooktransport.NewCorrelationService(runtimeSource, correlator, clock, config.MaximumRuntimes)
 	if err != nil {
 		return err
 	}

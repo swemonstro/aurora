@@ -8,11 +8,15 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
+	"github.com/swemonstro/aurora/internal/claudehook"
+	"github.com/swemonstro/aurora/internal/codexhook"
 	"github.com/swemonstro/aurora/internal/instancepresence"
 	"github.com/swemonstro/aurora/internal/linuxprocess"
+	"github.com/swemonstro/aurora/internal/runtimerecognition"
 )
 
 type systemClock struct{}
@@ -44,14 +48,14 @@ type outputFamily struct {
 	Root         instancepresence.ProcessIdentity `json:"root"`
 	MemberCount  int                              `json:"member_count"`
 	Shape        string                           `json:"shape"`
-	ReasonCodes  []linuxprocess.ReasonCode        `json:"reason_codes"`
+	ReasonCodes  []runtimerecognition.ReasonCode  `json:"reason_codes"`
 }
 
 type outputUncertainFamily struct {
 	Tool          instancepresence.ToolKind          `json:"tool"`
 	PossibleRoots []instancepresence.ProcessIdentity `json:"possible_roots"`
 	MemberCount   int                                `json:"member_count"`
-	ReasonCodes   []linuxprocess.ReasonCode          `json:"reason_codes"`
+	ReasonCodes   []runtimerecognition.ReasonCode    `json:"reason_codes"`
 }
 
 func main() {
@@ -107,6 +111,7 @@ func run(
 	adapter, err := linuxprocess.New(linuxprocess.Config{
 		ProcRoot: *procRoot, HostID: *hostID, BootID: instancepresence.BootIdentity(*bootID),
 		Clock: clock, ClockTicks: *clockTicks,
+		LaunchIdentityRules: append(claudehook.LaunchIdentityRules(), codexhook.LaunchIdentityRules()...),
 	})
 	if err != nil {
 		return err
@@ -125,7 +130,11 @@ func run(
 			}
 			exits = diff.Exits
 		}
-		report := makeOutputReport(index, sample, exits)
+		recognition, recognitionErr := runtimerecognition.Recognize(sample.Recognition, *hostID, claudehook.RuntimeRecognizer(), codexhook.RuntimeRecognizer())
+		if recognitionErr != nil {
+			return fmt.Errorf("recognize sample %d: %w", index, recognitionErr)
+		}
+		report := makeOutputReport(index, sample, recognition, exits)
 		if *format == "json" {
 			encoder := json.NewEncoder(stdout)
 			encoder.SetEscapeHTML(false)
@@ -143,17 +152,23 @@ func run(
 	return nil
 }
 
-func makeOutputReport(sampleNumber int, sample linuxprocess.Sample, exits []instancepresence.ProcessExit) outputReport {
-	families := make([]outputFamily, 0, len(sample.Families))
-	for _, family := range sample.Families {
+func makeOutputReport(sampleNumber int, sample linuxprocess.Sample, recognition runtimerecognition.Result, exits []instancepresence.ProcessExit) outputReport {
+	families := make([]outputFamily, 0, len(recognition.Families))
+	summary := outputSummary{ObservedProcesses: uint64(len(sample.Snapshot.Processes)), UnknownProcesses: recognition.UnknownProcesses, AmbiguousFamilies: uint64(len(recognition.UncertainFamilies))}
+	for _, family := range recognition.Families {
+		if family.Candidate.Tool == instancepresence.ToolClaude {
+			summary.ClaudeFamilies++
+		} else if family.Candidate.Tool == instancepresence.ToolCodex {
+			summary.CodexFamilies++
+		}
 		families = append(families, outputFamily{
 			CandidateRef: string(family.Candidate.InstanceID), Tool: family.Candidate.Tool,
 			Root: family.Candidate.Runtime.RootProcess, MemberCount: len(family.Candidate.Members),
 			Shape: family.Shape, ReasonCodes: family.ReasonCodes,
 		})
 	}
-	uncertain := make([]outputUncertainFamily, 0, len(sample.UncertainFamilies))
-	for _, family := range sample.UncertainFamilies {
+	uncertain := make([]outputUncertainFamily, 0, len(recognition.UncertainFamilies))
+	for _, family := range recognition.UncertainFamilies {
 		uncertain = append(uncertain, outputUncertainFamily{
 			Tool: family.Tool, PossibleRoots: family.PossibleRoots,
 			MemberCount: len(family.Members), ReasonCodes: family.ReasonCodes,
@@ -161,13 +176,39 @@ func makeOutputReport(sampleNumber int, sample linuxprocess.Sample, exits []inst
 	}
 	return outputReport{
 		Mode: "observe-only", Sample: sampleNumber, ObservedAt: sample.Snapshot.ObservedAt,
-		Summary: outputSummary{
-			ObservedProcesses: sample.Summary.ObservedProcesses,
-			ClaudeFamilies:    sample.Summary.ClaudeFamilies, CodexFamilies: sample.Summary.CodexFamilies,
-			UnknownProcesses: sample.Summary.UnknownProcesses, AmbiguousFamilies: sample.Summary.AmbiguousFamilies,
-		},
-		Families: families, Uncertain: uncertain, Diagnostics: sample.Diagnostics, Exits: exits,
+		Summary:  summary,
+		Families: families, Uncertain: uncertain, Diagnostics: mergedDiagnostics(sample.Diagnostics, recognition), Exits: exits,
 	}
+}
+
+// mergedDiagnostics preserves the established CLI diagnostics channel while
+// keeping collection and recognition responsibilities separate internally.
+func mergedDiagnostics(collection []linuxprocess.Diagnostic, recognition runtimerecognition.Result) []linuxprocess.Diagnostic {
+	counts := make(map[linuxprocess.ReasonCode]uint64, len(collection)+5)
+	for _, diagnostic := range collection {
+		counts[diagnostic.Code] += diagnostic.Count
+	}
+	counts[linuxprocess.ReasonCode(runtimerecognition.ReasonUnknownProcess)] += recognition.UnknownProcesses
+	for _, family := range recognition.Families {
+		for _, reason := range family.ReasonCodes {
+			counts[linuxprocess.ReasonCode(reason)]++
+		}
+	}
+	for _, family := range recognition.UncertainFamilies {
+		for _, reason := range family.ReasonCodes {
+			counts[linuxprocess.ReasonCode(reason)]++
+		}
+	}
+	diagnostics := make([]linuxprocess.Diagnostic, 0, len(counts))
+	for code, count := range counts {
+		if count > 0 {
+			diagnostics = append(diagnostics, linuxprocess.Diagnostic{Code: code, Count: count})
+		}
+	}
+	sort.Slice(diagnostics, func(first, second int) bool {
+		return diagnostics[first].Code < diagnostics[second].Code
+	})
+	return diagnostics
 }
 
 func writeTextReport(writer io.Writer, report outputReport) {

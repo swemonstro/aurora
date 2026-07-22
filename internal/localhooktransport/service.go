@@ -6,12 +6,12 @@ import (
 	"fmt"
 
 	"github.com/swemonstro/aurora/internal/instancecorrelation"
-	"github.com/swemonstro/aurora/internal/instancepresence"
-	"github.com/swemonstro/aurora/internal/linuxprocess"
 )
 
-type SnapshotSource interface {
-	Observe(context.Context) (linuxprocess.Sample, error)
+// RuntimeObservationSource is deliberately OS-neutral. Platform collection and
+// agent recognition are composed before the receiver reaches this boundary.
+type RuntimeObservationSource interface {
+	Observe(context.Context) ([]instancecorrelation.RuntimeObservation, error)
 }
 
 type CorrelationEngine interface {
@@ -19,55 +19,34 @@ type CorrelationEngine interface {
 }
 
 type CorrelationService struct {
-	snapshots       SnapshotSource
+	runtimes        RuntimeObservationSource
 	correlator      CorrelationEngine
 	clock           Clock
 	maximumRuntimes int
 }
 
-func NewCorrelationService(snapshots SnapshotSource, correlator CorrelationEngine, clock Clock, maximumRuntimes int) (*CorrelationService, error) {
-	if snapshots == nil || correlator == nil || clock == nil {
-		return nil, errors.New("snapshot source, correlator, and clock are required")
+func NewCorrelationService(runtimes RuntimeObservationSource, correlator CorrelationEngine, clock Clock, maximumRuntimes int) (*CorrelationService, error) {
+	if runtimes == nil || correlator == nil || clock == nil {
+		return nil, errors.New("runtime source, correlator, and clock are required")
 	}
 	if maximumRuntimes < 1 || maximumRuntimes > 12 {
 		return nil, errors.New("maximum runtimes must be between 1 and 12")
 	}
-	return &CorrelationService{snapshots: snapshots, correlator: correlator, clock: clock, maximumRuntimes: maximumRuntimes}, nil
+	return &CorrelationService{runtimes: runtimes, correlator: correlator, clock: clock, maximumRuntimes: maximumRuntimes}, nil
 }
 
 func (service *CorrelationService) Correlate(ctx context.Context, hook instancecorrelation.HookObservation) (instancecorrelation.CorrelationResult, error) {
-	sample, err := service.snapshots.Observe(ctx)
+	runtimes, err := service.runtimes.Observe(ctx)
 	if err != nil {
-		return instancecorrelation.CorrelationResult{}, fmt.Errorf("observe process snapshot: %w", err)
+		return instancecorrelation.CorrelationResult{}, fmt.Errorf("observe runtimes: %w", err)
 	}
-	if len(sample.Families) > service.maximumRuntimes {
+	if len(runtimes) > service.maximumRuntimes {
 		return instancecorrelation.CorrelationResult{}, ErrRuntimeLimit
-	}
-	contexts := make(map[string]instancepresence.ProcessObservation, len(sample.Snapshot.Processes))
-	for _, process := range sample.Snapshot.Processes {
-		contexts[processIdentityKey(process.Process)] = process
-	}
-	runtimes := make([]instancecorrelation.RuntimeObservation, 0, len(sample.Families))
-	for _, family := range sample.Families {
-		observation := instancecorrelation.RuntimeObservation{
-			Candidate: family.Candidate, ObservedAt: canonicalTime(sample.Snapshot.ObservedAt),
-			Lifecycle: instancecorrelation.LifecycleActive,
-		}
-		if process, exists := contexts[processIdentityKey(family.Candidate.Runtime.RootProcess)]; exists {
-			observation.ProcessGroupOrJob = process.ProcessGroupOrJob
-			observation.OSSession = process.OSSession
-			observation.TerminalFingerprint = process.TerminalFingerprint
-		}
-		runtimes = append(runtimes, observation)
 	}
 	return service.correlator.Correlate(instancecorrelation.CorrelationInput{
 		EvaluatedAt: canonicalTime(service.clock.Now()), Runtimes: runtimes,
 		Hooks: []instancecorrelation.HookObservation{hook},
 	})
-}
-
-func processIdentityKey(identity instancepresence.ProcessIdentity) string {
-	return fmt.Sprintf("%d/%s", identity.PID, canonicalTime(identity.StartedAt).Format("20060102T150405.999999999Z"))
 }
 
 type Receiver struct {

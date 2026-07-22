@@ -1,10 +1,32 @@
 package instancepresence
 
 import (
+	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestProcessObservationJSONContainsOnlyPublicContractFields(t *testing.T) {
+	value := ProcessObservation{Process: ProcessIdentity{PID: 101, StartedAt: fixedTestTime()}, ExecutableIdentity: "exe:node", OwnerIdentity: "uid:1000"}
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"parent_pid", "launch_identities", "comm_identity"} {
+		if strings.Contains(string(data), forbidden) {
+			t.Fatalf("public ProcessObservation wire format contains %q: %s", forbidden, data)
+		}
+	}
+	var decoded ProcessObservation
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded != value {
+		t.Fatalf("round trip = %#v, want %#v", decoded, value)
+	}
+}
 
 func TestUncertainCorrelationHasNoMutationTarget(t *testing.T) {
 	results := []CorrelationResult{

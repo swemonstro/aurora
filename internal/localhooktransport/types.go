@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/swemonstro/aurora/internal/hookadapter"
 	"github.com/swemonstro/aurora/internal/instancecorrelation"
 	"github.com/swemonstro/aurora/internal/instancepresence"
 )
@@ -132,6 +133,26 @@ func (observation HookObservation) domain() instancecorrelation.HookObservation 
 		TerminalFingerprint: observation.TerminalFingerprint,
 		HostID:              observation.HostID, BootID: observation.BootID,
 	}
+}
+
+// Validate checks the generic allowlisted observation without attaching it to
+// any agent event model.
+func (observation HookObservation) Validate() error {
+	return observation.domain().Validate()
+}
+
+// HookObservationFromIngress is the sole projection from a transport-neutral
+// agent ingress record to the local transport wire model.
+func HookObservationFromIngress(ingress hookadapter.Observation) (HookObservation, error) {
+	if err := ingress.Validate(); err != nil {
+		return HookObservation{}, err
+	}
+	observation := HookObservation{
+		Tool: ingress.Tool, HookSessionRef: ingress.HookSessionRef,
+		ProducerEpoch: ingress.ProducerEpoch, Revision: ingress.Revision,
+		IdempotencyKey: ingress.IdempotencyKey, ObservedAt: canonicalTime(ingress.ObservedAt), Lifecycle: ingress.Lifecycle,
+	}
+	return observation, observation.Validate()
 }
 
 type Request struct {

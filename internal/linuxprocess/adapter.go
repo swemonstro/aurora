@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/swemonstro/aurora/internal/instancepresence"
+	"github.com/swemonstro/aurora/internal/runtimerecognition"
 )
 
 const (
@@ -132,7 +133,7 @@ func (adapter *Adapter) Observe(ctx context.Context) (Sample, error) {
 		if !ok || entry.Type()&fs.ModeSymlink != 0 {
 			continue
 		}
-		record, outcome := readProcess(reader, pid, bootTime, adapter.config.ClockTicks)
+		record, outcome := readProcess(reader, pid, bootTime, adapter.config.ClockTicks, adapter.config.LaunchIdentityRules)
 		for code, count := range outcome.counts {
 			counts[code] += count
 		}
@@ -147,26 +148,23 @@ func (adapter *Adapter) Observe(ctx context.Context) (Sample, error) {
 		return processKey(records[first].identity) < processKey(records[second].identity)
 	})
 
-	byPID := make(map[uint64]*rawProcess, len(records))
+	byPID := make(map[uint64][]*rawProcess, len(records))
 	for index := range records {
-		byPID[records[index].identity.PID] = &records[index]
+		pid := records[index].identity.PID
+		byPID[pid] = append(byPID[pid], &records[index])
 	}
 	observations := make([]instancepresence.ProcessObservation, 0, len(records))
-	unknown := uint64(0)
+	recognitionProcesses := make([]runtimerecognition.ProcessObservation, 0, len(records))
 	for index := range records {
 		record := &records[index]
-		record.classification = classify(*record)
-		if record.classification.tool == "" {
-			unknown++
-		}
-		var parent *instancepresence.ProcessIdentity
-		if parentRecord := byPID[record.stat.ParentPID]; parentRecord != nil {
-			parentIdentity := parentRecord.identity
-			parent = &parentIdentity
+		parent := verifiedParent(reader, record, byPID, bootTime, adapter.config.ClockTicks)
+		publicExecutable := record.commBase
+		if record.argvBase != "" {
+			publicExecutable = record.argvBase
 		}
 		observation := instancepresence.ProcessObservation{
 			Process: record.identity, Parent: parent,
-			ExecutableIdentity: instancepresence.OpaqueIdentity("exe:" + sanitizeName(record.executableBase)),
+			ExecutableIdentity: instancepresence.OpaqueIdentity("exe:" + sanitizeName(publicExecutable)),
 			OwnerIdentity:      instancepresence.OpaqueIdentity(record.ownerIdentity),
 		}
 		if record.stat.GroupID != 0 {
@@ -179,49 +177,73 @@ func (adapter *Adapter) Observe(ctx context.Context) (Sample, error) {
 			observation.TerminalFingerprint = instancepresence.OpaqueIdentity(fmt.Sprintf("tty:%d", record.stat.TTY))
 		}
 		observations = append(observations, observation)
+		recognitionProcesses = append(recognitionProcesses, runtimerecognition.ProcessObservation{
+			Process: record.identity, Parent: parent, ParentPIDHint: record.stat.ParentPID,
+			CommIdentity:       instancepresence.OpaqueIdentity("exe:" + sanitizeName(record.commBase)),
+			ExecutableIdentity: instancepresence.OpaqueIdentity("exe:" + sanitizeName(record.argvBase)),
+			LaunchIdentities:   append([]instancepresence.OpaqueIdentity{}, record.launchIdentities...),
+			ProcessGroupOrJob:  observation.ProcessGroupOrJob, OSSession: observation.OSSession,
+			TerminalFingerprint: observation.TerminalFingerprint, OwnerIdentity: observation.OwnerIdentity,
+		})
 	}
 	snapshot := instancepresence.ProcessSnapshot{ObservedAt: observedAt, Processes: observations}
 	if err := snapshot.Validate(); err != nil {
 		return Sample{}, fmt.Errorf("linux process snapshot invariant: %w", err)
 	}
 
-	families, uncertainFamilies := buildFamilies(adapter.config.HostID, bootID, records)
-	for _, family := range families {
-		for _, code := range family.ReasonCodes {
-			counts[code]++
-		}
+	recognition := runtimerecognition.Snapshot{ObservedAt: observedAt, BootID: bootID, Processes: recognitionProcesses}
+	if err := recognition.Validate(); err != nil {
+		return Sample{}, fmt.Errorf("linux recognition snapshot invariant: %w", err)
 	}
-	for _, family := range uncertainFamilies {
-		for _, code := range family.ReasonCodes {
-			counts[code]++
-		}
+	return Sample{Snapshot: snapshot, Recognition: recognition, Diagnostics: diagnosticsFromCounts(counts), uncertainPIDs: uncertainPIDs}, nil
+}
+
+// verifiedParent establishes an exact parent generation only after observing
+// both records again. A PPID by itself is deliberately retained only as a
+// conservative hint because a reused PID cannot identify a process generation.
+func verifiedParent(reader procReader, child *rawProcess, byPID map[uint64][]*rawProcess, bootTime time.Time, clockTicks uint64) *instancepresence.ProcessIdentity {
+	candidates := byPID[child.stat.ParentPID]
+	if len(candidates) != 1 || child.stat.ParentPID == 0 {
+		return nil
 	}
-	counts[ReasonUnknownProcess] += unknown
-	summary := Summary{
-		ObservedProcesses: uint64(len(observations)), UnknownProcesses: unknown,
-		AmbiguousFamilies: uint64(len(uncertainFamilies)),
+	parent := candidates[0]
+	parentData, err := reader.ReadFile(path.Join(strconv.FormatUint(parent.identity.PID, 10), "stat"), statReadLimit)
+	if err != nil {
+		return nil
 	}
-	for _, family := range families {
-		switch family.Candidate.Tool {
-		case instancepresence.ToolClaude:
-			summary.ClaudeFamilies++
-		case instancepresence.ToolCodex:
-			summary.CodexFamilies++
-		}
+	currentParent, err := parseProcStat(parentData)
+	if err != nil || currentParent.PID != parent.identity.PID || !startedAt(bootTime, currentParent.StartTicks, clockTicks).Equal(parent.identity.StartedAt) {
+		return nil
 	}
-	return Sample{
-		Snapshot: snapshot, Families: families, UncertainFamilies: uncertainFamilies,
-		Diagnostics: diagnosticsFromCounts(counts), Summary: summary, uncertainPIDs: uncertainPIDs,
-	}, nil
+	childData, err := reader.ReadFile(path.Join(strconv.FormatUint(child.identity.PID, 10), "stat"), statReadLimit)
+	if err != nil {
+		return nil
+	}
+	currentChild, err := parseProcStat(childData)
+	if err != nil || currentChild.PID != child.identity.PID || currentChild.ParentPID != parent.identity.PID || !startedAt(bootTime, currentChild.StartTicks, clockTicks).Equal(child.identity.StartedAt) {
+		return nil
+	}
+	identity := parent.identity
+	return &identity
+}
+
+// RuntimeSnapshot returns a snapshot and its boot identity from one bounded
+// Linux observation. It exposes no agent classification.
+func (adapter *Adapter) RuntimeSnapshot(ctx context.Context) (runtimerecognition.Snapshot, error) {
+	sample, err := adapter.Observe(ctx)
+	if err != nil {
+		return runtimerecognition.Snapshot{}, err
+	}
+	return sample.Recognition, nil
 }
 
 type rawProcess struct {
-	stat           procStat
-	identity       instancepresence.ProcessIdentity
-	executableBase string
-	argvPrefix     []string
-	ownerIdentity  string
-	classification classification
+	stat             procStat
+	identity         instancepresence.ProcessIdentity
+	commBase         string
+	argvBase         string
+	launchIdentities []instancepresence.OpaqueIdentity
+	ownerIdentity    string
 }
 
 type readOutcome struct {
@@ -230,7 +252,7 @@ type readOutcome struct {
 	counts    map[ReasonCode]uint64
 }
 
-func readProcess(reader procReader, pid uint64, bootTime time.Time, clockTicks uint64) (rawProcess, readOutcome) {
+func readProcess(reader procReader, pid uint64, bootTime time.Time, clockTicks uint64, rules []runtimerecognition.LaunchIdentityRule) (rawProcess, readOutcome) {
 	outcome := readOutcome{counts: make(map[ReasonCode]uint64)}
 	statPath := path.Join(strconv.FormatUint(pid, 10), "stat")
 	initialData, err := reader.ReadFile(statPath, statReadLimit)
@@ -274,20 +296,14 @@ func readProcess(reader procReader, pid uint64, bootTime time.Time, clockTicks u
 		outcome.counts[ReasonPIDReused]++
 		return rawProcess{}, outcome
 	}
-	executable := comm
-	arguments := argvSignals(argvData)
-	if len(arguments) > 0 {
-		if base := filepath.Base(arguments[0]); base != "." && base != string(filepath.Separator) && base != "" {
-			executable = base
-		}
-	}
+	launchIdentities := launchIdentities(argvData, rules)
 	outcome.accepted = true
 	return rawProcess{
 		stat: final,
 		identity: instancepresence.ProcessIdentity{
 			PID: pid, StartedAt: startedAt(bootTime, final.StartTicks, clockTicks),
 		},
-		executableBase: executable, argvPrefix: arguments, ownerIdentity: owner,
+		commBase: comm, argvBase: safeExecutableName(launchExecutable(argvData)), launchIdentities: launchIdentities, ownerIdentity: owner,
 	}, outcome
 }
 
@@ -336,37 +352,37 @@ func numericPID(name string) (uint64, bool) {
 	return pid, err == nil && pid > 0 && strconv.FormatUint(pid, 10) == name
 }
 
-// argvSignals immediately reduces the bounded local prefix to allowlisted
-// classifier markers. Unknown argument values are discarded, not retained.
-func argvSignals(data []byte) []string {
-	const maxArguments = 4
+// launchIdentities immediately reduces a bounded local argv prefix to the
+// configured opaque identities. Unknown argument values are discarded and no
+// agent-specific rule is embedded in the Linux backend.
+func launchIdentities(data []byte, rules []runtimerecognition.LaunchIdentityRule) []instancepresence.OpaqueIdentity {
+	const maxArguments = 2
 	parts := strings.Split(string(data), "\x00")
-	arguments := make([]string, 0, maxArguments)
-	for index, part := range parts {
-		if part == "" {
-			continue
-		}
-		lower := strings.ToLower(part)
-		base := normalizeName(filepath.Base(part))
-		signal := ""
-		switch {
-		case index == 0:
-			signal = sanitizeName(base)
-		case strings.Contains(lower, "@anthropic-ai/claude-code"):
-			signal = "@anthropic-ai/claude-code"
-		case strings.Contains(lower, "@openai/codex"):
-			signal = "@openai/codex"
-		case isClaudeBinary(base) || isCodexBinary(base):
-			signal = base
-		}
-		if signal != "" {
-			arguments = append(arguments, signal)
-		}
-		if index+1 == maxArguments {
-			break
+	identities := make([]instancepresence.OpaqueIdentity, 0, len(rules))
+	seen := make(map[instancepresence.OpaqueIdentity]struct{}, len(rules))
+	for index := 0; index < len(parts) && index < maxArguments; index++ {
+		for _, rule := range rules {
+			if rule.Matches(parts, index) {
+				if _, exists := seen[rule.Identity]; !exists {
+					identities = append(identities, rule.Identity)
+					seen[rule.Identity] = struct{}{}
+				}
+			}
 		}
 	}
-	return arguments
+	return identities
+}
+
+func launchExecutable(data []byte) string {
+	parts := strings.Split(string(data), "\x00")
+	if len(parts) == 0 || parts[0] == "" {
+		return ""
+	}
+	base := filepath.Base(parts[0])
+	if base == "." || base == string(filepath.Separator) {
+		return ""
+	}
+	return base
 }
 
 func ownerFromStatus(data []byte) string {
@@ -382,7 +398,14 @@ func ownerFromStatus(data []byte) string {
 }
 
 func sanitizeName(value string) string {
-	value = filepath.Base(strings.TrimSpace(value))
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "unknown"
+	}
+	value = filepath.Base(value)
+	if value == "." || value == string(filepath.Separator) {
+		return "unknown"
+	}
 	var result strings.Builder
 	for _, character := range value {
 		if character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' ||
@@ -399,4 +422,15 @@ func sanitizeName(value string) string {
 		return "unknown"
 	}
 	return result.String()
+}
+
+// safeExecutableName retains only a sanitized executable basename. argv[0] is
+// process-controlled, so empty and option-like values become unknown rather
+// than entering a serializable observation.
+func safeExecutableName(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || strings.HasPrefix(value, "-") || strings.Contains(value, "=") {
+		return "unknown"
+	}
+	return sanitizeName(value)
 }

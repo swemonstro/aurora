@@ -5,9 +5,14 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/swemonstro/aurora/internal/instancepresence"
+	"github.com/swemonstro/aurora/internal/linuxprocess"
+	"github.com/swemonstro/aurora/internal/runtimerecognition"
 )
 
 type testClock struct{ now time.Time }
@@ -51,6 +56,34 @@ func TestHelpDeclaresObserveOnlyMode(t *testing.T) {
 	err := run([]string{"-help"}, &stdout, &stderr, testClock{}, func(time.Duration) {})
 	if err == nil || !strings.Contains(strings.ToLower(stderr.String()), "observe-only") {
 		t.Fatalf("help error = %v, stderr = %q", err, stderr.String())
+	}
+}
+
+func TestObserverReportAggregatesRecognitionDiagnosticsDeterministically(t *testing.T) {
+	observed := time.Date(2026, 7, 22, 10, 0, 0, 0, time.UTC)
+	root := instancepresence.ProcessIdentity{PID: 101, StartedAt: observed.Add(-time.Second)}
+	candidate := instancepresence.RuntimeCandidate{InstanceID: "observe-fixture", Tool: instancepresence.ToolClaude, Runtime: instancepresence.RuntimeIdentity{HostID: "host-a", BootID: "boot-a", RootProcess: root}, Members: []instancepresence.ProcessIdentity{root}}
+	recognition := runtimerecognition.Result{
+		UnknownProcesses:  2,
+		Families:          []runtimerecognition.Family{{Candidate: candidate, ReasonCodes: []runtimerecognition.ReasonCode{runtimerecognition.ReasonIdentifiedAgentFamily, runtimerecognition.ReasonRootMissingChildAlive}}},
+		UncertainFamilies: []runtimerecognition.UncertainFamily{{Tool: instancepresence.ToolCodex, PossibleRoots: []instancepresence.ProcessIdentity{root}, Members: []instancepresence.ProcessIdentity{root}, ReasonCodes: []runtimerecognition.ReasonCode{runtimerecognition.ReasonAmbiguousRoot, runtimerecognition.ReasonMultipleRoots}}},
+	}
+	sample := linuxprocess.Sample{Snapshot: instancepresence.ProcessSnapshot{ObservedAt: observed}, Diagnostics: []linuxprocess.Diagnostic{{Code: linuxprocess.ReasonPermissionDenied, Count: 3}, {Code: linuxprocess.ReasonCode(runtimerecognition.ReasonUnknownProcess), Count: 4}, {Code: linuxprocess.ReasonPIDReused, Count: 0}}}
+	first := makeOutputReport(1, sample, recognition, nil)
+	second := makeOutputReport(1, sample, recognition, nil)
+	want := []linuxprocess.Diagnostic{
+		{Code: linuxprocess.ReasonCode(runtimerecognition.ReasonAmbiguousRoot), Count: 1},
+		{Code: linuxprocess.ReasonCode(runtimerecognition.ReasonIdentifiedAgentFamily), Count: 1},
+		{Code: linuxprocess.ReasonCode(runtimerecognition.ReasonMultipleRoots), Count: 1},
+		{Code: linuxprocess.ReasonPermissionDenied, Count: 3},
+		{Code: linuxprocess.ReasonCode(runtimerecognition.ReasonRootMissingChildAlive), Count: 1},
+		{Code: linuxprocess.ReasonCode(runtimerecognition.ReasonUnknownProcess), Count: 6},
+	}
+	if !reflect.DeepEqual(first.Diagnostics, want) || !reflect.DeepEqual(first.Diagnostics, second.Diagnostics) {
+		t.Fatalf("diagnostics = %#v, want %#v", first.Diagnostics, want)
+	}
+	if first.Families[0].CandidateRef != string(candidate.InstanceID) || first.Uncertain[0].Tool != instancepresence.ToolCodex || first.Summary.UnknownProcesses != 2 {
+		t.Fatalf("report = %#v", first)
 	}
 }
 

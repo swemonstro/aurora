@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/swemonstro/aurora/internal/instancepresence"
+	"github.com/swemonstro/aurora/internal/runtimerecognition"
 )
 
 var (
@@ -22,17 +23,12 @@ var (
 type ReasonCode string
 
 const (
-	ReasonClaudeFamily          ReasonCode = "identified_claude_family"
-	ReasonCodexFamily           ReasonCode = "identified_codex_family"
-	ReasonUnknownProcess        ReasonCode = "unknown_process"
-	ReasonAmbiguousRoot         ReasonCode = "ambiguous_root"
-	ReasonProcessDisappeared    ReasonCode = "process_disappeared_during_read"
-	ReasonInvalidProcData       ReasonCode = "invalid_proc_data"
-	ReasonPIDReused             ReasonCode = "pid_reused"
-	ReasonRootMissingChildAlive ReasonCode = "root_missing_child_alive"
-	ReasonMultipleRoots         ReasonCode = "multiple_possible_roots"
-	ReasonPermissionDenied      ReasonCode = "permission_denied"
-	ReasonArgvPrefixTruncated   ReasonCode = "argv_prefix_truncated"
+	ReasonUnknownProcess      ReasonCode = "unknown_process"
+	ReasonProcessDisappeared  ReasonCode = "process_disappeared_during_read"
+	ReasonInvalidProcData     ReasonCode = "invalid_proc_data"
+	ReasonPIDReused           ReasonCode = "pid_reused"
+	ReasonPermissionDenied    ReasonCode = "permission_denied"
+	ReasonArgvPrefixTruncated ReasonCode = "argv_prefix_truncated"
 )
 
 type Diagnostic struct {
@@ -40,42 +36,20 @@ type Diagnostic struct {
 	Count uint64     `json:"count"`
 }
 
-type Family struct {
-	Candidate   instancepresence.RuntimeCandidate
-	Shape       string
-	ReasonCodes []ReasonCode
-}
-
-type UncertainFamily struct {
-	Tool          instancepresence.ToolKind
-	PossibleRoots []instancepresence.ProcessIdentity
-	Members       []instancepresence.ProcessIdentity
-	ReasonCodes   []ReasonCode
-}
-
-type Summary struct {
-	ObservedProcesses uint64
-	ClaudeFamilies    uint64
-	CodexFamilies     uint64
-	UnknownProcesses  uint64
-	AmbiguousFamilies uint64
-}
-
 type Sample struct {
-	Snapshot          instancepresence.ProcessSnapshot
-	Families          []Family
-	UncertainFamilies []UncertainFamily
-	Diagnostics       []Diagnostic
-	Summary           Summary
-	uncertainPIDs     map[uint64]struct{}
+	Snapshot      instancepresence.ProcessSnapshot
+	Recognition   runtimerecognition.Snapshot
+	Diagnostics   []Diagnostic
+	uncertainPIDs map[uint64]struct{}
 }
 
 type Config struct {
-	ProcRoot   string
-	HostID     string
-	BootID     instancepresence.BootIdentity
-	Clock      instancepresence.Clock
-	ClockTicks uint64
+	ProcRoot            string
+	HostID              string
+	BootID              instancepresence.BootIdentity
+	Clock               instancepresence.Clock
+	ClockTicks          uint64
+	LaunchIdentityRules []runtimerecognition.LaunchIdentityRule
 }
 
 func (config Config) validate() error {
@@ -92,6 +66,11 @@ func (config Config) validate() error {
 	}
 	if config.Clock == nil {
 		return errors.New("clock must not be nil")
+	}
+	for index, rule := range config.LaunchIdentityRules {
+		if err := rule.Validate(); err != nil {
+			return fmt.Errorf("launch identity rule %d: %w", index, err)
+		}
 	}
 	return nil
 }

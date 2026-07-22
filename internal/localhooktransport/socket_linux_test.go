@@ -17,7 +17,6 @@ import (
 
 	"github.com/swemonstro/aurora/internal/instancecorrelation"
 	"github.com/swemonstro/aurora/internal/instancepresence"
-	"github.com/swemonstro/aurora/internal/linuxprocess"
 )
 
 type captureLogger struct {
@@ -311,7 +310,7 @@ type acceptingAuthenticator struct{}
 
 func (acceptingAuthenticator) Authenticate(PeerIdentity) error { return nil }
 
-func newNetworkTestServer(t *testing.T, authenticator Authenticator, source SnapshotSource) (*Server, Client, context.CancelFunc, <-chan error) {
+func newNetworkTestServer(t *testing.T, authenticator Authenticator, source RuntimeObservationSource) (*Server, Client, context.CancelFunc, <-chan error) {
 	t.Helper()
 	clock := wallClock{}
 	config := DefaultConfig(clock)
@@ -350,7 +349,7 @@ func newNetworkTestServer(t *testing.T, authenticator Authenticator, source Snap
 
 func TestServerAuthenticatesBeforeDecode(t *testing.T) {
 	sample := testSample()
-	server, _, cancel, done := newNetworkTestServer(t, rejectingAuthenticator{}, &fakeSnapshots{samples: []linuxprocess.Sample{sample}})
+	server, _, cancel, done := newNetworkTestServer(t, rejectingAuthenticator{}, &fakeSnapshots{samples: [][]instancecorrelation.RuntimeObservation{sample}})
 	connection, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: server.config.SocketPath, Net: "unix"})
 	if err != nil {
 		t.Fatal(err)
@@ -384,8 +383,7 @@ func TestServerClientRoundTripAndCleanup(t *testing.T) {
 	runtime.Candidate.Runtime.RootProcess.StartedAt = now.Add(-time.Second)
 	runtime.Candidate.Members[0] = runtime.Candidate.Runtime.RootProcess
 	sample := testSample(runtime)
-	sample.Snapshot.ObservedAt = now
-	source := &fakeSnapshots{samples: []linuxprocess.Sample{sample}}
+	source := &fakeSnapshots{samples: [][]instancecorrelation.RuntimeObservation{sample}}
 	server, client, cancel, done := newNetworkTestServer(t, DefaultAuthenticator(), source)
 	request := testRequest("request-01", instancepresence.ToolClaude)
 	request.Observation.ObservedAt = now
@@ -408,7 +406,7 @@ func TestServerClientRoundTripAndCleanup(t *testing.T) {
 }
 
 func TestServerAbruptDisconnectAndReadTimeout(t *testing.T) {
-	server, _, cancel, done := newNetworkTestServer(t, acceptingAuthenticator{}, &fakeSnapshots{samples: []linuxprocess.Sample{testSample()}})
+	server, _, cancel, done := newNetworkTestServer(t, acceptingAuthenticator{}, &fakeSnapshots{samples: [][]instancecorrelation.RuntimeObservation{testSample()}})
 	connection, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: server.config.SocketPath, Net: "unix"})
 	if err != nil {
 		t.Fatal(err)
@@ -455,7 +453,7 @@ func TestServerConcurrencyLimitIsBounded(t *testing.T) {
 	config.WriteDeadline = time.Second
 	config.MaximumHandlingTime = time.Second
 	entered, release := make(chan struct{}, 1), make(chan struct{})
-	source := &fakeSnapshots{samples: []linuxprocess.Sample{testSample()}, entered: entered, release: release}
+	source := &fakeSnapshots{samples: [][]instancecorrelation.RuntimeObservation{testSample()}, entered: entered, release: release}
 	correlator, err := instancecorrelation.New(instancecorrelation.DefaultConfig())
 	if err != nil {
 		t.Fatal(err)

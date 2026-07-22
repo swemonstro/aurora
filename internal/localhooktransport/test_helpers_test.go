@@ -8,7 +8,6 @@ import (
 
 	"github.com/swemonstro/aurora/internal/instancecorrelation"
 	"github.com/swemonstro/aurora/internal/instancepresence"
-	"github.com/swemonstro/aurora/internal/linuxprocess"
 )
 
 var testTime = time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
@@ -32,13 +31,13 @@ func (clock *testClock) Advance(duration time.Duration) {
 
 type fakeSnapshots struct {
 	mutex   sync.Mutex
-	samples []linuxprocess.Sample
+	samples [][]instancecorrelation.RuntimeObservation
 	calls   int
 	entered chan struct{}
 	release chan struct{}
 }
 
-func (source *fakeSnapshots) Observe(ctx context.Context) (linuxprocess.Sample, error) {
+func (source *fakeSnapshots) Observe(ctx context.Context) ([]instancecorrelation.RuntimeObservation, error) {
 	if source.entered != nil {
 		select {
 		case source.entered <- struct{}{}:
@@ -49,7 +48,7 @@ func (source *fakeSnapshots) Observe(ctx context.Context) (linuxprocess.Sample, 
 		select {
 		case <-source.release:
 		case <-ctx.Done():
-			return linuxprocess.Sample{}, ctx.Err()
+			return nil, ctx.Err()
 		}
 	}
 	source.mutex.Lock()
@@ -59,7 +58,7 @@ func (source *fakeSnapshots) Observe(ctx context.Context) (linuxprocess.Sample, 
 		index = len(source.samples) - 1
 	}
 	source.calls++
-	return source.samples[index], nil
+	return append([]instancecorrelation.RuntimeObservation{}, source.samples[index]...), nil
 }
 
 func (source *fakeSnapshots) Calls() int {
@@ -68,7 +67,7 @@ func (source *fakeSnapshots) Calls() int {
 	return source.calls
 }
 
-func newTestReceiver(t *testing.T, clock *testClock, source SnapshotSource) (*Receiver, Config) {
+func newTestReceiver(t *testing.T, clock *testClock, source RuntimeObservationSource) (*Receiver, Config) {
 	t.Helper()
 	correlator, err := instancecorrelation.New(instancecorrelation.DefaultConfig())
 	if err != nil {
@@ -86,26 +85,8 @@ func newTestReceiver(t *testing.T, clock *testClock, source SnapshotSource) (*Re
 	return receiver, config
 }
 
-func testSample(runtimes ...instancecorrelation.RuntimeObservation) linuxprocess.Sample {
-	sample := linuxprocess.Sample{
-		Snapshot: instancepresence.ProcessSnapshot{ObservedAt: testTime, Processes: []instancepresence.ProcessObservation{}},
-		Families: []linuxprocess.Family{},
-	}
-	for _, runtime := range runtimes {
-		sample.Families = append(sample.Families, linuxprocess.Family{Candidate: runtime.Candidate})
-		for _, member := range runtime.Candidate.Members {
-			observation := instancepresence.ProcessObservation{
-				Process: member, ExecutableIdentity: "exe:fixture", OwnerIdentity: "owner:fixture",
-			}
-			if member.PID == runtime.Candidate.Runtime.RootProcess.PID && member.StartedAt.Equal(runtime.Candidate.Runtime.RootProcess.StartedAt) {
-				observation.ProcessGroupOrJob = runtime.ProcessGroupOrJob
-				observation.OSSession = runtime.OSSession
-				observation.TerminalFingerprint = runtime.TerminalFingerprint
-			}
-			sample.Snapshot.Processes = append(sample.Snapshot.Processes, observation)
-		}
-	}
-	return sample
+func testSample(runtimes ...instancecorrelation.RuntimeObservation) []instancecorrelation.RuntimeObservation {
+	return append([]instancecorrelation.RuntimeObservation{}, runtimes...)
 }
 
 func testRuntime(ref string, tool instancepresence.ToolKind, pid uint64) instancecorrelation.RuntimeObservation {

@@ -10,7 +10,6 @@ import (
 
 	"github.com/swemonstro/aurora/internal/instancecorrelation"
 	"github.com/swemonstro/aurora/internal/instancepresence"
-	"github.com/swemonstro/aurora/internal/linuxprocess"
 )
 
 func TestReceiverCorrelationOutcomes(t *testing.T) {
@@ -74,7 +73,7 @@ func TestReceiverCorrelationOutcomes(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			clock := &testClock{now: testTime}
 			runtimes := test.runtimes()
-			receiver, _ := newTestReceiver(t, clock, &fakeSnapshots{samples: []linuxprocess.Sample{testSample(runtimes...)}})
+			receiver, _ := newTestReceiver(t, clock, &fakeSnapshots{samples: [][]instancecorrelation.RuntimeObservation{testSample(runtimes...)}})
 			request := testRequest("request-01", instancepresence.ToolClaude)
 			test.mutate(&request, runtimes)
 			response := receiver.Handle(context.Background(), request)
@@ -105,7 +104,7 @@ func TestReceiverCorrelationOutcomes(t *testing.T) {
 func TestReceiverResponseDoesNotSerializeProcessOrSourceData(t *testing.T) {
 	clock := &testClock{now: testTime}
 	runtime := oneClaudeRuntime()[0]
-	receiver, _ := newTestReceiver(t, clock, &fakeSnapshots{samples: []linuxprocess.Sample{testSample(runtime)}})
+	receiver, _ := newTestReceiver(t, clock, &fakeSnapshots{samples: [][]instancecorrelation.RuntimeObservation{testSample(runtime)}})
 	request := testRequest("request-01", instancepresence.ToolClaude)
 	root := runtime.Candidate.Runtime.RootProcess
 	request.Observation.ProcessHint = &ProcessIdentity{PID: root.PID, StartedAt: root.StartedAt}
@@ -124,7 +123,7 @@ func TestReceiverResponseDoesNotSerializeProcessOrSourceData(t *testing.T) {
 func TestReceiverReplayDiagnosticsAndNoCorrelationStateTransfer(t *testing.T) {
 	clock := &testClock{now: testTime}
 	runtimeA, runtimeB := testRuntime("runtime-a", instancepresence.ToolClaude, 101), testRuntime("runtime-b", instancepresence.ToolClaude, 201)
-	source := &fakeSnapshots{samples: []linuxprocess.Sample{testSample(runtimeA), testSample(runtimeB), testSample(runtimeB)}}
+	source := &fakeSnapshots{samples: [][]instancecorrelation.RuntimeObservation{testSample(runtimeA), testSample(runtimeB), testSample(runtimeB)}}
 	receiver, config := newTestReceiver(t, clock, source)
 	first := testRequest("request-01", instancepresence.ToolClaude)
 	rootA := runtimeA.Candidate.Runtime.RootProcess
@@ -164,7 +163,7 @@ func TestReceiverCandidateLimitIsConservative(t *testing.T) {
 	for index := 0; index < 13; index++ {
 		runtimes = append(runtimes, testRuntime(fmt.Sprintf("runtime-%02d", index), instancepresence.ToolClaude, uint64(100+index)))
 	}
-	receiver, _ := newTestReceiver(t, clock, &fakeSnapshots{samples: []linuxprocess.Sample{testSample(runtimes...)}})
+	receiver, _ := newTestReceiver(t, clock, &fakeSnapshots{samples: [][]instancecorrelation.RuntimeObservation{testSample(runtimes...)}})
 	response := receiver.Handle(context.Background(), testRequest("request-01", instancepresence.ToolClaude))
 	if len(response.Proposals) != 0 || !hasErrorCode(response, CodeCorrelationFailed) || !hasErrorCode(response, CodeInsufficientEvidence) {
 		t.Fatalf("response = %#v", response)
@@ -179,7 +178,7 @@ func TestReceiverReplayOverflowIsConservative(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	service, err := NewCorrelationService(&fakeSnapshots{samples: []linuxprocess.Sample{testSample(), testSample()}}, correlator, clock, config.MaximumRuntimes)
+	service, err := NewCorrelationService(&fakeSnapshots{samples: [][]instancecorrelation.RuntimeObservation{testSample(), testSample()}}, correlator, clock, config.MaximumRuntimes)
 	if err != nil {
 		t.Fatal(err)
 	}
