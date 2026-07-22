@@ -1,0 +1,14 @@
+{
+  "protocol_version": 1,
+  "request_id": "codex-request-01",
+  "operation": "correlate_observation",
+  "observation": {
+    "tool": "codex",
+    "hook_session_ref": "codex-session-fixture",
+    "producer_epoch": "epoch-fixture",
+    "revision": 1,
+    "idempotency_key": "codex-idem-01",
+    "observed_at": "2026-07-22T12:00:00Z",
+    "lifecycle": "idle"
+  }
+}
