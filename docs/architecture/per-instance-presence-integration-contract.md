@@ -1,9 +1,10 @@
 # Integrationskontrakt för per-instance presence
 
-Status: normativt integrationskontrakt för Paket 4.5–6
+Status: normativt integrationskontrakt för Paket 4.5–7 (inkl. förutsättningsunderpaket 7.0)
 
-Detta dokument definierar produktgränsen som gäller efter Paket 5 och under
-Paket 6.
+Detta dokument definierar produktgränsen som gäller efter Paket 5, under
+Paket 6, samt de bindande avgränsningarna för Paket 7 och förutsättnings-
+underpaketet Paket 7.0 (trusted identity bridge).
 `SKA`, `FÅR INTE` och `KRÄVER` är bindande. Beskrivningar märkta **nuläge** är
 observerade avvikelser och gör dem inte till godkänd målarkitektur.
 
@@ -338,14 +339,26 @@ hooksidan. Med exakt den stacken ska Paket 7 fail-closed och får inte avge
 `propose_bind` (eller `replace` som skapar ny association) för en ny koppling
 förrän hård identitet kommer från en uttryckligen definierad, betrodd
 server-side källa. Payloadpåstådda PID-/starttidsfält förblir overifierade.
-Den saknade trusted identity-bryggan är en explicit förutsättning för nyttig
-Paket 7-implementation, inte en implicit Paket 7-antagande.
+
+Den saknade trusted identity-bryggan specificeras som **Paket 7.0**
+([trusted identity bridge](per-instance-presence-package-7-trusted-identity-bridge.md)):
+ett förutsättningsunderpaket till Paket 7 (roadmapordning **före** Paket 7),
+inte Paket 8-mutation och inte en implicit Paket 6-förmåga. Linux-MVP:n kör en
+**begränsad attesteringstransaktion**: omedelbar `SO_PEERCRED` och peer-
+generation efter accept, därefter strikt Paket 6-requestvalidering, därefter
+tool-namnrymdsbegränsad ancestry-join; resultatet publiceras som **en**
+immutabel checkpoint (betrodd evidens eller explicit frånvaro).
+Processinspektionerna är inte kernelatomära. `SO_PEERCRED` ensamt bevisar inte
+slutlig Claude-/Codex-runtime. Validerad ingress-`tool` är endast
+kandidatnamnrymd, inte hård processidentitet.
 
 Paket 7 får:
 
 - uttrycka fail-closed policy för exact/strong vs weak/ambiguous/rejected;
 - kräva betrodd hård processgeneration (PID + starttid) före
   bindningsberättigande för nya associationer;
+- konsumera Paket 7.0-attestering (eller likvärdig godkänd källa) som hook-sidans
+  hårda evidens;
 - hantera keep/suspend/**atomär replace**/remove för korrelationslivscykel i
   minnet (`replace` är ett Paket 7-beslut; Paket 8 styr hur mutation tillämpas);
 - producera innehållsfria beslut och auditposter;
@@ -359,6 +372,7 @@ Paket 7 får inte:
   bindningsauktorisation;
 - binda på enbart mjuka signaler eller overifierade payload-hints;
 - anta att Paket 6 redan levererar hård hookidentitet;
+- behandla enbart peer-PID från `SO_PEERCRED` som hård runtimeidentitet;
 - behandla omätta åldersfönster, grace, TTL, kapacitet, ambiguitetsdelta eller
   exact-vs-strong som slutliga produktsäkerhetströsklar utan mänskligt
   godkännande;
@@ -366,15 +380,61 @@ Paket 7 får inte:
 - aktivera mutation eller installation som default.
 
 Godkänt Paket 7-dokument godkänner inte registry-/slotmutation. Den hör till
-Paket 8 och kräver separat aktivering.
+Paket 8 och kräver separat aktivering. Godkänd Paket 7.0-dokumentation
+godkänner inte heller mutation eller produktionsaktivering av bindning.
+
+## Paket 7.0: trusted identity bridge
+
+Paket 7.0 definierar den betrovda evidenskedjan för hook-sidans hårda
+processidentitet på Linux. Det fullständiga kontraktet finns i
+[Paket 7.0](per-instance-presence-package-7-trusted-identity-bridge.md).
+
+Obligatorisk serverordning (ingress-`tool` är okänd före requestvalidering):
+
+1. acceptera Unix-anslutning;
+2. omedelbart läsa och autentisera `SO_PEERCRED`;
+3. omedelbart fånga och stabilisera peerprocessgeneration;
+4. läsa, storlekskontrollera, strikt avkoda och validera Paket 6-request;
+5. använda validerad `tool` endast för att begränsa runtimekandidater;
+6. verifierad ancestry och unik runtimefamilje-join;
+7. publicera en immutabel intern checkpoint: betrodd evidens **eller**
+   `trusted_hard_identity_present=false` med reason codes.
+
+Paket 6-sekvensering och Paket 7.0-attestering är **separata utfall**. En giltig
+Paket 6-ingress FÅR fortfarande sekvenseras observe-only när attestering
+misslyckas. Paket 6-svar och `no_binding_performed=true` ändras inte av
+identitetsfrånvaro. Paket 7 vägrar ny bindning utan betrodd evidens.
+
+Paket 7.0 får (när implementerat bakom avstängd default):
+
+- läsa kernel-peercredentials omedelbart efter socketaccept;
+- server-side bestämma peerprocessgeneration (PID + starttid) före payload-
+  decode;
+- efter validerad request begränsa kandidater med `tool` (namnrymd, inte hård
+  identitet);
+- verifiera begränsad ancestry och unikt koppla till en igenkänd same-tool-
+  runtimefamilj;
+- publicera exakt ett immutabelt internt checkpointresultat.
+
+Paket 7.0 får inte:
+
+- lita på klientdeklarerade processfält;
+- behandla klient-`tool` som hård processidentitet;
+- påstå att `/proc`-/peer-läsningar är operativt atomära (endast
+  publikationsatomicitet vid checkpoint);
+- mutera registry, slots eller publicera presence;
+- ändra Paket 6:s minimala wirepayload, svarssemantik eller ESP/v1-pathen;
+- kräva att giltig Paket 6-sekvensering avvisas enbart för saknad hård
+  identitet;
+- behandla misslyckad attestering som mjuk bindning.
 
 ## Öppna produktbeslut efter Paket 6
 
 Följande ska beslutas före motsvarande framtida funktion:
 
-- design och evidens för trusted hard identity-brygga (serverattestering och/eller
-  senare versionerad ingress) före att Paket 7 får avge `propose_bind`/`replace`
-  till en muterande konsument (se Paket 7 §2.0 och §16);
+- live-evidens och Blue1-mätningar för Paket 7.0 (hookträd, parallella sessioner,
+  latency, false-link) före att Paket 7 får avge `propose_bind`/`replace` till
+  en muterande konsument (se Paket 7 §2.0 och §16 samt Paket 7.0 §16);
 - accepterad false-positive-gräns för automatisk bind;
 - om automatic bind tillåter `strong` (member) eller endast `exact`
   (root/runtime), baserat på märkt evidence;

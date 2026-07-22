@@ -20,6 +20,7 @@ Related documents:
 - [architecture decisions](per-instance-presence-decisions.md)
 - [Package 3 correlation](per-instance-presence-package-3.md)
 - [Package 6 local ingress](per-instance-presence-package-6.md)
+- [Package 7.0 trusted identity bridge](per-instance-presence-package-7-trusted-identity-bridge.md)
 - [main design](per-instance-presence.md)
 
 ## 1. Purpose and product boundary
@@ -96,8 +97,11 @@ met and reviewed, including:
 Package 7’s **docs-first contract** may exist earlier so policy is locked before
 code. Useful Package 7 implementation that can emit `propose_bind` for new
 associations is additionally blocked until a **trusted hard identity bridge**
-exists (section 2.0). That bridge is not provided by Package 6 as implemented
-today and is not an implicit Package 7 assumption.
+exists (section 2.0). That bridge is specified as prerequisite subpackage
+**Package 7.0** in
+[per-instance-presence-package-7-trusted-identity-bridge.md](per-instance-presence-package-7-trusted-identity-bridge.md).
+It is not provided by Package 6 as implemented today and is not an implicit
+capability of Package 7 policy itself.
 
 ## 2. Inputs and trust model
 
@@ -132,7 +136,11 @@ Therefore, with Packages 0–6 **exactly as implemented today**, Package 7:
 
 This missing trusted identity bridge is an **explicit prerequisite** for useful
 Package 7 implementation. It is **not** assumed to exist inside Package 7
-itself.
+policy itself. The normative Linux design is **Package 7.0** (trusted identity
+bridge): kernel peer credentials, server-side generation lookup, and bounded
+ancestry join to an already recognized runtime family — never client-declared
+process fields. See
+[Package 7.0](per-instance-presence-package-7-trusted-identity-bridge.md).
 
 #### Allowed future source boundary (not implemented here)
 
@@ -143,8 +151,8 @@ limited to:
 | Allowed class | Examples (future, versioned) | Status |
 | --- | --- | --- |
 | Trusted local process/runtime observation | OS-neutral runtime snapshot members already attested by the process backend (PID + start time, host/boot as backend provides) used only as the **runtime** side of a pair | Exists for runtimes (Packages 2/5); not a hook-side identity |
-| Server-side attestation of the hook peer | e.g. Linux `SO_PEERCRED` peer PID checked against the same snapshot generation (PID + start time), ancestry, or equivalent platform attestation performed **on the presence server** after auth | Not implemented; requires explicit design + evidence |
-| Later **versioned** ingress contract | A new protocol version that carries only fields Aurora can treat as server-attested or that are filled server-side after attestation — never raw client claims as hard identity | Not Package 6 v2 as shipped |
+| Server-side attestation of the hook peer | Package 7.0: ordered bounded attestation transaction — immediate `SO_PEERCRED` + peer generation after accept, then Package 6 request validation, then tool-namespaced ancestry join; one immutable checkpoint result (evidence or explicit absence). Not operationally atomic process inspection | Designed in Package 7.0 docs; not implemented; Blue1 evidence still required |
+| Later **versioned** ingress contract | A new protocol version that carries only fields Aurora can treat as server-attested or that are filled server-side after attestation — never raw client claims as hard identity | Not Package 6 v2 as shipped; not required if Package 7.0 server-side attestation succeeds |
 
 **Forbidden as hard identity:**
 
@@ -152,6 +160,7 @@ limited to:
 - soft signals (process group, OS session, terminal fingerprint, start-time
   proximity, tool match alone);
 - session-ID, source, provider, profile, CWD, argv, transcript path;
+- `SO_PEERCRED` PID alone without generation and unique runtime link;
 - Package 3 `would_bind_under_current_threshold` without trusted hard identity.
 
 Payload-declared process/runtime hints, if they appear on any path, remain
@@ -163,7 +172,7 @@ Package 3 rules and must never alone authorize `propose_bind` or `replace`.
 | Input | Provenance | Role in Package 7 |
 | --- | --- | --- |
 | Sequenced hook observation | Package 6 server: epoch, revision, `ObservedAt`, `tool`, `hook_session_ref`, `lifecycle` | Subject of the decision |
-| Trusted hook-side hard identity (optional) | Future server attestation or versioned contract — **not** Package 6 payload today | Required for new `propose_bind` / `replace` |
+| Trusted hook-side hard identity (optional) | Package 7.0 checkpoint result (or later approved equivalent) — **not** Package 6 payload; absence is explicit (`trusted_hard_identity_present=false`) | Required for new `propose_bind` / `replace` |
 | Runtime observations | OS-neutral snapshot + agent recognizers | Candidate set (runtime-side hard identity) |
 | Package 3 correlation result | Deterministic scoring of the same inputs | Evidence classification |
 | Prior Package 7 decision (if any) | In-memory decision table for this epoch | Lifecycle continuity |
@@ -605,10 +614,12 @@ status on another instance.
 **Not permitted:** `propose_bind`, even if soft signals or Package 3 diagnostic
 `would_bind` look attractive.
 
-### Example B — future trusted hard identity + safe exact match
+### Example B — Package 7.0 trusted hard identity + safe exact match
 
-- Same as A, **plus** an approved server-side attestation that the hook peer is
-  PID 18420 start T0, matching the unique Claude runtime root.
+- Same as A, **plus** Package 7.0 checkpoint success after the prescribed order:
+  accept → `SO_PEERCRED` → peer generation (PID 18420 start T0) → validated
+  Package 6 request (`tool=claude`) → L1/L2/L3 link to the unique Claude
+  runtime root (see Package 7.0).
 - Correlation: exact root match, unique, not ambiguous.
 - Prior: none.
 - Parameters approved for the evaluation class (section 16).
@@ -697,7 +708,7 @@ Intended future code ownership (not implemented by this document):
 | --- | --- |
 | `internal/instancecorrelation` | Unchanged scoring engine (Package 3) |
 | New policy package (e.g. `internal/bindingpolicy`) | Pure Package 7 decision function |
-| Future attestation / versioned ingress | Trusted hard identity bridge (prerequisite) |
+| Package 7.0 attestation composition (Linux peer + proc + recognition join) | Trusted hard identity bridge (prerequisite); see Package 7.0 doc |
 | `internal/instanceregistry` | Unchanged until Package 8 |
 | `cmd/aurora-presence-local-server` | Optional composition behind default-off flags later |
 | Claude/Codex hooks, relay, v1 publish | Unchanged |
@@ -732,13 +743,13 @@ anything.
 The following are **not** settled as final product safety thresholds and must
 not be filled by implementation convenience:
 
-1. **Trusted hard identity bridge design and evidence** (server attestation
-   and/or versioned ingress) — prerequisite for useful `propose_bind` /
-   `replace` (section 2.0).
+1. **Trusted hard identity bridge live evidence** — Package 7.0 design is
+   documented; Blue1 measurements and soak (Package 7.0 §16) remain open before
+   the bridge may authorize Package 7 `propose_bind` / `replace`.
 2. **Accepted false-positive rate** for automatic `propose_bind` / `replace` in
    production (from labeled soak data).
 3. **Whether `strong` (member) is authorized**, or only `exact` (root/runtime),
-   for mutating consumption.
+   for mutating consumption (includes Package 7.0 L2/L3 link classes).
 4. **Suspend grace** duration and/or snapshot miss count before `remove`.
 5. **Numeric approval** of age windows, proximity windows, TTLs, capacities, and
    ambiguity delta in section 5 (proposed defaults only until then).
@@ -754,6 +765,20 @@ consumers. With Packages 0–6 alone, new associations remain `refuse` regardles
 
 - Package 6 as implemented today does **not** supply server-attested hard
   process identity.
+- The trusted identity bridge is **Package 7.0**, a **prerequisite subpackage**
+  of Package 7 policy — not Package 8 mutation and not an implicit Package 6
+  capability. Normative design:
+  [Package 7.0](per-instance-presence-package-7-trusted-identity-bridge.md).
+- `SO_PEERCRED` alone does **not** prove the final Claude/Codex runtime; peer
+  generation and unique ancestry/runtime join are required.
+- Client-declared process fields are never hard identity. Validated ingress
+  `tool` is candidate **namespace** only, not process proof.
+- Package 7.0 uses a **bounded attestation transaction** and **checkpoint**
+  (publication atomicity only); process inspection steps are not claimed to be
+  kernel-atomic.
+- Valid Package 6 observe-only sequencing is **independent** of Package 7.0
+  attestation success; the internal path must carry trusted evidence **or**
+  explicit `trusted_hard_identity_present=false` with reason codes.
 - `replace` is an **atomic Package 7 decision**; Package 8 owns mutation
   application safety.
 - Section 5 numbers are **proposed measurement defaults**, not final safety
@@ -767,5 +792,7 @@ consumers. With Packages 0–6 alone, new associations remain `refuse` regardles
   for mutation.
 - Package 6 remains observe-only ingress with a minimal payload; Package 7 does
   not smuggle process identity into that payload without a versioned contract
-  change.
+  change. Package 7.0 attests identity **server-side**, keeps it off the hook
+  response wire, and does not gate valid Package 6 sequencing on attestation
+  success.
 - The overall ESP status path (v1 `/presence` aggregation) remains untouched.

@@ -37,6 +37,7 @@ produktion.
 | 4.5 | Produktgräns, lagerkontrakt och kanonisk roadmap | ja | ja | ja | nej |
 | 5 | Refaktorer A–C: runtimekälla, recognition, agentadapters och transportgränser | ja | ja | ja | nej |
 | 6 | Verklig lokal hook-ingress med receiverägd sequencing och bounded best-effort-klient | ja | nej | nej | nej |
+| 7.0 | Trusted identity bridge (Linux peer + generation + ancestry; docs-first; förutsättning för Paket 7) | ja | delvis (docs) | nej | nej |
 | 7 | Säker binding policy och korrelationslivscykel (docs-first kontrakt) | ja | delvis (docs) | nej | nej |
 | 8 | Registry- och slotmutation bakom separat aktivering | ja | nej | nej | nej |
 
@@ -112,6 +113,36 @@ Paket 6 utför ingen automatisk bindning och får inte mutera registry eller
 slots, persistera presence-state, publicera till relay/v2, ändra v1 eller
 installera eller aktivera någon tjänst.
 
+### Paket 7.0 — trusted identity bridge (förutsättning för nyttig Paket 7)
+
+[Paket 7.0](per-instance-presence-package-7-trusted-identity-bridge.md) är ett
+**förutsättningsunderpaket** till Paket 7 och står **före** Paket 7 i
+roadmapordningen. Det definierar hur Linux-MVP:n server-side får attestera
+hook-avsändarens processgeneration och koppla den till en redan igenkänd
+Claude-/Codex-runtimefamilj **utan** att lita på klientdeklarerad PID,
+starttid, ancestry eller runtimeidentitet.
+
+Normativt underlag:
+
+- obligatorisk ordning: accept → omedelbar `SO_PEERCRED`/auth → omedelbar
+  peergeneration → strikt Paket 6-requestvalidering → tool som **namnrymd** →
+  ancestry/runtime-join → en immutabel checkpoint;
+- processinspektion är inte kernelatomär; endast checkpointpublicering är
+  atomär (evidens eller explicit frånvaro, aldrig partiell betrodd evidens);
+- `SO_PEERCRED` ensamt bevisar inte slutlig Claude-/Codex-runtime;
+- giltig Paket 6 observe-only-sekvensering är **oberoende** av attesterings-
+  utfall; intern väg bär betrodd evidens eller
+  `trusted_hard_identity_present=false` med reason codes;
+- en kortlivad anslutning per hookinvocation är den föredragna bäraren;
+- misslyckad identitet ger fail-closed bindning i Paket 7
+  (`missing_trusted_hard_identity`), inte mjuk bindning;
+- ingen registry-/slotmutation (Paket 8-gräns);
+- ESP/v1-pathen lämnas orörd;
+- Blue1-mätningar av verkliga hookträd återstår före `propose_bind` får
+  auktoriseras.
+
+Normativ dokumentation finns; implementation, integration och aktivering saknas.
+
 ### Paket 7 — säker binding policy och korrelationslivscykel
 
 [Paket 7](per-instance-presence-package-7.md) definierar det normativa
@@ -130,13 +161,14 @@ Normativ dokumentation finns; implementation, integration och aktivering saknas.
 `would_bind_under_current_threshold` från Paket 3 förblir diagnostik och är inte
 bindningsauktorisation. Paket 6 som den är implementerad ger ingen
 serverattesterad hård processidentitet i ingressen; med endast Paket 0–6 ska
-Paket 7 fail-closed och inte avge `propose_bind` för nya associationer förrän en
-uttrycklig trusted identity-brygga finns. `replace` är ett atomärt
-policybeslut; Paket 8 styr mutationsapplikation. Åldersfönster, grace, TTL,
-kapaciteter och exact-vs-strong är föreslagna mätdefaults som kräver mänskligt
-godkännande före muterande konsumtion. Paket 7 får inte mutera registry, slots,
-hookclaims, runtimeclaims eller publicera till relay/v2. Implementeringsarbete
-förutsätter att Paket 6:s exitkriterier är uppfyllda och granskade.
+Paket 7 fail-closed och inte avge `propose_bind` för nya associationer förrän
+förutsättningsunderpaketet **Paket 7.0** (eller likvärdig godkänd attestering)
+finns med evidens. `replace` är ett atomärt policybeslut; Paket 8 styr
+mutationsapplikation. Åldersfönster, grace, TTL, kapaciteter och
+exact-vs-strong är föreslagna mätdefaults som kräver mänskligt godkännande före
+muterande konsumtion. Paket 7 får inte mutera registry, slots, hookclaims,
+runtimeclaims eller publicera till relay/v2. Implementeringsarbete förutsätter
+att Paket 6:s exitkriterier är uppfyllda och granskade.
 
 ### Paket 8 — registry- och slotmutation
 
@@ -155,6 +187,7 @@ Efter integrationen av A–C vid `0b0fc65` gäller följande kanoniska uppdelnin
 | --- | --- |
 | “Paket 5:s första refaktorer A–C” | Paket 5 |
 | “Paket 5: verklig observe-only hookanslutning” | Paket 6 |
+| Trusted identity bridge (förutsättning för propose_bind) | Paket 7.0 |
 | Framtida säker bindning | Paket 7 |
 | Framtida registry-/slotmutation | Paket 8 |
 

@@ -39,10 +39,20 @@ Linuxbackenden och får inte vara generell användaridentitet.
 
 En autentiserad samma-UID-peer är fortfarande en lokal avsändare, inte en
 attestering av payloadens PID/starttid. Hård processidentitet måste verifieras
-separat server-side. En Linuximplementation kan pröva peerprocessens
-kernelrapporterade PID mot PID + starttid och verifierad ancestry i samma
-snapshot. Om peeren har försvunnit eller relationen är tvetydig finns ingen hård
-identitet; backenden får inte falla tillbaka till payloadens PID.
+separat server-side. Den normativa designen för den attesteringen är
+[Paket 7.0 trusted identity bridge](../per-instance-presence-package-7-trusted-identity-bridge.md):
+
+1. omedelbart efter accept: `SO_PEERCRED` och stabiliserad peergeneration;
+2. därefter Paket 6 requestläsning och strikt validering (då blir `tool` känd);
+3. därefter tool-namnrymdsbegränsad verifierad ancestry-join;
+4. en immutabel checkpoint: betrodd evidens eller explicit frånvaro.
+
+Processläsningarna är inte kernelatomära; endast checkpointpubliceringen är
+atomär i kontraktets mening. `SO_PEERCRED` ensamt bevisar inte att peeren är
+slutlig agentruntime (hookhjälpare, wrappers och shells är förväntade). Om
+peeren har försvunnit eller relationen är tvetydig finns ingen hård identitet;
+backenden får inte falla tillbaka till payloadens PID. Saknad hård identitet
+får inte ensam avvisa en i övrigt giltig Paket 6 observe-only-sekvensering.
 
 ## Konfigurationsgräns
 
@@ -99,6 +109,10 @@ Samma UID är inte processidentitet. Ingressen innehåller därför inga process
 eller runtimehints, och transportautentisering kan inte ensam skapa bindning.
 Pathbaserad Unix socket har kvar en reducerad TOCTOU-risk även efter sådana
 kontroller; den risken ska redovisas och får inte döljas som hård identitet.
+Paket 6:s modell med en kortlivad anslutning per hookinvocation är den
+föredragna bäraren för Paket 7.0-attesteringstransaktionen; connection reuse
+utan ny full generations- och checkpointkontroll vore en kontraktsregression
+för bryggan.
 
 ## Framtida named-pipe-backend
 
