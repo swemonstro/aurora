@@ -70,6 +70,29 @@ func TestWireInstanceLifecycleAndRevisionValidation(t *testing.T) {
 		}
 	})
 
+	t.Run("attention with zero hook revision is valid", func(t *testing.T) {
+		// RuntimeSuspended projects to attention without any hook event.
+		instance := validAPIInstance()
+		instance.State = instancepresence.StateAttention
+		instance.Revisions.HookRevision = 0
+		if err := instance.Validate(); err != nil {
+			t.Fatalf("suspended-derived attention rejected: %v", err)
+		}
+	})
+
+	for _, state := range []instancepresence.EffectiveState{
+		instancepresence.StateWorking, instancepresence.StateError,
+	} {
+		t.Run(string(state)+" with zero hook revision is rejected", func(t *testing.T) {
+			instance := validAPIInstance()
+			instance.State = state
+			instance.Revisions.HookRevision = 0
+			if err := instance.Validate(); err == nil {
+				t.Fatalf("%s with zero hook revision was accepted", state)
+			}
+		})
+	}
+
 	tests := []struct {
 		name   string
 		mutate func(*Instance)
@@ -77,7 +100,6 @@ func TestWireInstanceLifecycleAndRevisionValidation(t *testing.T) {
 		{name: "zero runtime revision", mutate: func(instance *Instance) { instance.Revisions.RuntimeRevision = 0 }},
 		{name: "state change before discovery", mutate: func(instance *Instance) { instance.StateChangedAt = instance.DiscoveredAt.Add(-time.Second) }},
 		{name: "lease before discovery", mutate: func(instance *Instance) { instance.LeaseExpiresAt = instance.DiscoveredAt.Add(-time.Second) }},
-		{name: "non-idle state without hook revision", mutate: func(instance *Instance) { instance.State = instancepresence.StateWorking }},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -89,14 +111,19 @@ func TestWireInstanceLifecycleAndRevisionValidation(t *testing.T) {
 		})
 	}
 
-	t.Run("positive hook revision permits active hook state", func(t *testing.T) {
-		instance := validAPIInstance()
-		instance.State = instancepresence.StateWorking
-		instance.Revisions.HookRevision = 1
-		if err := instance.Validate(); err != nil {
-			t.Fatalf("valid hooked wire instance rejected: %v", err)
-		}
-	})
+	for _, state := range []instancepresence.EffectiveState{
+		instancepresence.StateIdle, instancepresence.StateWorking,
+		instancepresence.StateAttention, instancepresence.StateError,
+	} {
+		t.Run(string(state)+" with positive hook revision is valid", func(t *testing.T) {
+			instance := validAPIInstance()
+			instance.State = state
+			instance.Revisions.HookRevision = 1
+			if err := instance.Validate(); err != nil {
+				t.Fatalf("%s with positive hook revision rejected: %v", state, err)
+			}
+		})
+	}
 }
 
 func TestMutationResponseRevisionValidation(t *testing.T) {
@@ -121,19 +148,52 @@ func TestMutationResponseRevisionValidation(t *testing.T) {
 		}
 	})
 
+	t.Run("attention with zero hook revision is valid", func(t *testing.T) {
+		response := base
+		response.EffectiveState = instancepresence.StateAttention
+		response.Revisions.HookRevision = 0
+		if err := response.Validate(); err != nil {
+			t.Fatalf("attention response with zero hook revision rejected: %v", err)
+		}
+	})
+
 	for _, state := range []instancepresence.EffectiveState{
-		instancepresence.StateWorking, instancepresence.StateAttention, instancepresence.StateError,
+		instancepresence.StateWorking, instancepresence.StateError,
 	} {
-		t.Run(string(state)+" requires hook revision", func(t *testing.T) {
+		t.Run(string(state)+" with zero hook revision is rejected", func(t *testing.T) {
 			response := base
 			response.EffectiveState = state
+			response.Revisions.HookRevision = 0
 			if err := response.Validate(); err == nil {
 				t.Fatalf("%s with zero hook revision was accepted", state)
 			}
+		})
+	}
+
+	for _, state := range []instancepresence.EffectiveState{
+		instancepresence.StateIdle, instancepresence.StateWorking,
+		instancepresence.StateAttention, instancepresence.StateError,
+	} {
+		t.Run(string(state)+" with positive hook revision is valid", func(t *testing.T) {
+			response := base
+			response.EffectiveState = state
 			response.Revisions.HookRevision = 1
 			if err := response.Validate(); err != nil {
 				t.Fatalf("%s with positive hook revision rejected: %v", state, err)
 			}
 		})
+	}
+}
+
+func TestCanonicalSnapshotAllowsSuspendedAttentionWithoutHook(t *testing.T) {
+	instance := validAPIInstance()
+	instance.State = instancepresence.StateAttention
+	instance.Revisions.HookRevision = 0
+	snapshot := CanonicalSnapshot{
+		APIVersion: APIVersion, GeneratedAt: fixedAPITestTime(), Presence: PresenceActive,
+		Instances: []Instance{instance}, Slots: SlotSummary{Namespace: "default", ActiveCount: 1},
+	}
+	if err := snapshot.Validate(); err != nil {
+		t.Fatalf("canonical snapshot with suspended-derived attention rejected: %v", err)
 	}
 }

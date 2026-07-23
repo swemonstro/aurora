@@ -84,8 +84,10 @@ func (instance Instance) Validate() error {
 	if instance.Revisions.RuntimeRevision == 0 {
 		return errors.New("runtime revision must be positive")
 	}
-	if instance.Revisions.HookRevision == 0 && instance.State != instancepresence.StateIdle {
-		return errors.New("non-idle state requires a positive hook revision")
+	// hook_revision=0 is valid for idle (pre-hook) and attention derived solely
+	// from RuntimeSuspended. Working/error always require a hook claim revision.
+	if instance.Revisions.HookRevision == 0 && !wireStateAllowsZeroHookRevision(instance.State) {
+		return errors.New("working and error states require a positive hook revision")
 	}
 	if instance.DiscoveredAt.IsZero() || instance.StateChangedAt.IsZero() || instance.LeaseExpiresAt.IsZero() {
 		return errors.New("instance lifecycle timestamps must not be zero")
@@ -306,10 +308,17 @@ func (response MutationResponse) Validate() error {
 	if response.Revisions.RuntimeRevision == 0 {
 		return errors.New("runtime revision must be positive")
 	}
-	if response.Revisions.HookRevision == 0 && response.EffectiveState != instancepresence.StateIdle {
-		return errors.New("non-idle effective state requires a positive hook revision")
+	if response.Revisions.HookRevision == 0 && !wireStateAllowsZeroHookRevision(response.EffectiveState) {
+		return errors.New("working and error effective states require a positive hook revision")
 	}
 	return nil
+}
+
+// wireStateAllowsZeroHookRevision reports EffectiveStates that may appear on
+// the wire with hook_revision=0. Idle is the pre-hook base state; attention may
+// be produced solely by a suspended runtime root without any hook event.
+func wireStateAllowsZeroHookRevision(state instancepresence.EffectiveState) bool {
+	return state == instancepresence.StateIdle || state == instancepresence.StateAttention
 }
 
 type ErrorCode string
