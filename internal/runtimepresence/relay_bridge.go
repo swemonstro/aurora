@@ -32,8 +32,10 @@ type RelayBridge struct {
 	clock     Clock
 	interval  time.Duration
 	stderr    io.Writer
+	trigger   chan struct{}
 
-	mu sync.Mutex
+	mu      sync.Mutex
+	pending []desiredView
 	// lastOK records the last successfully applied desired view per source.
 	// absent (ok=false) means Remove succeeded last; present means Publish of state succeeded.
 	lastOK map[string]publishedView
@@ -43,6 +45,8 @@ type publishedView struct {
 	present bool
 	state   status.State
 }
+
+type desiredView map[string]publishedView
 
 // NewRelayBridge constructs a v2→v1 bridge. interval defaults to DefaultBridgeInterval.
 func NewRelayBridge(
@@ -73,11 +77,35 @@ func NewRelayBridge(
 		clock:     clock,
 		interval:  interval,
 		stderr:    stderr,
+		trigger:   make(chan struct{}, 1),
 		lastOK:    make(map[string]publishedView),
 	}, nil
 }
 
-// Run periodically reconciles until ctx is cancelled.
+// Trigger captures the current aggregate view and queues state changes
+// in order. The wake-up signal may be coalesced, but queued transitions are not.
+func (bridge *RelayBridge) Trigger() {
+	desired := bridge.captureDesired()
+
+	bridge.mu.Lock()
+	previous := bridge.lastDesiredLocked()
+	if len(bridge.pending) > 0 {
+		previous = bridge.pending[len(bridge.pending)-1]
+	}
+	if desiredViewsEqual(previous, desired) {
+		bridge.mu.Unlock()
+		return
+	}
+	bridge.pending = append(bridge.pending, desired)
+	bridge.mu.Unlock()
+
+	select {
+	case bridge.trigger <- struct{}{}:
+	default:
+	}
+}
+
+// Run reconciles on startup, explicit triggers and the recovery ticker.
 func (bridge *RelayBridge) Run(ctx context.Context) {
 	// Immediate reconcile so a restarting process restores relay promptly.
 	bridge.Reconcile(ctx)
@@ -87,6 +115,8 @@ func (bridge *RelayBridge) Run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
+		case <-bridge.trigger:
+			bridge.drainPending(ctx)
 		case <-ticker.C:
 			bridge.Reconcile(ctx)
 		}
@@ -100,16 +130,84 @@ func (bridge *RelayBridge) Reconcile(ctx context.Context) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	desired := aggregateByTool(bridge.source.ActiveInstances())
-	for _, tool := range []instancepresence.ToolKind{instancepresence.ToolClaude, instancepresence.ToolCodex} {
+	bridge.applyDesired(ctx, bridge.captureDesired())
+}
+
+func (bridge *RelayBridge) captureDesired() desiredView {
+	desired := desiredView{
+		SourceClaudeRuntime: {present: false},
+		SourceCodexRuntime:  {present: false},
+	}
+
+	for tool, state := range aggregateByTool(bridge.source.ActiveInstances()) {
 		source := sourceForTool(tool)
-		view, present := desired[tool]
-		if !present {
+		if source != "" {
+			desired[source] = publishedView{
+				present: true,
+				state:   state,
+			}
+		}
+	}
+
+	return desired
+}
+
+func (bridge *RelayBridge) applyDesired(ctx context.Context, desired desiredView) {
+	for _, source := range []string{
+		SourceClaudeRuntime,
+		SourceCodexRuntime,
+	} {
+		view := desired[source]
+		if !view.present {
 			bridge.removeSource(ctx, source)
 			continue
 		}
-		bridge.publishSource(ctx, source, view)
+		bridge.publishSource(ctx, source, view.state)
 	}
+}
+
+func (bridge *RelayBridge) drainPending(ctx context.Context) {
+	for {
+		bridge.mu.Lock()
+		if len(bridge.pending) == 0 {
+			bridge.mu.Unlock()
+			return
+		}
+
+		desired := bridge.pending[0]
+		bridge.pending = bridge.pending[1:]
+		if len(bridge.pending) == 0 {
+			bridge.pending = nil
+		}
+		bridge.mu.Unlock()
+
+		bridge.applyDesired(ctx, desired)
+	}
+}
+
+func (bridge *RelayBridge) lastDesiredLocked() desiredView {
+	desired := desiredView{
+		SourceClaudeRuntime: {present: false},
+		SourceCodexRuntime:  {present: false},
+	}
+
+	for source, view := range bridge.lastOK {
+		desired[source] = view
+	}
+
+	return desired
+}
+
+func desiredViewsEqual(left, right desiredView) bool {
+	for _, source := range []string{
+		SourceClaudeRuntime,
+		SourceCodexRuntime,
+	} {
+		if left[source] != right[source] {
+			return false
+		}
+	}
+	return true
 }
 
 // LastPublished reports the last successfully published view for a source (tests).

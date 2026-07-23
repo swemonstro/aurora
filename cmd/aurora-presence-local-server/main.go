@@ -39,6 +39,31 @@ type systemClock struct{}
 
 func (systemClock) Now() time.Time { return time.Now().UTC() }
 
+type notifyingHookMutator struct {
+	localhooktransport.HookMutator
+	notify func()
+}
+
+func (mutator notifyingHookMutator) ApplyNextHookMutation(
+	id instancepresence.InstanceID,
+	producerEpoch instancepresence.ProducerEpoch,
+	state instancepresence.EffectiveState,
+	observedAt time.Time,
+	idempotencyKey string,
+) (instancepresence.Instance, error) {
+	instance, err := mutator.HookMutator.ApplyNextHookMutation(
+		id,
+		producerEpoch,
+		state,
+		observedAt,
+		idempotencyKey,
+	)
+	if err == nil && mutator.notify != nil {
+		mutator.notify()
+	}
+	return instance, err
+}
+
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -152,6 +177,8 @@ func composeServer(arguments []string, stderr io.Writer, getenv func(string) str
 	}
 
 	var registry *instanceregistry.Registry
+	var relayBridge *runtimepresence.RelayBridge
+
 	ensureRegistry := func() error {
 		if registry != nil {
 			return nil
@@ -218,7 +245,15 @@ func composeServer(arguments []string, stderr io.Writer, getenv func(string) str
 		server.SetIdentityObserver(observer)
 
 		sessions := sessionbinding.New()
-		engine, err := localhooktransport.NewBindingEngine(sessions, observer, registry)
+		mutator := notifyingHookMutator{
+			HookMutator: registry,
+			notify: func() {
+				if relayBridge != nil {
+					relayBridge.Trigger()
+				}
+			},
+		}
+		engine, err := localhooktransport.NewBindingEngine(sessions, observer, mutator)
 		if err != nil {
 			cleanup()
 			_ = server.Close()
@@ -312,6 +347,7 @@ func composeServer(arguments []string, stderr io.Writer, getenv func(string) str
 			_ = server.Close()
 			return nil, nil, false, err
 		}
+		relayBridge = bridge
 		fmt.Fprintf(stderr, "v2→v1 relay bridge: %s (sources %s, %s; stop separate aurora-runtime-presence to avoid dual producers)\n",
 			relayURL, runtimepresence.SourceClaudeRuntime, runtimepresence.SourceCodexRuntime)
 		bridgeCtx, bridgeCancel := context.WithCancel(context.Background())

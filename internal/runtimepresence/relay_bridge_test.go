@@ -453,6 +453,110 @@ func TestBridgeRaceConcurrentMutationsAndReconcile(t *testing.T) {
 	bridge.Reconcile(context.Background())
 }
 
+func TestBridgeTriggerReconcilesBeforeTicker(t *testing.T) {
+	src := &memorySource{}
+	pub := &bridgePublisher{}
+
+	src.set(testInstance(
+		"a",
+		instancepresence.ToolClaude,
+		instancepresence.StateIdle,
+	))
+
+	bridge, err := NewRelayBridge(src, pub, time.Now, time.Hour, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		bridge.Run(ctx)
+		close(done)
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	waitForState := func(want status.State) {
+		t.Helper()
+		deadline := time.Now().Add(time.Second)
+		for time.Now().Before(deadline) {
+			publishes, _ := pub.snapshot()
+			if len(publishes) > 0 &&
+				publishes[len(publishes)-1].State == want {
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		t.Fatalf("relay bridge did not publish %q before deadline", want)
+	}
+
+	waitForState(status.Idle)
+
+	src.set(testInstance(
+		"a",
+		instancepresence.ToolClaude,
+		instancepresence.StateWorking,
+	))
+	bridge.Trigger()
+
+	waitForState(status.Working)
+}
+
+func TestBridgeTriggerPreservesRapidTransitions(t *testing.T) {
+	src := &memorySource{}
+	pub := &bridgePublisher{}
+
+	bridge, err := NewRelayBridge(src, pub, time.Now, time.Hour, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Queue both transitions before Run gets a chance to reconcile.
+	src.set(testInstance(
+		"a",
+		instancepresence.ToolClaude,
+		instancepresence.StateWorking,
+	))
+	bridge.Trigger()
+
+	src.set(testInstance(
+		"a",
+		instancepresence.ToolClaude,
+		instancepresence.StateIdle,
+	))
+	bridge.Trigger()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		bridge.Run(ctx)
+		close(done)
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		publishes, _ := pub.snapshot()
+		if len(publishes) >= 3 {
+			last := publishes[len(publishes)-2:]
+			if last[0].State == status.Working &&
+				last[1].State == status.Idle {
+				return
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	publishes, _ := pub.snapshot()
+	t.Fatalf("rapid transition sequence was not preserved: %#v", publishes)
+}
+
 func TestNewRelayBridgeValidates(t *testing.T) {
 	if _, err := NewRelayBridge(nil, &bridgePublisher{}, time.Now, 0, nil); err == nil {
 		t.Fatal("nil source")
