@@ -365,7 +365,7 @@ func TestUnsupportedEventDoesNotPublish(t *testing.T) {
 		claudehook.StateFileEnv: filepath.Join(t.TempDir(), "sessions.json"),
 	}
 	run(context.Background(), strings.NewReader(
-		`{"hook_event_name":"PreToolUse","session_id":"session-a","tool_name":"Bash"}`,
+		`{"hook_event_name":"FutureHookEvent","session_id":"session-a","tool_name":"Bash"}`,
 	), func(key string) string { return values[key] })
 
 	select {
@@ -587,7 +587,7 @@ func TestLocalIngressUnsupportedEventIsNotDelivered(t *testing.T) {
 	}
 	if err := run(
 		context.Background(),
-		strings.NewReader(`{"hook_event_name":"PreToolUse","session_id":"session-a","tool_name":"Bash"}`),
+		strings.NewReader(`{"hook_event_name":"FutureHookEvent","session_id":"session-a","tool_name":"Bash"}`),
 		func(key string) string { return values[key] },
 	); err != nil {
 		t.Fatalf("run: %v", err)

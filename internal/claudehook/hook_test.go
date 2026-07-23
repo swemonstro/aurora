@@ -38,15 +38,15 @@ func TestMapEvent(t *testing.T) {
 	}
 }
 
-func TestMapEventRejectsUnsupportedToolEvents(t *testing.T) {
+func TestMapEventMapsOrdinaryToolEventsToWorking(t *testing.T) {
 	for _, eventName := range []string{"PreToolUse", "PostToolUse"} {
 		t.Run(eventName, func(t *testing.T) {
 			action, supported := MapEvent(Event{
 				HookEventName: eventName,
 				ToolName:      "Bash",
 			})
-			if supported {
-				t.Fatalf("supported = true with action %#v", action)
+			if !supported || action.State != status.Working {
+				t.Fatalf("action = %#v supported=%t, want working", action, supported)
 			}
 		})
 	}

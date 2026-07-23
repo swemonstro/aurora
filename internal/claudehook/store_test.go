@@ -60,6 +60,34 @@ func TestSessionEventSemantics(t *testing.T) {
 	}
 }
 
+func TestToolActivityClearsAttentionUntilNextQuestion(t *testing.T) {
+	store := newTestStore(t)
+
+	if got := mustUpdate(t, store, Event{
+		HookEventName:    "Notification",
+		SessionID:        "a",
+		NotificationType: "permission_prompt",
+	}); got != status.Attention {
+		t.Fatalf("initial aggregate = %q, want attention", got)
+	}
+
+	if got := mustUpdate(t, store, Event{
+		HookEventName: "PreToolUse",
+		SessionID:     "a",
+		ToolName:      "Bash",
+	}); got != status.Working {
+		t.Fatalf("aggregate during tool work = %q, want working", got)
+	}
+
+	if got := mustUpdate(t, store, Event{
+		HookEventName: "PreToolUse",
+		SessionID:     "a",
+		ToolName:      "AskUserQuestion",
+	}); got != status.Attention {
+		t.Fatalf("aggregate at next question = %q, want attention", got)
+	}
+}
+
 func TestStopChangesOnlyItsSessionToIdle(t *testing.T) {
 	store := newTestStore(t)
 	mustUpdate(t, store, Event{HookEventName: "UserPromptSubmit", SessionID: "a"})
@@ -252,7 +280,7 @@ func TestUnsupportedEventDoesNotRewriteState(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, supported, err := store.Update(Event{HookEventName: "PreToolUse", SessionID: "a"})
+	_, supported, err := store.Update(Event{HookEventName: "FutureHookEvent", SessionID: "a"})
 	if err != nil {
 		t.Fatal(err)
 	}

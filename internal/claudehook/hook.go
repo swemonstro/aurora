@@ -164,10 +164,9 @@ func MapEvent(event Event) (EventAction, bool) {
 		if event.ToolName == "AskUserQuestion" {
 			return EventAction{State: status.Attention}, true
 		}
+		return EventAction{State: status.Working}, true
 	case "PostToolUse":
-		if event.ToolName == "AskUserQuestion" {
-			return EventAction{State: status.Working}, true
-		}
+		return EventAction{State: status.Working}, true
 	case "Stop":
 		return EventAction{State: status.Idle}, true
 	case "StopFailure":
