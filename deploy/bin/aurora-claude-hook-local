@@ -1,0 +1,8 @@
+#!/bin/sh
+
+set -eu
+
+export AURORA_LOCAL_HOOK_ENABLED=1
+export AURORA_LOCAL_HOOK_SOCKET=/run/aurora/presence-hook.sock
+
+exec /usr/local/bin/aurora-claude-hook
