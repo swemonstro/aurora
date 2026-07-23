@@ -10,10 +10,14 @@ import (
 	"strings"
 
 	"github.com/swemonstro/aurora/internal/presence"
+	"github.com/swemonstro/aurora/internal/presencev2"
 	"github.com/swemonstro/aurora/internal/status"
 )
 
-const maxSnapshotBodyBytes = 8 * 1024
+const (
+	maxSnapshotBodyBytes     = 8 * 1024
+	maxPresentationBodyBytes = 16 * 1024
+)
 
 type Handler struct {
 	store *Store
@@ -30,8 +34,94 @@ func NewHandler(store *Store) (*Handler, error) {
 func (h *Handler) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/presence", h.handlePresence)
+	mux.HandleFunc(
+		"/presence/presentation",
+		h.handlePresentation,
+	)
 
 	return mux
+}
+
+func (h *Handler) handlePresentation(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	switch r.Method {
+	case http.MethodGet:
+		h.getPresentation(w)
+	case http.MethodPost:
+		h.postPresentation(w, r)
+	case http.MethodDelete:
+		h.store.RemovePresentation()
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		w.Header().Set("Allow", "GET, POST, DELETE")
+		writeError(
+			w,
+			http.StatusMethodNotAllowed,
+			"method not allowed",
+		)
+	}
+}
+
+func (h *Handler) getPresentation(w http.ResponseWriter) {
+	presentation, ok := h.store.Presentation()
+	if !ok {
+		writeError(
+			w,
+			http.StatusNotFound,
+			"no presence presentation available",
+		)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, presentation)
+}
+
+func (h *Handler) postPresentation(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	if contentType := r.Header.Get("Content-Type"); contentType != "" {
+		mediaType, _, err := mime.ParseMediaType(contentType)
+		if err != nil || mediaType != "application/json" {
+			writeError(
+				w,
+				http.StatusUnsupportedMediaType,
+				"content type must be application/json",
+			)
+			return
+		}
+	}
+
+	body := http.MaxBytesReader(
+		w,
+		r.Body,
+		maxPresentationBodyBytes,
+	)
+	defer body.Close()
+
+	decoder := json.NewDecoder(body)
+	decoder.DisallowUnknownFields()
+
+	var presentation presencev2.Presentation
+	if err := decoder.Decode(&presentation); err != nil {
+		writeDecodeError(w, err)
+		return
+	}
+
+	if err := ensureSingleJSONValue(decoder); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if err := presentation.Validate(); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.store.SetPresentation(presentation)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *Handler) handlePresence(w http.ResponseWriter, r *http.Request) {

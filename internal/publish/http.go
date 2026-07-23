@@ -11,13 +11,15 @@ import (
 	"strings"
 
 	"github.com/swemonstro/aurora/internal/presence"
+	"github.com/swemonstro/aurora/internal/presencev2"
 )
 
 const maxErrorResponseBytes = 4 * 1024
 
 type HTTPPublisher struct {
-	endpoint string
-	client   *http.Client
+	endpoint             string
+	presentationEndpoint string
+	client               *http.Client
 }
 
 func NewHTTPPublisher(relayURL string, client *http.Client) (*HTTPPublisher, error) {
@@ -37,9 +39,12 @@ func NewHTTPPublisher(relayURL string, client *http.Client) (*HTTPPublisher, err
 		return nil, fmt.Errorf("relay URL must be an absolute HTTP or HTTPS URL")
 	}
 
+	baseURL := strings.TrimRight(relayURL, "/")
+
 	return &HTTPPublisher{
-		endpoint: strings.TrimRight(relayURL, "/") + "/presence",
-		client:   client,
+		endpoint:             baseURL + "/presence",
+		presentationEndpoint: baseURL + "/presence/presentation",
+		client:               client,
 	}, nil
 }
 
@@ -56,6 +61,67 @@ func (p *HTTPPublisher) Publish(ctx context.Context, snapshot presence.Snapshot)
 	request.Header.Set("Content-Type", "application/json")
 
 	return p.do(request, "post presence snapshot to relay")
+}
+
+func (p *HTTPPublisher) PublishPresentation(
+	ctx context.Context,
+	presentation presencev2.Presentation,
+) error {
+	if err := presentation.Validate(); err != nil {
+		return fmt.Errorf(
+			"validate presence presentation: %w",
+			err,
+		)
+	}
+
+	body, err := json.Marshal(presentation)
+	if err != nil {
+		return fmt.Errorf(
+			"encode presence presentation: %w",
+			err,
+		)
+	}
+
+	request, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		p.presentationEndpoint,
+		bytes.NewReader(body),
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"create presentation request: %w",
+			err,
+		)
+	}
+	request.Header.Set("Content-Type", "application/json")
+
+	return p.do(
+		request,
+		"post presence presentation to relay",
+	)
+}
+
+func (p *HTTPPublisher) RemovePresentation(
+	ctx context.Context,
+) error {
+	request, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodDelete,
+		p.presentationEndpoint,
+		nil,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"create presentation removal request: %w",
+			err,
+		)
+	}
+
+	return p.do(
+		request,
+		"delete presence presentation from relay",
+	)
 }
 
 func (p *HTTPPublisher) Remove(ctx context.Context, source string) error {

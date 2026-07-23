@@ -8,10 +8,29 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/swemonstro/aurora/internal/localhooktransport"
 )
+
+// lockedBuffer is a race-safe stderr sink for tests that start background bridges.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
 
 func TestRunRequiresExplicitIdentityAndSafeSocketDefault(t *testing.T) {
 	var output bytes.Buffer
@@ -36,10 +55,10 @@ func TestHelpStatesBindingFlag(t *testing.T) {
 
 func TestRelayBridgeDefaultOff(t *testing.T) {
 	socketPath := testSocketPath(t)
-	var stderr bytes.Buffer
+	stderr := &lockedBuffer{}
 	server, cleanup, _, err := composeServer(
 		[]string{"-host-id", "host-fixture", "-socket", socketPath},
-		&stderr,
+		stderr,
 		func(string) string { return "" },
 	)
 	if err != nil {
@@ -56,10 +75,10 @@ func TestRelayBridgeDefaultOff(t *testing.T) {
 
 func TestRelayFlagRequiresAbsoluteHTTP(t *testing.T) {
 	socketPath := testSocketPath(t)
-	var stderr bytes.Buffer
+	stderr := &lockedBuffer{}
 	_, _, _, err := composeServer(
 		[]string{"-host-id", "host-fixture", "-socket", socketPath, "-relay", "not-a-url"},
-		&stderr,
+		stderr,
 		func(string) string { return "" },
 	)
 	if err == nil {
@@ -69,10 +88,10 @@ func TestRelayFlagRequiresAbsoluteHTTP(t *testing.T) {
 
 func TestRelayEnvUsedWhenFlagEmpty(t *testing.T) {
 	socketPath := testSocketPath(t)
-	var stderr bytes.Buffer
+	stderr := &lockedBuffer{}
 	server, cleanup, _, err := composeServer(
 		[]string{"-host-id", "host-fixture", "-socket", socketPath},
-		&stderr,
+		stderr,
 		func(key string) string {
 			if key == EnvRelayURL {
 				return "http://127.0.0.1:9"
@@ -84,11 +103,38 @@ func TestRelayEnvUsedWhenFlagEmpty(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cleanup != nil {
-		defer cleanup()
+		cleanup()
 	}
 	defer server.Close()
 	if !strings.Contains(stderr.String(), "relay bridge") {
 		t.Fatalf("env relay not enabled: %s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "V2") || !strings.Contains(stderr.String(), "presentation") {
+		t.Fatalf("presentation bridge not mentioned: %s", stderr.String())
+	}
+}
+
+func TestRelayStartsPresentationAndV1Bridges(t *testing.T) {
+	socketPath := testSocketPath(t)
+	stderr := &lockedBuffer{}
+	server, cleanup, _, err := composeServer(
+		[]string{"-host-id", "host-fixture", "-socket", socketPath, "-relay", "http://127.0.0.1:9"},
+		stderr,
+		func(string) string { return "" },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cleanup != nil {
+		cleanup()
+	}
+	defer server.Close()
+	log := stderr.String()
+	if !strings.Contains(log, "V1 aggregate") {
+		t.Fatalf("missing V1 bridge log: %s", log)
+	}
+	if !strings.Contains(log, "5-pixel presentation") {
+		t.Fatalf("missing V2 presentation log: %s", log)
 	}
 }
 

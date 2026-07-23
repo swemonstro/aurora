@@ -35,6 +35,9 @@ const EnvRelayURL = "AURORA_RELAY_URL"
 
 const relayHTTPTimeout = 2 * time.Second
 
+// relayPresentationPixelCapacity is the fixed ESP slot count for v2 presentation.
+const relayPresentationPixelCapacity uint64 = 5
+
 type systemClock struct{}
 
 func (systemClock) Now() time.Time { return time.Now().UTC() }
@@ -178,6 +181,7 @@ func composeServer(arguments []string, stderr io.Writer, getenv func(string) str
 
 	var registry *instanceregistry.Registry
 	var relayBridge *runtimepresence.RelayBridge
+	var presentationBridge *runtimepresence.PresentationBridge
 
 	ensureRegistry := func() error {
 		if registry != nil {
@@ -248,8 +252,12 @@ func composeServer(arguments []string, stderr io.Writer, getenv func(string) str
 		mutator := notifyingHookMutator{
 			HookMutator: registry,
 			notify: func() {
+				// Only after successful registry mutation: wake both bridges.
 				if relayBridge != nil {
 					relayBridge.Trigger()
+				}
+				if presentationBridge != nil {
+					presentationBridge.Trigger()
 				}
 			},
 		}
@@ -348,11 +356,30 @@ func composeServer(arguments []string, stderr io.Writer, getenv func(string) str
 			return nil, nil, false, err
 		}
 		relayBridge = bridge
-		fmt.Fprintf(stderr, "v2→v1 relay bridge: %s (sources %s, %s; stop separate aurora-runtime-presence to avoid dual producers)\n",
-			relayURL, runtimepresence.SourceClaudeRuntime, runtimepresence.SourceCodexRuntime)
+		presBridge, err := runtimepresence.NewPresentationBridge(
+			registry,
+			publisher,
+			relayPresentationPixelCapacity,
+			runtimepresence.DefaultBridgeInterval,
+			stderr,
+		)
+		if err != nil {
+			cleanup()
+			_ = server.Close()
+			return nil, nil, false, err
+		}
+		presentationBridge = presBridge
+		fmt.Fprintf(stderr,
+			"relay bridge: %s (V1 aggregate sources %s/%s + V2 %d-pixel presentation; stop separate aurora-runtime-presence to avoid dual producers)\n",
+			relayURL,
+			runtimepresence.SourceClaudeRuntime,
+			runtimepresence.SourceCodexRuntime,
+			relayPresentationPixelCapacity,
+		)
 		bridgeCtx, bridgeCancel := context.WithCancel(context.Background())
 		cleanups = append(cleanups, bridgeCancel)
 		go bridge.Run(bridgeCtx)
+		go presentationBridge.Run(bridgeCtx)
 	}
 
 	return server, cleanup, bindingEnabled, nil
