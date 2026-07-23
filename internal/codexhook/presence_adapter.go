@@ -46,9 +46,13 @@ type runtimeRecognizer struct{}
 func (runtimeRecognizer) Recognize(process runtimerecognition.ProcessObservation) (runtimerecognition.Recognition, bool) {
 	direct, native := false, false
 	for _, executable := range processNames(process) {
-		if executable == "codex" || executable == "aurora-codex" || strings.HasPrefix(executable, "codex-") {
+		if executable == "codex" ||
+			executable == "aurora-codex" ||
+			strings.HasPrefix(executable, "codex-linux-") {
 			direct = true
-			native = native || strings.Contains(executable, "native") || strings.HasPrefix(executable, "codex-linux-")
+			native = native ||
+				strings.Contains(executable, "native") ||
+				strings.HasPrefix(executable, "codex-linux-")
 		}
 	}
 	if direct {

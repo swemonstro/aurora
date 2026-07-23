@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/swemonstro/aurora/internal/codexhook"
+	"github.com/swemonstro/aurora/internal/localhooktransport"
 	"github.com/swemonstro/aurora/internal/presence"
 	"github.com/swemonstro/aurora/internal/relay"
 	"github.com/swemonstro/aurora/internal/status"
@@ -608,5 +609,52 @@ func TestWatchPermissionReturnsCancellationPublicationFailure(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Fatalf("watcher registration leaked: %#v", entries)
+	}
+}
+
+func TestRunLocalIngressEnabledSkipsLegacyStateAndRelay(t *testing.T) {
+	relayHits := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(
+		writer http.ResponseWriter,
+		request *http.Request,
+	) {
+		relayHits <- struct{}{}
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	stateFile := filepath.Join(t.TempDir(), "codex-sessions.json")
+	values := map[string]string{
+		codexhook.RelayURLEnv:                  server.URL,
+		codexhook.StateFileEnv:                 stateFile,
+		localhooktransport.EnvLocalHookEnabled: "1",
+		localhooktransport.EnvLocalHookSocket: filepath.Join(
+			t.TempDir(),
+			"missing.sock",
+		),
+	}
+
+	err := run(
+		context.Background(),
+		strings.NewReader(
+			`{"hook_event_name":"UserPromptSubmit","session_id":"session-a"}`,
+		),
+		func(key string) string { return values[key] },
+	)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	select {
+	case <-relayHits:
+		t.Fatal("local mode published to the legacy relay")
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	if _, err := os.Stat(stateFile); !os.IsNotExist(err) {
+		t.Fatalf(
+			"local mode created legacy state file: %v",
+			err,
+		)
 	}
 }

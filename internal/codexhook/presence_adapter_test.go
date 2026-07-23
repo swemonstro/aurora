@@ -80,3 +80,17 @@ func TestCodexWrapperLaunchRulesExcludeNPMAndAllowNPX(t *testing.T) {
 		})
 	}
 }
+
+func TestCodexCodeModeHostIsNotRecognizedAsSession(t *testing.T) {
+	process := runtimerecognition.ProcessObservation{
+		CommIdentity:       "exe:codex-code-mode-host",
+		ExecutableIdentity: "exe:codex-code-mode-host",
+	}
+
+	if recognition, recognized := RuntimeRecognizer().Recognize(process); recognized {
+		t.Fatalf(
+			"codex-code-mode-host recognized as session: %#v",
+			recognition,
+		)
+	}
+}

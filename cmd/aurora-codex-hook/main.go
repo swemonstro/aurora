@@ -17,6 +17,7 @@ import (
 
 	"github.com/swemonstro/aurora/internal/agent"
 	"github.com/swemonstro/aurora/internal/codexhook"
+	"github.com/swemonstro/aurora/internal/localhooktransport"
 	"github.com/swemonstro/aurora/internal/publish"
 	"github.com/swemonstro/aurora/internal/sourcelifecycle"
 )
@@ -59,6 +60,19 @@ func run(
 	event, err := codexhook.ParseEvent(rawInput)
 	if err != nil {
 		return err
+	}
+
+	// In local multi-instance mode, deliver the verified Codex event to
+	// Package 6 ingress. Transport failures remain fail-open so Codex itself
+	// is never blocked by Aurora.
+	localEnabled := localhooktransport.LocalHookEnabled(
+		getenv(localhooktransport.EnvLocalHookEnabled),
+	)
+	if ingress, ingressErr := codexhook.LocalIngressObservation(event); ingressErr == nil {
+		localhooktransport.TryDeliverIngress(ctx, getenv, ingress)
+	}
+	if localEnabled {
+		return nil
 	}
 
 	config, err := codexhook.ConfigFromEnv(getenv, os.UserHomeDir)
