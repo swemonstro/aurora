@@ -41,7 +41,8 @@ func TestLocalIngressObservationRejectsSessionEndAndMapsLifecycle(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if observation.Tool != instancepresence.ToolCodex || observation.HookSessionRef != "session-a" || observation.Lifecycle != instancecorrelation.LifecycleActive {
+	if observation.Tool != instancepresence.ToolCodex || observation.HookSessionRef != "session-a" ||
+		observation.Lifecycle != instancecorrelation.LifecycleActive || observation.EffectiveState != instancepresence.StateWorking {
 		t.Fatalf("observation = %#v", observation)
 	}
 	if _, err := LocalIngressObservation(Event{HookEventName: "Stop", SessionID: "session-a"}); err != nil {

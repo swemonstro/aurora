@@ -113,6 +113,17 @@ type ProcessAdapter interface {
 	Observe(ctx context.Context) (linuxprocess.Sample, error)
 }
 
+// IdentityLinkResult is the strict internal outcome of verified runtime linking.
+// Unique is true only when exactly one runtime matches the peer generation tree.
+type IdentityLinkResult struct {
+	RuntimeRef instancepresence.InstanceID
+	Unique     bool
+	Rule       string
+	Reasons    []string
+	TimedOut   bool
+	Links      []PossibleLink
+}
+
 // Observer implements localhooktransport.IngestIdentityObserver.
 type Observer struct {
 	adapter     ProcessAdapter
@@ -214,9 +225,97 @@ func (observer *Observer) CapturePeer(peer localhooktransport.PeerIdentity) loca
 	return capture
 }
 
+// ResolveLink computes a strict runtime link from a pre-captured peer tree.
+// Production binding uses this result; JSONL diagnostics are independent.
+func (observer *Observer) ResolveLink(
+	ctx context.Context,
+	capture localhooktransport.IdentityPeerCapture,
+	tool instancepresence.ToolKind,
+) IdentityLinkResult {
+	result := IdentityLinkResult{Reasons: []string{}, Links: []PossibleLink{}}
+	if !capture.GenerationOK {
+		result.Reasons = append(result.Reasons, "peer_process_unreadable", "no_unique_runtime_link")
+		return result
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		result.TimedOut = true
+		result.Reasons = append(result.Reasons, "attestation_timeout", "no_unique_runtime_link")
+		return result
+	}
+
+	sample, err := observer.adapter.Observe(ctx)
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+			result.TimedOut = true
+			result.Reasons = append(result.Reasons, "attestation_timeout", "no_unique_runtime_link")
+			return result
+		}
+		result.Reasons = append(result.Reasons, "attestation_internal_error", "no_unique_runtime_link")
+		return result
+	}
+	recognition, err := runtimerecognition.Recognize(sample.Recognition, observer.hostID, observer.recognizers...)
+	if err != nil {
+		result.Reasons = append(result.Reasons, "attestation_internal_error", "no_unique_runtime_link")
+		return result
+	}
+
+	peer := instancepresence.ProcessIdentity{
+		PID: capture.GenerationPID, StartedAt: capture.GenerationStarted.UTC(),
+	}
+	ancestry := hopsFromCapture(capture)
+	runtimes := filterToolRuntimes(recognition.Observations, tool, observer.config.MaxRuntimeCandidates)
+	sameToolCount := 0
+	for _, runtime := range recognition.Observations {
+		if runtime.Candidate.Tool == tool {
+			sameToolCount++
+		}
+	}
+	if sameToolCount > observer.config.MaxRuntimeCandidates {
+		result.Reasons = append(result.Reasons, "candidate_limit_exceeded", "no_unique_runtime_link")
+		return result
+	}
+
+	links, linkCodes := evaluateLinks(peer, ancestry, runtimes)
+	result.Links = links
+	result.Reasons = append(result.Reasons, linkCodes...)
+	uniqueCount := countUniqueRuntimeRefs(links)
+	switch uniqueCount {
+	case 1:
+		result.Unique = true
+		result.RuntimeRef = instancepresence.InstanceID(links[0].RuntimeRef)
+		result.Rule = links[0].LinkRule
+		result.Reasons = append(result.Reasons, "unique_runtime_link")
+	case 0:
+		result.Reasons = append(result.Reasons, "no_unique_runtime_link")
+	default:
+		result.Reasons = append(result.Reasons, "ambiguous_runtime_link")
+	}
+	return result
+}
+
+// Link implements localhooktransport.RuntimeLinker for production binding.
+func (observer *Observer) Link(
+	ctx context.Context,
+	capture localhooktransport.IdentityPeerCapture,
+	tool instancepresence.ToolKind,
+) localhooktransport.RuntimeLinkResult {
+	resolved := observer.ResolveLink(ctx, capture, tool)
+	return localhooktransport.RuntimeLinkResult{
+		RuntimeRef: resolved.RuntimeRef,
+		Unique:     resolved.Unique,
+		Rule:       resolved.Rule,
+		Reasons:    append([]string{}, resolved.Reasons...),
+		TimedOut:   resolved.TimedOut,
+	}
+}
+
 // CompleteIngest implements localhooktransport.IngestIdentityObserver.
 // Joins the pre-captured ancestry against current runtime candidates using the
 // validated tool as namespace only. Does not re-capture the peer process tree.
+// Production binding must call ResolveLink/Link independently of JSONL output.
 func (observer *Observer) CompleteIngest(
 	capture localhooktransport.IdentityPeerCapture,
 	tool instancepresence.ToolKind,
@@ -256,12 +355,7 @@ func (observer *Observer) CompleteIngest(
 		record.ReasonCodes = append(record.ReasonCodes, "request_not_validated")
 	}
 
-	if !capture.GenerationOK {
-		record.ReasonCodes = append(record.ReasonCodes, "diagnostic_no_unique_link", "fail_closed")
-		observer.finish(record, measureStarted)
-		return
-	}
-	if !validated {
+	if !capture.GenerationOK || !validated {
 		record.ReasonCodes = append(record.ReasonCodes, "diagnostic_no_unique_link", "fail_closed")
 		observer.finish(record, measureStarted)
 		return
@@ -276,63 +370,39 @@ func (observer *Observer) CompleteIngest(
 	ctx, cancel := context.WithTimeout(context.Background(), remaining)
 	defer cancel()
 
-	// Runtime candidates are long-lived relative to the hook helper. Join only;
-	// do not re-walk peer ancestry (already captured before request read).
-	sample, err := observer.adapter.Observe(ctx)
-	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
-			record.ReasonCodes = append(record.ReasonCodes, "attestation_timeout")
-		} else {
-			record.ReasonCodes = append(record.ReasonCodes, "attestation_internal_error")
-		}
-		record.ReasonCodes = append(record.ReasonCodes, "diagnostic_no_unique_link", "fail_closed")
+	link := observer.ResolveLink(ctx, capture, tool)
+	record.PossibleLinks = link.Links
+	record.LinkRules = uniqueSortedRules(link.Links)
+	record.MatchingRuntimeCount = countUniqueRuntimeRefs(link.Links)
+	record.Ancestry = ancestry
+	record.ReasonCodes = append(record.ReasonCodes, link.Reasons...)
+	if link.TimedOut {
+		record.ReasonCodes = append(record.ReasonCodes, "fail_closed")
 		observer.finish(record, measureStarted)
 		return
 	}
-
-	recognition, err := runtimerecognition.Recognize(sample.Recognition, observer.hostID, observer.recognizers...)
-	if err != nil {
-		record.ReasonCodes = append(record.ReasonCodes, "attestation_internal_error", "diagnostic_no_unique_link", "fail_closed")
-		observer.finish(record, measureStarted)
-		return
-	}
-
-	peer := instancepresence.ProcessIdentity{
-		PID: capture.GenerationPID, StartedAt: capture.GenerationStarted.UTC(),
-	}
-	runtimes := filterToolRuntimes(recognition.Observations, tool, observer.config.MaxRuntimeCandidates)
-	sameToolCount := 0
-	for _, runtime := range recognition.Observations {
-		if runtime.Candidate.Tool == tool {
-			sameToolCount++
-		}
-	}
-	if sameToolCount > observer.config.MaxRuntimeCandidates {
-		record.ReasonCodes = append(record.ReasonCodes, "candidate_limit_exceeded")
-	}
-
-	links, linkCodes := evaluateLinks(peer, ancestry, runtimes)
-	record.PossibleLinks = links
-	record.LinkRules = uniqueSortedRules(links)
-	record.MatchingRuntimeCount = countUniqueRuntimeRefs(links)
-	record.Ancestry = annotateAncestry(ancestry, runtimes)
-	record.ReasonCodes = append(record.ReasonCodes, linkCodes...)
-
-	if record.MatchingRuntimeCount == 1 {
-		// Diagnostic uniqueness only — not approved production hard identity.
+	if link.Unique {
 		record.DiagnosticUniqueLink = true
-		record.ReasonCodes = append(record.ReasonCodes, "unique_runtime_link", "diagnostic_unique_link")
+		record.ReasonCodes = append(record.ReasonCodes, "diagnostic_unique_link")
 	} else {
 		record.DiagnosticUniqueLink = false
-		if record.MatchingRuntimeCount == 0 {
-			record.ReasonCodes = append(record.ReasonCodes, "no_unique_runtime_link", "diagnostic_no_unique_link")
+		if hasString(link.Reasons, "ambiguous_runtime_link") {
+			record.ReasonCodes = append(record.ReasonCodes, "diagnostic_ambiguous_link")
 		} else {
-			record.ReasonCodes = append(record.ReasonCodes, "ambiguous_runtime_link", "diagnostic_ambiguous_link")
+			record.ReasonCodes = append(record.ReasonCodes, "diagnostic_no_unique_link")
 		}
 		record.ReasonCodes = append(record.ReasonCodes, "fail_closed")
 	}
-
 	observer.finish(record, measureStarted)
+}
+
+func hasString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func hopsFromCapture(capture localhooktransport.IdentityPeerCapture) []AncestryHop {

@@ -83,6 +83,7 @@ func TestIdentityObserverDoesNotChangeIngestResponse(t *testing.T) {
 		Tool:           instancepresence.ToolClaude,
 		HookSessionRef: "session-measure-a",
 		Lifecycle:      instancecorrelation.LifecycleActive,
+		EffectiveState: instancepresence.StateWorking,
 	})
 	if response.Status != StatusOK || !response.NoBindingPerformed {
 		t.Fatalf("response = %#v", response)
@@ -115,6 +116,7 @@ func TestIdentityObserverFailureDoesNotRejectValidIngest(t *testing.T) {
 		Tool:           instancepresence.ToolCodex,
 		HookSessionRef: "session-measure-b",
 		Lifecycle:      instancecorrelation.LifecycleIdle,
+		EffectiveState: instancepresence.StateIdle,
 	})
 	if response.Status != StatusOK || !response.NoBindingPerformed {
 		t.Fatalf("response = %#v", response)
@@ -137,6 +139,7 @@ func TestIdentityObserverNotInvokedWhenDisabled(t *testing.T) {
 		Tool:           instancepresence.ToolClaude,
 		HookSessionRef: "session-measure-c",
 		Lifecycle:      instancecorrelation.LifecycleActive,
+		EffectiveState: instancepresence.StateWorking,
 	})
 	if response.Status != StatusOK {
 		t.Fatalf("response = %#v", response)

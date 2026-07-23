@@ -348,32 +348,53 @@ func newNetworkTestServer(t *testing.T, authenticator Authenticator, source Runt
 }
 
 func TestServerAuthenticatesBeforeDecode(t *testing.T) {
+	// Server rejects on SO_PEERCRED before reading the request body, writes
+	// unauthorized_peer, then closes. A concurrent client write can observe
+	// EPIPE/broken pipe once the server has closed after delivering the
+	// rejection — that is an expected platform effect, not a silent drop.
 	sample := testSample()
 	server, _, cancel, done := newNetworkTestServer(t, rejectingAuthenticator{}, &fakeSnapshots{samples: [][]instancecorrelation.RuntimeObservation{sample}})
 	connection, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: server.config.SocketPath, Net: "unix"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := connection.Write([]byte{0, 0, 0, 1, '{'}); err != nil {
-		t.Fatal(err)
-	}
+	writeErr := writeAllIgnoringBrokenPipe(connection, []byte{0, 0, 0, 1, '{'})
 	responseData, err := readFrame(connection, server.config.MaximumResponseBytes)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("read rejection response: %v (writeErr=%v)", err, writeErr)
 	}
 	var response Response
-	err = json.Unmarshal(responseData, &response)
-	if err != nil {
+	if err := json.Unmarshal(responseData, &response); err != nil {
 		t.Fatal(err)
 	}
 	if !hasErrorCode(response, CodeUnauthorizedPeer) {
 		t.Fatalf("response = %#v", response)
+	}
+	// Only after verifying the intended rejection may write-side broken pipe be accepted.
+	if writeErr != nil && !isBrokenPipe(writeErr) {
+		t.Fatalf("unexpected write error after auth rejection: %v", writeErr)
 	}
 	_ = connection.Close()
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
+}
+
+func writeAllIgnoringBrokenPipe(conn *net.UnixConn, data []byte) error {
+	_, err := conn.Write(data)
+	return err
+}
+
+func isBrokenPipe(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, syscall.EPIPE) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	// net package often wraps as "write: broken pipe"
+	return strings.Contains(err.Error(), "broken pipe")
 }
 
 func TestServerClientRoundTripAndCleanup(t *testing.T) {

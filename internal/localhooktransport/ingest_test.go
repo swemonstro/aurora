@@ -17,6 +17,7 @@ func TestIngestRequestSerializationAllowlist(t *testing.T) {
 		Tool:           instancepresence.ToolClaude,
 		HookSessionRef: "session-a",
 		Lifecycle:      instancecorrelation.LifecycleActive,
+		EffectiveState: instancepresence.StateWorking,
 	}
 	request, err := NewIngestRequest(ingress)
 	if err != nil {
@@ -74,6 +75,7 @@ func TestIngestRequestValidation(t *testing.T) {
 			Tool:           instancepresence.ToolCodex,
 			HookSessionRef: "session-b",
 			Lifecycle:      instancecorrelation.LifecycleIdle,
+			State:          instancepresence.StateIdle,
 		},
 	}
 	if err := ValidateIngestRequest(config, valid); err != nil {
@@ -142,12 +144,13 @@ func TestIngestResponseValidationAndSerialization(t *testing.T) {
 	if err := ValidateIngestResponse(decoded, response.RequestID); err != nil {
 		t.Fatal(err)
 	}
-	bad := response
-	bad.NoBindingPerformed = false
-	if err := ValidateIngestResponse(bad, response.RequestID); err == nil {
-		t.Fatal("binding response accepted")
+	// Successful binds may set NoBindingPerformed=false; still content-free.
+	bound := response
+	bound.NoBindingPerformed = false
+	if err := ValidateIngestResponse(bound, response.RequestID); err != nil {
+		t.Fatalf("bound response rejected: %v", err)
 	}
-	bad = response
+	bad := response
 	bad.RequestID = "other"
 	if err := ValidateIngestResponse(bad, response.RequestID); err == nil {
 		t.Fatal("mismatched request ID accepted")

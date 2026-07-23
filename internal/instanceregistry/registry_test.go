@@ -503,3 +503,74 @@ func TestConcurrentReadsAndMutations(t *testing.T) {
 		t.Fatalf("active count = %d, want %d", got, count)
 	}
 }
+
+func TestApplyNextHookMutationSequencesPerRuntime(t *testing.T) {
+	registry, _ := newTestRegistry(t)
+	mustRegister(t, registry, registration("instance-a", 101))
+	now := testTime()
+
+	first, err := registry.ApplyNextHookMutation("instance-a", "epoch-a", instancepresence.StateWorking, now, "next-1")
+	if err != nil || first.Revisions.HookRevision != 1 || first.State != instancepresence.StateWorking {
+		t.Fatalf("first = %#v err=%v", first, err)
+	}
+	second, err := registry.ApplyNextHookMutation("instance-a", "epoch-a", instancepresence.StateIdle, now.Add(time.Second), "next-2")
+	if err != nil || second.Revisions.HookRevision != 2 || second.State != instancepresence.StateIdle {
+		t.Fatalf("second = %#v err=%v", second, err)
+	}
+	// Idempotent retry of the same key does not advance revision.
+	retry, err := registry.ApplyNextHookMutation("instance-a", "epoch-a", instancepresence.StateIdle, now.Add(time.Second), "next-2")
+	if err != nil || retry.Revisions.HookRevision != 2 {
+		t.Fatalf("retry = %#v err=%v", retry, err)
+	}
+	// Same key, different payload conflicts.
+	if _, err := registry.ApplyNextHookMutation("instance-a", "epoch-a", instancepresence.StateWorking, now.Add(2*time.Second), "next-2"); !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("idempotency conflict = %v", err)
+	}
+	if _, err := registry.ApplyNextHookMutation("instance-a", "epoch-b", instancepresence.StateWorking, now.Add(3*time.Second), "next-3"); !errors.Is(err, ErrEpochConflict) {
+		t.Fatalf("epoch conflict = %v", err)
+	}
+}
+
+func TestApplyNextHookMutationConcurrentUniqueKeys(t *testing.T) {
+	registry, _ := newTestRegistry(t)
+	mustRegister(t, registry, registration("instance-a", 101))
+	now := testTime()
+	const workers = 20
+	var wait sync.WaitGroup
+	errs := make(chan error, workers)
+	wait.Add(workers)
+	for i := 0; i < workers; i++ {
+		i := i
+		go func() {
+			defer wait.Done()
+			_, err := registry.ApplyNextHookMutation(
+				"instance-a", "epoch-a", instancepresence.StateWorking,
+				now.Add(time.Duration(i)*time.Millisecond),
+				fmt.Sprintf("concurrent-%d", i),
+			)
+			errs <- err
+		}()
+	}
+	wait.Wait()
+	close(errs)
+	var okCount int
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent mutation error = %v", err)
+		}
+		okCount++
+	}
+	if okCount != workers {
+		t.Fatalf("okCount = %d", okCount)
+	}
+	got, err := registry.Get("instance-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Revisions.HookRevision != instancepresence.HookRevision(workers) {
+		t.Fatalf("HookRevision = %d, want %d", got.Revisions.HookRevision, workers)
+	}
+	if got.State != instancepresence.StateWorking {
+		t.Fatalf("state = %q", got.State)
+	}
+}

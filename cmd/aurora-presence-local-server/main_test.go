@@ -23,11 +23,72 @@ func TestRunRequiresExplicitIdentityAndSafeSocketDefault(t *testing.T) {
 	}
 }
 
-func TestHelpStatesObserveOnly(t *testing.T) {
+func TestHelpStatesBindingFlag(t *testing.T) {
 	var output bytes.Buffer
 	_ = run(context.Background(), []string{"-help"}, &output, &output, func(string) string { return "" })
-	if !strings.Contains(output.String(), "observe-only") || !strings.Contains(output.String(), "never performs a binding") {
+	if !strings.Contains(output.String(), "verified per-instance binding") || !strings.Contains(output.String(), "AURORA_LOCAL_HOOK_ENABLED") {
 		t.Fatalf("help = %s", output.String())
+	}
+	if !strings.Contains(output.String(), "-relay") {
+		t.Fatalf("help missing -relay: %s", output.String())
+	}
+}
+
+func TestRelayBridgeDefaultOff(t *testing.T) {
+	socketPath := testSocketPath(t)
+	var stderr bytes.Buffer
+	server, cleanup, _, err := composeServer(
+		[]string{"-host-id", "host-fixture", "-socket", socketPath},
+		&stderr,
+		func(string) string { return "" },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cleanup != nil {
+		defer cleanup()
+	}
+	defer server.Close()
+	if strings.Contains(stderr.String(), "relay bridge") {
+		t.Fatalf("relay bridge started by default: %s", stderr.String())
+	}
+}
+
+func TestRelayFlagRequiresAbsoluteHTTP(t *testing.T) {
+	socketPath := testSocketPath(t)
+	var stderr bytes.Buffer
+	_, _, _, err := composeServer(
+		[]string{"-host-id", "host-fixture", "-socket", socketPath, "-relay", "not-a-url"},
+		&stderr,
+		func(string) string { return "" },
+	)
+	if err == nil {
+		t.Fatal("invalid relay accepted")
+	}
+}
+
+func TestRelayEnvUsedWhenFlagEmpty(t *testing.T) {
+	socketPath := testSocketPath(t)
+	var stderr bytes.Buffer
+	server, cleanup, _, err := composeServer(
+		[]string{"-host-id", "host-fixture", "-socket", socketPath},
+		&stderr,
+		func(key string) string {
+			if key == EnvRelayURL {
+				return "http://127.0.0.1:9"
+			}
+			return ""
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cleanup != nil {
+		defer cleanup()
+	}
+	defer server.Close()
+	if !strings.Contains(stderr.String(), "relay bridge") {
+		t.Fatalf("env relay not enabled: %s", stderr.String())
 	}
 }
 
@@ -36,7 +97,7 @@ func TestIngestRemainsDisabledWhenFeatureFlagUnsetOrFalse(t *testing.T) {
 		t.Run("value_"+value, func(t *testing.T) {
 			socketPath := testSocketPath(t)
 			var stderr bytes.Buffer
-			server, cleanup, err := composeServer(
+			server, cleanup, _, err := composeServer(
 				[]string{"-host-id", "host-fixture", "-socket", socketPath},
 				&stderr,
 				func(key string) string {
@@ -68,7 +129,7 @@ func TestIngestEnabledWhenFeatureFlagTrue(t *testing.T) {
 		t.Run("value_"+strings.TrimSpace(value), func(t *testing.T) {
 			socketPath := testSocketPath(t)
 			var stderr bytes.Buffer
-			server, cleanup, err := composeServer(
+			server, cleanup, _, err := composeServer(
 				[]string{"-host-id", "host-fixture", "-socket", socketPath},
 				&stderr,
 				func(key string) string {
@@ -97,7 +158,7 @@ func TestIdentityMeasureDefaultOffAndExplicitEnable(t *testing.T) {
 	measurePath := filepath.Join(filepath.Dir(socketPath), "identity-measure.jsonl")
 
 	var stderr bytes.Buffer
-	server, cleanup, err := composeServer(
+	server, cleanup, _, err := composeServer(
 		[]string{"-host-id", "host-fixture", "-socket", socketPath},
 		&stderr,
 		func(string) string { return "" },
@@ -114,7 +175,7 @@ func TestIdentityMeasureDefaultOffAndExplicitEnable(t *testing.T) {
 	}
 
 	stderr.Reset()
-	server, cleanup, err = composeServer(
+	server, cleanup, _, err = composeServer(
 		[]string{"-host-id", "host-fixture", "-socket", socketPath, "-identity-measure-file", measurePath},
 		&stderr,
 		func(key string) string {
@@ -151,7 +212,7 @@ func TestLegacyStartupValidWithAndWithoutIngest(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			socketPath := testSocketPath(t)
 			var stderr bytes.Buffer
-			server, cleanup, err := composeServer(
+			server, cleanup, _, err := composeServer(
 				[]string{"-host-id", "host-fixture", "-socket", socketPath},
 				&stderr,
 				func(key string) string {

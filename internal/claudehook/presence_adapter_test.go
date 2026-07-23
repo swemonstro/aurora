@@ -50,10 +50,12 @@ func TestLocalIngressObservationMapsClaudeWithoutMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if observation.Tool != instancepresence.ToolClaude || observation.HookSessionRef != "session-a" || observation.Lifecycle != instancecorrelation.LifecycleActive {
+	if observation.Tool != instancepresence.ToolClaude || observation.HookSessionRef != "session-a" ||
+		observation.Lifecycle != instancecorrelation.LifecycleActive || observation.EffectiveState != instancepresence.StateWorking {
 		t.Fatalf("observation = %#v", observation)
 	}
-	if observation, err := LocalIngressObservation(Event{HookEventName: "SessionEnd", SessionID: "session-a"}); err != nil || observation.Lifecycle != instancecorrelation.LifecycleEnded {
+	if observation, err := LocalIngressObservation(Event{HookEventName: "SessionEnd", SessionID: "session-a"}); err != nil ||
+		observation.Lifecycle != instancecorrelation.LifecycleEnded || observation.EffectiveState != "" {
 		t.Fatalf("session end = %#v err=%v", observation, err)
 	}
 	if _, err := LocalIngressObservation(Event{HookEventName: "unsupported", SessionID: "session-a"}); err == nil {

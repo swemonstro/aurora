@@ -256,6 +256,7 @@ func testIngress() hookadapter.IngressObservation {
 		Tool:           instancepresence.ToolClaude,
 		HookSessionRef: "session-fixture",
 		Lifecycle:      instancecorrelation.LifecycleActive,
+		EffectiveState: instancepresence.StateWorking,
 	}
 }
 

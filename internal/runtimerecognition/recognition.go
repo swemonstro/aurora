@@ -485,6 +485,12 @@ func sortProcesses(processes []instancepresence.ProcessIdentity) {
 	})
 }
 
+// StableInstanceID returns the deterministic runtime instance ID from host,
+// boot, tool, and generation-safe root process identity (PID + start time).
+func StableInstanceID(hostID string, bootID instancepresence.BootIdentity, tool instancepresence.ToolKind, root instancepresence.ProcessIdentity) instancepresence.InstanceID {
+	return observedCandidateID(hostID, bootID, tool, root)
+}
+
 func observedCandidateID(hostID string, bootID instancepresence.BootIdentity, tool instancepresence.ToolKind, root instancepresence.ProcessIdentity) instancepresence.InstanceID {
 	value := fmt.Sprintf("%s\x00%s\x00%s\x00%d\x00%d", hostID, bootID, tool, root.PID, root.StartedAt.UnixNano())
 	digest := sha256.Sum256([]byte(value))

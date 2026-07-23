@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -19,11 +20,20 @@ import (
 	"github.com/swemonstro/aurora/internal/codexhook"
 	"github.com/swemonstro/aurora/internal/instancecorrelation"
 	"github.com/swemonstro/aurora/internal/instancepresence"
+	"github.com/swemonstro/aurora/internal/instanceregistry"
 	"github.com/swemonstro/aurora/internal/linuxidentitymeasure"
 	"github.com/swemonstro/aurora/internal/linuxprocess"
 	"github.com/swemonstro/aurora/internal/localhooktransport"
+	"github.com/swemonstro/aurora/internal/publish"
+	"github.com/swemonstro/aurora/internal/runtimepresence"
 	"github.com/swemonstro/aurora/internal/runtimerecognition"
+	"github.com/swemonstro/aurora/internal/sessionbinding"
 )
+
+// EnvRelayURL is an optional default for -relay; the CLI flag always wins when set.
+const EnvRelayURL = "AURORA_RELAY_URL"
+
+const relayHTTPTimeout = 2 * time.Second
 
 type systemClock struct{}
 
@@ -41,7 +51,7 @@ func main() {
 }
 
 func run(ctx context.Context, arguments []string, stdout, stderr io.Writer, getenv func(string) string) error {
-	server, cleanup, err := composeServer(arguments, stderr, getenv)
+	server, cleanup, bindingEnabled, err := composeServer(arguments, stderr, getenv)
 	if err != nil {
 		return err
 	}
@@ -49,14 +59,18 @@ func run(ctx context.Context, arguments []string, stdout, stderr io.Writer, gete
 		defer cleanup()
 	}
 	defer server.Close()
-	fmt.Fprintln(stdout, "Aurora local hook receiver: observe-only, foreground, no binding performed")
+	if bindingEnabled {
+		fmt.Fprintln(stdout, "Aurora local hook receiver: verified per-instance binding enabled (content-free responses)")
+	} else {
+		fmt.Fprintln(stdout, "Aurora local hook receiver: observe-only, foreground, no binding performed")
+	}
 	if server.IdentityObserverEnabled() {
-		fmt.Fprintln(stdout, "Package 7.0 identity measure: enabled (read-only JSONL; no binding)")
+		fmt.Fprintln(stdout, "Package 7.0 identity measure: enabled (read-only JSONL independent of binding)")
 	}
 	return server.Serve(ctx)
 }
 
-func composeServer(arguments []string, stderr io.Writer, getenv func(string) string) (*localhooktransport.Server, func(), error) {
+func composeServer(arguments []string, stderr io.Writer, getenv func(string) string) (*localhooktransport.Server, func(), bool, error) {
 	flags := flag.NewFlagSet("aurora-presence-local-server", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	socketPath := flags.String("socket", "", "absolute private Unix socket path; defaults below XDG_RUNTIME_DIR")
@@ -64,28 +78,31 @@ func composeServer(arguments []string, stderr io.Writer, getenv func(string) str
 	hostID := flags.String("host-id", "", "required opaque local host ID")
 	bootID := flags.String("boot-id", "", "optional opaque boot ID; default reads proc boot_id")
 	identityMeasurePath := flags.String("identity-measure-file", "", "default-off Package 7.0 read-only JSONL path for peer identity measurements")
+	snapshotPath := flags.String("snapshot-file", "", "default-off absolute path for periodic read-only CanonicalSnapshot JSON")
+	relayFlag := flags.String("relay", "", "default-off Aurora Relay base URL for v2→v1 presence bridge (http/https)")
 	flags.Usage = func() {
-		fmt.Fprintln(flags.Output(), "Foreground observe-only local hook receiver; it never performs a binding or state mutation.")
-		fmt.Fprintln(flags.Output(), "Usage: aurora-presence-local-server -host-id OPAQUE [-socket PATH] [-identity-measure-file PATH]")
-		fmt.Fprintln(flags.Output(), "Package 7.0 identity measure is off unless -identity-measure-file is set (manual Blue1 diagnostic only).")
+		fmt.Fprintln(flags.Output(), "Foreground local hook receiver with optional verified per-instance binding.")
+		fmt.Fprintln(flags.Output(), "Usage: aurora-presence-local-server -host-id OPAQUE [-socket PATH] [-identity-measure-file PATH] [-snapshot-file PATH] [-relay URL]")
+		fmt.Fprintln(flags.Output(), "Binding requires AURORA_LOCAL_HOOK_ENABLED=1|true (same flag as hook clients).")
+		fmt.Fprintln(flags.Output(), "When -relay is set, this process owns claude-runtime/codex-runtime; stop separate aurora-runtime-presence to avoid dual producers.")
 		flags.PrintDefaults()
 	}
 	if err := flags.Parse(arguments); err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
 	}
 	if *hostID == "" {
 		flags.Usage()
-		return nil, nil, errors.New("host-id is required")
+		return nil, nil, false, errors.New("host-id is required")
 	}
 	if *socketPath == "" {
 		runtimeDirectory := getenv("XDG_RUNTIME_DIR")
 		if runtimeDirectory == "" || !filepath.IsAbs(runtimeDirectory) {
-			return nil, nil, errors.New("socket is required when XDG_RUNTIME_DIR is unavailable")
+			return nil, nil, false, errors.New("socket is required when XDG_RUNTIME_DIR is unavailable")
 		}
 		*socketPath = filepath.Join(runtimeDirectory, "aurora", "presence-hook.sock")
 	}
 	if err := localhooktransport.PrepareSocketDirectory(*socketPath); err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
 	}
 	clock := systemClock{}
 	adapter, err := linuxprocess.New(linuxprocess.Config{
@@ -93,70 +110,253 @@ func composeServer(arguments []string, stderr io.Writer, getenv func(string) str
 		LaunchIdentityRules: append(claudehook.LaunchIdentityRules(), codexhook.LaunchIdentityRules()...),
 	})
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
 	}
 	correlator, err := instancecorrelation.New(instancecorrelation.DefaultConfig())
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
 	}
 	config := localhooktransport.DefaultConfig(clock)
 	config.SocketPath = *socketPath
 	runtimeSource, err := runtimerecognition.NewSource(adapter, *hostID, claudehook.RuntimeRecognizer(), codexhook.RuntimeRecognizer())
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
 	}
 	service, err := localhooktransport.NewCorrelationService(runtimeSource, correlator, clock, config.MaximumRuntimes)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
 	}
 	receiver, err := localhooktransport.NewReceiver(config, service)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
 	}
 	server, err := localhooktransport.NewServer(config, receiver, localhooktransport.DefaultAuthenticator(), nil)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
 	}
-	// Package 6 ingest stays off by default. Enable only when the same feature
-	// flag used by hook clients is explicitly on.
-	if localhooktransport.LocalHookEnabled(getenv(localhooktransport.EnvLocalHookEnabled)) {
-		if err := server.EnableIngest(localhooktransport.DefaultIngestServerConfig(clock)); err != nil {
+
+	var cleanups []func()
+	cleanup := func() {
+		for i := len(cleanups) - 1; i >= 0; i-- {
+			cleanups[i]()
+		}
+	}
+	bindingEnabled := false
+
+	snapshotFile := strings.TrimSpace(*snapshotPath)
+	if snapshotFile != "" {
+		if !filepath.IsAbs(snapshotFile) {
 			_ = server.Close()
-			return nil, nil, err
+			return nil, nil, false, errors.New("snapshot-file must be an absolute path")
 		}
 	}
 
-	var cleanup func()
-	measurePath := strings.TrimSpace(*identityMeasurePath)
-	if measurePath == "" {
-		measurePath = strings.TrimSpace(getenv("AURORA_IDENTITY_MEASURE_FILE"))
-	}
-	if measurePath != "" {
-		if !filepath.IsAbs(measurePath) {
-			_ = server.Close()
-			return nil, nil, errors.New("identity-measure-file must be an absolute path")
+	var registry *instanceregistry.Registry
+	ensureRegistry := func() error {
+		if registry != nil {
+			return nil
 		}
-		file, err := linuxidentitymeasure.OpenFileWriter(measurePath)
+		created, regErr := instanceregistry.New(instanceregistry.Config{
+			Clock: clock, SlotNamespace: "default",
+			LeaseDuration: 30 * time.Second, GracePeriod: 15 * time.Second,
+		})
+		if regErr != nil {
+			return regErr
+		}
+		registry = created
+		return nil
+	}
+
+	// Package 6 ingest stays off by default. When enabled, attach verified
+	// per-instance binding: unique runtime link + session map + registry mutation.
+	if localhooktransport.LocalHookEnabled(getenv(localhooktransport.EnvLocalHookEnabled)) {
+		epoch, err := localhooktransport.NewProducerEpoch()
 		if err != nil {
 			_ = server.Close()
-			return nil, nil, fmt.Errorf("open identity measure file: %w", err)
+			return nil, nil, false, err
 		}
+		if err := server.EnableIngestWithEpoch(localhooktransport.DefaultIngestServerConfig(clock), epoch); err != nil {
+			_ = server.Close()
+			return nil, nil, false, err
+		}
+		if err := ensureRegistry(); err != nil {
+			_ = server.Close()
+			return nil, nil, false, err
+		}
+
+		var measureWriter io.Writer = io.Discard
+		measurePath := strings.TrimSpace(*identityMeasurePath)
+		if measurePath == "" {
+			measurePath = strings.TrimSpace(getenv("AURORA_IDENTITY_MEASURE_FILE"))
+		}
+		if measurePath != "" {
+			if !filepath.IsAbs(measurePath) {
+				_ = server.Close()
+				return nil, nil, false, errors.New("identity-measure-file must be an absolute path")
+			}
+			file, err := linuxidentitymeasure.OpenFileWriter(measurePath)
+			if err != nil {
+				_ = server.Close()
+				return nil, nil, false, fmt.Errorf("open identity measure file: %w", err)
+			}
+			measureWriter = file
+			cleanups = append(cleanups, func() { _ = file.Close() })
+			fmt.Fprintf(stderr, "identity measure JSONL: %s (diagnostic only; independent of binding)\n", measurePath)
+		}
+
 		observer, err := linuxidentitymeasure.NewObserver(
-			adapter,
-			*hostID,
-			file,
+			adapter, *hostID, measureWriter,
 			linuxidentitymeasure.Config{HostID: *hostID},
-			claudehook.RuntimeRecognizer(),
-			codexhook.RuntimeRecognizer(),
+			claudehook.RuntimeRecognizer(), codexhook.RuntimeRecognizer(),
 		)
 		if err != nil {
-			_ = file.Close()
+			cleanup()
 			_ = server.Close()
-			return nil, nil, err
+			return nil, nil, false, err
 		}
+		// CapturePeer still runs for binding; CompleteIngest remains diagnostic.
 		server.SetIdentityObserver(observer)
-		cleanup = func() { _ = file.Close() }
-		fmt.Fprintf(stderr, "identity measure JSONL: %s (read-only; no binding; stop server to disable)\n", measurePath)
+
+		sessions := sessionbinding.New()
+		engine, err := localhooktransport.NewBindingEngine(sessions, observer, registry)
+		if err != nil {
+			cleanup()
+			_ = server.Close()
+			return nil, nil, false, err
+		}
+		if ingest := server.IngestReceiver(); ingest != nil {
+			ingest.SetBinder(engine)
+		}
+
+		// Background runtime registration keeps InstanceIDs alive for binding.
+		regSync, err := runtimepresence.NewRegistrySync(registry, *hostID, epoch, instancepresence.SourceDescriptor{
+			Provider: "linux-runtime", Profile: "default", CollectorID: "local-server",
+		}, time.Now)
+		if err != nil {
+			cleanup()
+			_ = server.Close()
+			return nil, nil, false, err
+		}
+		pollCtx, pollCancel := context.WithCancel(context.Background())
+		cleanups = append(cleanups, pollCancel)
+		go pollRuntimes(pollCtx, adapter, *hostID, instancepresence.BootIdentity(*bootID), regSync, stderr)
+		bindingEnabled = true
+	} else {
+		// Observe-only identity measure without binding when ingest is off.
+		measurePath := strings.TrimSpace(*identityMeasurePath)
+		if measurePath == "" {
+			measurePath = strings.TrimSpace(getenv("AURORA_IDENTITY_MEASURE_FILE"))
+		}
+		if measurePath != "" {
+			if !filepath.IsAbs(measurePath) {
+				_ = server.Close()
+				return nil, nil, false, errors.New("identity-measure-file must be an absolute path")
+			}
+			file, err := linuxidentitymeasure.OpenFileWriter(measurePath)
+			if err != nil {
+				_ = server.Close()
+				return nil, nil, false, fmt.Errorf("open identity measure file: %w", err)
+			}
+			observer, err := linuxidentitymeasure.NewObserver(
+				adapter, *hostID, file,
+				linuxidentitymeasure.Config{HostID: *hostID},
+				claudehook.RuntimeRecognizer(), codexhook.RuntimeRecognizer(),
+			)
+			if err != nil {
+				_ = file.Close()
+				_ = server.Close()
+				return nil, nil, false, err
+			}
+			server.SetIdentityObserver(observer)
+			cleanups = append(cleanups, func() { _ = file.Close() })
+			fmt.Fprintf(stderr, "identity measure JSONL: %s (read-only; no binding; stop server to disable)\n", measurePath)
+		}
 	}
-	return server, cleanup, nil
+
+	// Optional read-only CanonicalSnapshot JSON for external observers (no HTTP).
+	if snapshotFile != "" {
+		if err := ensureRegistry(); err != nil {
+			cleanup()
+			_ = server.Close()
+			return nil, nil, false, err
+		}
+		fmt.Fprintf(stderr, "canonical snapshot file: %s (read-only JSON; content-free instances)\n", snapshotFile)
+		snapCtx, snapCancel := context.WithCancel(context.Background())
+		cleanups = append(cleanups, snapCancel)
+		go runSnapshotLoop(snapCtx, registry, snapshotFile, defaultSnapshotInterval, stderr)
+	}
+
+	// Optional v2→v1 relay bridge. CLI -relay wins over AURORA_RELAY_URL.
+	relayURL := strings.TrimSpace(*relayFlag)
+	if relayURL == "" {
+		relayURL = strings.TrimSpace(getenv(EnvRelayURL))
+	}
+	if relayURL != "" {
+		if err := ensureRegistry(); err != nil {
+			cleanup()
+			_ = server.Close()
+			return nil, nil, false, err
+		}
+		client := &http.Client{Timeout: relayHTTPTimeout}
+		publisher, err := publish.NewHTTPPublisher(relayURL, client)
+		if err != nil {
+			cleanup()
+			_ = server.Close()
+			return nil, nil, false, fmt.Errorf("relay publisher: %w", err)
+		}
+		bridge, err := runtimepresence.NewRelayBridge(
+			registry, publisher, time.Now, runtimepresence.DefaultBridgeInterval, stderr,
+		)
+		if err != nil {
+			cleanup()
+			_ = server.Close()
+			return nil, nil, false, err
+		}
+		fmt.Fprintf(stderr, "v2→v1 relay bridge: %s (sources %s, %s; stop separate aurora-runtime-presence to avoid dual producers)\n",
+			relayURL, runtimepresence.SourceClaudeRuntime, runtimepresence.SourceCodexRuntime)
+		bridgeCtx, bridgeCancel := context.WithCancel(context.Background())
+		cleanups = append(cleanups, bridgeCancel)
+		go bridge.Run(bridgeCtx)
+	}
+
+	return server, cleanup, bindingEnabled, nil
+}
+
+func pollRuntimes(
+	ctx context.Context,
+	adapter *linuxprocess.Adapter,
+	hostID string,
+	bootID instancepresence.BootIdentity,
+	sync *runtimepresence.RegistrySync,
+	stderr io.Writer,
+) {
+	ticker := time.NewTicker(runtimepresence.DefaultPollInterval)
+	defer ticker.Stop()
+	for {
+		sample, err := adapter.Observe(ctx)
+		if err == nil {
+			result, recErr := runtimerecognition.Recognize(
+				sample.Recognition, hostID,
+				claudehook.RuntimeRecognizer(), codexhook.RuntimeRecognizer(),
+			)
+			if recErr == nil {
+				effectiveBoot := bootID
+				if effectiveBoot == "" {
+					effectiveBoot = sample.Recognition.BootID
+				}
+				if syncErr := sync.ApplyRecognition(result, effectiveBoot); syncErr != nil {
+					fmt.Fprintln(stderr, "runtime registry sync:", syncErr)
+				}
+			} else {
+				fmt.Fprintln(stderr, "runtime recognize:", recErr)
+			}
+		} else if !errors.Is(err, context.Canceled) {
+			fmt.Fprintln(stderr, "runtime observe:", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }

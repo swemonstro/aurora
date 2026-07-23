@@ -121,13 +121,22 @@ type AcceptedIngress struct {
 	Tool           instancepresence.ToolKind
 	HookSessionRef instancepresence.OpaqueIdentity
 	Lifecycle      instancecorrelation.Lifecycle
+	State          instancepresence.EffectiveState
 	ProducerEpoch  instancepresence.ProducerEpoch
 	Revision       uint64
 	ObservedAt     time.Time
 }
 
-// IngestReceiver is the Package 6 server-side sequencing owner. It never binds,
-// mutates registry state, or performs correlation.
+// IngestBinder performs post-accept binding and registry mutation. When nil,
+// the receiver remains observe-only (NoBindingPerformed=true).
+type IngestBinder interface {
+	// Bind runs after atomic accept. Fail-closed results must keep
+	// NoBindingPerformed=true. Successful bind/mutation sets it false.
+	Bind(ctx context.Context, accepted AcceptedIngress, capture IdentityPeerCapture) IngestResponse
+}
+
+// IngestReceiver is the Package 6 server-side sequencing owner. Binding and
+// registry mutation are optional via IngestBinder and run after accept.
 type IngestReceiver struct {
 	config   IngestServerConfig
 	epoch    instancepresence.ProducerEpoch
@@ -135,6 +144,7 @@ type IngestReceiver struct {
 	streams  map[ingestStreamKey]*ingestStreamState
 	replay   map[string]ingestReplayEntry
 	accepted map[ingestStreamKey]AcceptedIngress
+	binder   IngestBinder
 
 	// afterAccept is an optional test hook invoked after the atomic accept
 	// point while the request is still in_progress. It must not be used in
@@ -155,11 +165,22 @@ func NewProducerEpoch() (instancepresence.ProducerEpoch, error) {
 }
 
 func NewIngestReceiver(config IngestServerConfig) (*IngestReceiver, error) {
+	return NewIngestReceiverWithEpoch(config, "")
+}
+
+// NewIngestReceiverWithEpoch constructs a receiver with an explicit producer
+// epoch (shared with runtime registration) or generates one when empty.
+func NewIngestReceiverWithEpoch(config IngestServerConfig, epoch instancepresence.ProducerEpoch) (*IngestReceiver, error) {
 	if err := config.Validate(); err != nil {
 		return nil, err
 	}
-	epoch, err := NewProducerEpoch()
-	if err != nil {
+	if epoch == "" {
+		generated, err := NewProducerEpoch()
+		if err != nil {
+			return nil, err
+		}
+		epoch = generated
+	} else if err := epoch.Validate(); err != nil {
 		return nil, err
 	}
 	return &IngestReceiver{
@@ -169,6 +190,13 @@ func NewIngestReceiver(config IngestServerConfig) (*IngestReceiver, error) {
 		replay:   make(map[string]ingestReplayEntry),
 		accepted: make(map[ingestStreamKey]AcceptedIngress),
 	}, nil
+}
+
+// SetBinder installs the optional post-accept binding engine.
+func (receiver *IngestReceiver) SetBinder(binder IngestBinder) {
+	receiver.mutex.Lock()
+	defer receiver.mutex.Unlock()
+	receiver.binder = binder
 }
 
 func (receiver *IngestReceiver) ProducerEpoch() instancepresence.ProducerEpoch {
@@ -193,6 +221,11 @@ func (receiver *IngestReceiver) StreamRevision(tool instancepresence.ToolKind, s
 }
 
 func (receiver *IngestReceiver) HandleJSON(ctx context.Context, data []byte) (response IngestResponse) {
+	return receiver.HandleJSONWithCapture(ctx, data, IdentityPeerCapture{})
+}
+
+// HandleJSONWithCapture decodes and handles one request with a pre-accept peer capture.
+func (receiver *IngestReceiver) HandleJSONWithCapture(ctx context.Context, data []byte, capture IdentityPeerCapture) (response IngestResponse) {
 	if uint64(len(data)) > uint64(receiver.config.MaximumRequestBytes) {
 		return emptyIngestResponse(StatusRejected, "", CodeRequestTooLarge)
 	}
@@ -200,10 +233,15 @@ func (receiver *IngestReceiver) HandleJSON(ctx context.Context, data []byte) (re
 	if err != nil {
 		return emptyIngestResponse(StatusRejected, "", errorCode(err))
 	}
-	return receiver.Handle(ctx, request)
+	return receiver.HandleWithCapture(ctx, request, capture)
 }
 
 func (receiver *IngestReceiver) Handle(ctx context.Context, request IngestRequest) (response IngestResponse) {
+	return receiver.HandleWithCapture(ctx, request, IdentityPeerCapture{})
+}
+
+// HandleWithCapture sequences one ingress and optionally binds after accept.
+func (receiver *IngestReceiver) HandleWithCapture(ctx context.Context, request IngestRequest, capture IdentityPeerCapture) (response IngestResponse) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -237,7 +275,7 @@ func (receiver *IngestReceiver) Handle(ctx context.Context, request IngestReques
 			receiver.complete(request.RequestID, digest, response)
 			finalized = true
 		}
-		response = ensureIngestNoBinding(response)
+		response = normalizeIngestResponse(response)
 	}()
 
 	outcome, accepted, owned := receiver.accept(request.RequestID, digest, request.Payload)
@@ -256,10 +294,24 @@ func (receiver *IngestReceiver) Handle(ctx context.Context, request IngestReques
 		return response
 	}
 
-	// Observe-only Package 6 server path: sequencing is complete. Correlation,
-	// binding, registry mutation, and publication are intentionally not performed.
-	_ = accepted
-	response = emptyIngestResponse(StatusOK, request.RequestID)
+	receiver.mutex.Lock()
+	binder := receiver.binder
+	receiver.mutex.Unlock()
+	if binder != nil {
+		response = binder.Bind(handleCtx, accepted, capture)
+		if response.RequestID == "" {
+			response.RequestID = request.RequestID
+		}
+		if response.ProtocolVersion == 0 {
+			response.ProtocolVersion = IngestProtocolVersion
+		}
+		if response.ErrorCodes == nil {
+			response.ErrorCodes = []ErrorCode{}
+		}
+	} else {
+		// Observe-only path when no binder is installed.
+		response = emptyIngestResponse(StatusOK, request.RequestID)
+	}
 	receiver.complete(request.RequestID, digest, response)
 	finalized = true
 	return response
@@ -280,11 +332,11 @@ func (receiver *IngestReceiver) accept(requestID string, digest [sha256.Size]byt
 			return emptyIngestResponse(StatusDuplicate, requestID, CodeRequestInProgress), AcceptedIngress{}, false
 		}
 		// Completed identical replay: return cached final result with duplicate status.
+		// Replay must not re-run binding or registry mutation.
 		cached := entry.response
 		cached.Status = StatusDuplicate
 		cached.RequestID = requestID
 		cached.ProtocolVersion = IngestProtocolVersion
-		cached.NoBindingPerformed = true
 		if cached.ErrorCodes == nil {
 			cached.ErrorCodes = []ErrorCode{}
 		}
@@ -314,6 +366,7 @@ func (receiver *IngestReceiver) accept(requestID string, digest [sha256.Size]byt
 		Tool:           payload.Tool,
 		HookSessionRef: payload.HookSessionRef,
 		Lifecycle:      payload.Lifecycle,
+		State:          payload.State,
 		ProducerEpoch:  receiver.epoch,
 		Revision:       revision,
 		ObservedAt:     observedAt,
@@ -340,12 +393,8 @@ func (receiver *IngestReceiver) complete(requestID string, digest [sha256.Size]b
 	defer receiver.mutex.Unlock()
 
 	now := canonicalTime(receiver.config.Clock.Now())
-	response = ensureIngestNoBinding(response)
-	response.ProtocolVersion = IngestProtocolVersion
+	response = normalizeIngestResponse(response)
 	response.RequestID = requestID
-	if response.ErrorCodes == nil {
-		response.ErrorCodes = []ErrorCode{}
-	}
 	response.ErrorCodes = sortedErrorCodes(response.ErrorCodes)
 
 	entry, exists := receiver.replay[requestID]
@@ -380,16 +429,18 @@ func (accepted AcceptedIngress) domain() instancecorrelation.HookObservation {
 }
 
 func canonicalIngressDigest(payload IngressPayload) ([sha256.Size]byte, error) {
-	// Canonical body equality is over the validated triple only, not raw JSON.
+	// Canonical body equality is over the validated allowlisted fields only.
 	type canonical struct {
 		Tool           instancepresence.ToolKind       `json:"tool"`
 		HookSessionRef instancepresence.OpaqueIdentity `json:"hook_session_ref"`
 		Lifecycle      instancecorrelation.Lifecycle   `json:"lifecycle"`
+		State          instancepresence.EffectiveState `json:"state,omitempty"`
 	}
 	data, err := json.Marshal(canonical{
 		Tool:           payload.Tool,
 		HookSessionRef: payload.HookSessionRef,
 		Lifecycle:      payload.Lifecycle,
+		State:          payload.State,
 	})
 	if err != nil {
 		return [sha256.Size]byte{}, err
@@ -410,12 +461,21 @@ func peekProtocolVersion(data []byte) (ProtocolVersion, error) {
 	return envelope.ProtocolVersion, nil
 }
 
-func ensureIngestNoBinding(response IngestResponse) IngestResponse {
-	response.NoBindingPerformed = true
+// normalizeIngestResponse fills protocol defaults without forcing the binding flag.
+// Fail-closed helpers (emptyIngestResponse) set NoBindingPerformed=true; successful
+// binders set it false explicitly.
+func normalizeIngestResponse(response IngestResponse) IngestResponse {
 	response.ProtocolVersion = IngestProtocolVersion
 	if response.ErrorCodes == nil {
 		response.ErrorCodes = []ErrorCode{}
 	}
+	return response
+}
+
+// ensureIngestNoBinding is retained for reject/error paths that must never bind.
+func ensureIngestNoBinding(response IngestResponse) IngestResponse {
+	response = normalizeIngestResponse(response)
+	response.NoBindingPerformed = true
 	return response
 }
 

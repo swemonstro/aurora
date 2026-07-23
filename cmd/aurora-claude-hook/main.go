@@ -36,10 +36,20 @@ func run(ctx context.Context, input io.Reader, getenv func(string) string) error
 	if err != nil {
 		return err
 	}
-	// Package 6 local ingress is fail-open and independent of v1 state/relay.
+
+	// When local multi-instance presence is enabled, this process delivers only
+	// to Package 6 ingress. claude-runtime is owned by the local server bridge;
+	// legacy claude-code session-store/relay publish is skipped so there is
+	// exactly one relay producer for runtime presence.
+	localEnabled := localhooktransport.LocalHookEnabled(getenv(localhooktransport.EnvLocalHookEnabled))
 	if ingress, ingressErr := claudehook.LocalIngressObservation(event); ingressErr == nil {
+		// Fail-open: transport errors must not block Claude.
 		localhooktransport.TryDeliverIngress(ctx, getenv, ingress)
 	}
+	if localEnabled {
+		return nil
+	}
+
 	stateConfig, err := claudehook.StateConfigFromEnv(getenv, os.UserHomeDir)
 	if err != nil {
 		return err

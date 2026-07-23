@@ -356,6 +356,13 @@ func newTestIngestReceiver(t *testing.T, clock Clock, config IngestServerConfig)
 }
 
 func testIngestRequest(id string, tool instancepresence.ToolKind, session string, lifecycle instancecorrelation.Lifecycle) IngestRequest {
+	state := instancepresence.StateWorking
+	switch lifecycle {
+	case instancecorrelation.LifecycleIdle:
+		state = instancepresence.StateIdle
+	case instancecorrelation.LifecycleEnded:
+		state = ""
+	}
 	return IngestRequest{
 		ProtocolVersion: IngestProtocolVersion,
 		Operation:       OperationIngestHookEvent,
@@ -364,6 +371,7 @@ func testIngestRequest(id string, tool instancepresence.ToolKind, session string
 			Tool:           tool,
 			HookSessionRef: instancepresence.OpaqueIdentity(session),
 			Lifecycle:      lifecycle,
+			State:          state,
 		},
 	}
 }

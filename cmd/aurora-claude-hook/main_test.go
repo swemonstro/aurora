@@ -383,7 +383,7 @@ func TestHookHelperProcess(t *testing.T) {
 	os.Exit(0)
 }
 
-func TestLocalIngressDeliveryEnabledReachesSocket(t *testing.T) {
+func TestLocalIngressEnabledReachesSocketWithZeroRelay(t *testing.T) {
 	requests := make(chan localhooktransport.IngestRequest, 1)
 	socketPath := startLocalIngestSocket(t, requests)
 
@@ -394,9 +394,10 @@ func TestLocalIngressDeliveryEnabledReachesSocket(t *testing.T) {
 	}))
 	defer server.Close()
 
+	stateFile := filepath.Join(t.TempDir(), "sessions.json")
 	values := map[string]string{
 		claudehook.RelayURLEnv:                 server.URL,
-		claudehook.StateFileEnv:                filepath.Join(t.TempDir(), "sessions.json"),
+		claudehook.StateFileEnv:                stateFile,
 		localhooktransport.EnvLocalHookEnabled: "1",
 		localhooktransport.EnvLocalHookSocket:  socketPath,
 	}
@@ -425,28 +426,41 @@ func TestLocalIngressDeliveryEnabledReachesSocket(t *testing.T) {
 		if request.Payload.Lifecycle != instancecorrelation.LifecycleActive {
 			t.Fatalf("lifecycle = %q, want %q", request.Payload.Lifecycle, instancecorrelation.LifecycleActive)
 		}
+		if request.Payload.State != instancepresence.StateWorking {
+			t.Fatalf("state = %q, want %q", request.Payload.State, instancepresence.StateWorking)
+		}
 	case <-time.After(time.Second):
 		t.Fatal("enabled local delivery did not reach socket")
 	}
 
 	select {
 	case <-relayHits:
-	case <-time.After(time.Second):
-		t.Fatal("relay did not receive publication")
+		t.Fatal("enabled local mode must not call relay")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if _, err := os.Stat(stateFile); err == nil {
+		t.Fatal("enabled local mode must not create legacy session store")
 	}
 }
 
-func TestLocalIngressDeliveryDisabledDoesNothing(t *testing.T) {
+func TestLocalIngressDisabledUsesLegacyRelay(t *testing.T) {
 	requests := make(chan localhooktransport.IngestRequest, 1)
 	socketPath := startLocalIngestSocket(t, requests)
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	relayHits := make(chan presence.Snapshot, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var snapshot presence.Snapshot
+		if err := json.NewDecoder(r.Body).Decode(&snapshot); err != nil {
+			t.Errorf("decode: %v", err)
+		}
+		relayHits <- snapshot
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
 
 	values := map[string]string{
 		claudehook.RelayURLEnv:                 server.URL,
+		claudehook.SourceEnv:                   "overridden-source",
 		claudehook.StateFileEnv:                filepath.Join(t.TempDir(), "sessions.json"),
 		localhooktransport.EnvLocalHookEnabled: "0",
 		localhooktransport.EnvLocalHookSocket:  socketPath,
@@ -464,9 +478,21 @@ func TestLocalIngressDeliveryDisabledDoesNothing(t *testing.T) {
 		t.Fatalf("disabled local delivery reached socket: %#v", request)
 	case <-time.After(150 * time.Millisecond):
 	}
+
+	select {
+	case snapshot := <-relayHits:
+		if snapshot.Source != "overridden-source" {
+			t.Fatalf("source = %q, want overridden-source", snapshot.Source)
+		}
+		if snapshot.State != status.Working {
+			t.Fatalf("state = %q, want working", snapshot.State)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("disabled local mode did not use legacy relay")
+	}
 }
 
-func TestLocalIngressUnavailableSocketDoesNotAffectRelay(t *testing.T) {
+func TestLocalIngressEnabledMissingSocketNoRelayNoError(t *testing.T) {
 	directory := secureTempDir(t)
 	socketPath := filepath.Join(directory, "missing.sock")
 
@@ -493,8 +519,52 @@ func TestLocalIngressUnavailableSocketDoesNotAffectRelay(t *testing.T) {
 
 	select {
 	case <-relayHits:
+		t.Fatal("enabled local mode with missing socket must not call relay")
+	case <-time.After(150 * time.Millisecond):
+	}
+}
+
+func TestLocalIngressSessionEndDoesNotRemoveClaudeCode(t *testing.T) {
+	requests := make(chan localhooktransport.IngestRequest, 1)
+	socketPath := startLocalIngestSocket(t, requests)
+
+	relayMethods := make(chan string, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		relayMethods <- r.Method
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	values := map[string]string{
+		claudehook.RelayURLEnv:                 server.URL,
+		claudehook.StateFileEnv:                filepath.Join(t.TempDir(), "sessions.json"),
+		localhooktransport.EnvLocalHookEnabled: "1",
+		localhooktransport.EnvLocalHookSocket:  socketPath,
+	}
+	if err := run(
+		context.Background(),
+		strings.NewReader(`{"hook_event_name":"SessionEnd","session_id":"session-a"}`),
+		func(key string) string { return values[key] },
+	); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	select {
+	case request := <-requests:
+		if request.Payload.Lifecycle != instancecorrelation.LifecycleEnded {
+			t.Fatalf("lifecycle = %q, want ended", request.Payload.Lifecycle)
+		}
+		if request.Payload.HookSessionRef != "session-a" {
+			t.Fatalf("session = %q", request.Payload.HookSessionRef)
+		}
 	case <-time.After(time.Second):
-		t.Fatal("relay publication failed when local socket was unavailable")
+		t.Fatal("SessionEnd was not delivered locally")
+	}
+
+	select {
+	case method := <-relayMethods:
+		t.Fatalf("local SessionEnd must not touch relay (got %s); claude-code must not be deleted", method)
+	case <-time.After(100 * time.Millisecond):
 	}
 }
 

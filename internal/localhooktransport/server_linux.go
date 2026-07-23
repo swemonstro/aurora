@@ -33,6 +33,7 @@ type Server struct {
 	ingest           *IngestReceiver
 	authenticator    Authenticator
 	logger           Logger
+	identityMu       sync.RWMutex
 	identityObserver IngestIdentityObserver
 	listener         *ownedListener
 	semaphore        chan struct{}
@@ -61,13 +62,19 @@ func NewServer(config Config, receiver *Receiver, authenticator Authenticator, l
 	}, nil
 }
 
-// EnableIngest attaches Package 6 observe-only ingress handling to this server.
+// EnableIngest attaches Package 6 ingress handling to this server.
 // Legacy v1 correlate_observation handling is unchanged.
 func (server *Server) EnableIngest(config IngestServerConfig) error {
+	return server.EnableIngestWithEpoch(config, "")
+}
+
+// EnableIngestWithEpoch attaches Package 6 ingress with a shared producer epoch
+// (for coordinated runtime registration + hook mutation).
+func (server *Server) EnableIngestWithEpoch(config IngestServerConfig, epoch instancepresence.ProducerEpoch) error {
 	if server == nil {
 		return errors.New("server must not be nil")
 	}
-	receiver, err := NewIngestReceiver(config)
+	receiver, err := NewIngestReceiverWithEpoch(config, epoch)
 	if err != nil {
 		return err
 	}
@@ -89,12 +96,19 @@ func (server *Server) SetIdentityObserver(observer IngestIdentityObserver) {
 	if server == nil {
 		return
 	}
+	server.identityMu.Lock()
 	server.identityObserver = observer
+	server.identityMu.Unlock()
 }
 
 // IdentityObserverEnabled reports whether a diagnostic observer is attached.
 func (server *Server) IdentityObserverEnabled() bool {
-	return server != nil && server.identityObserver != nil
+	if server == nil {
+		return false
+	}
+	server.identityMu.RLock()
+	defer server.identityMu.RUnlock()
+	return server.identityObserver != nil
 }
 
 func (server *Server) Serve(ctx context.Context) error {
@@ -151,7 +165,10 @@ func (server *Server) handleAuthenticated(connection *net.UnixConn, peer PeerIde
 	// while the hook helper is still expected to be alive. Connection-local only.
 	var peerCapture IdentityPeerCapture
 	var haveCapture bool
-	if server.identityObserver != nil {
+	server.identityMu.RLock()
+	observerEnabled := server.identityObserver != nil
+	server.identityMu.RUnlock()
+	if observerEnabled {
 		peerCapture = server.safeCapturePeer(peer)
 		haveCapture = true
 	}
@@ -194,7 +211,12 @@ func (server *Server) handleIngest(connection *net.UnixConn, data []byte, starte
 		return
 	}
 	handleCtx, cancel := context.WithTimeout(context.Background(), server.ingest.config.MaximumHandlingTime)
-	response := server.ingest.HandleJSON(handleCtx, data)
+	var response IngestResponse
+	if haveCapture {
+		response = server.ingest.HandleJSONWithCapture(handleCtx, data, peerCapture)
+	} else {
+		response = server.ingest.HandleJSON(handleCtx, data)
+	}
 	cancel()
 	_ = connection.SetWriteDeadline(server.config.Clock.Now().Add(server.config.WriteDeadline))
 	encoded, err := EncodeIngestResponseJSON(response, server.ingest.config.MaximumResponseBytes)
@@ -205,8 +227,7 @@ func (server *Server) handleIngest(connection *net.UnixConn, data []byte, starte
 	_ = writeFrame(connection, encoded, server.ingest.config.MaximumResponseBytes)
 	server.logIngestEvent(response, server.config.Clock.Now().Sub(started))
 
-	// Join uses the pre-captured ancestry + validated tool only. Never rewrite
-	// the Package 6 response on measurement failure or success.
+	// Diagnostic join after response. Never rewrite the Package 6 response.
 	if haveCapture {
 		tool, lifecycle, validated := ingestValidationFrom(data, response)
 		server.safeCompleteIngest(peerCapture, tool, lifecycle, validated)
@@ -241,18 +262,24 @@ func (server *Server) safeCapturePeer(peer PeerIdentity) (capture IdentityPeerCa
 			}
 		}
 	}()
-	if server.identityObserver == nil {
+	server.identityMu.RLock()
+	observer := server.identityObserver
+	server.identityMu.RUnlock()
+	if observer == nil {
 		return IdentityPeerCapture{}
 	}
-	return server.identityObserver.CapturePeer(peer)
+	return observer.CapturePeer(peer)
 }
 
 func (server *Server) safeCompleteIngest(capture IdentityPeerCapture, tool instancepresence.ToolKind, lifecycle instancecorrelation.Lifecycle, validated bool) {
 	defer func() { _ = recover() }()
-	if server.identityObserver == nil {
+	server.identityMu.RLock()
+	observer := server.identityObserver
+	server.identityMu.RUnlock()
+	if observer == nil {
 		return
 	}
-	server.identityObserver.CompleteIngest(capture, tool, lifecycle, validated)
+	observer.CompleteIngest(capture, tool, lifecycle, validated)
 }
 
 func (server *Server) writeIngestImmediate(connection *net.UnixConn, response IngestResponse) {

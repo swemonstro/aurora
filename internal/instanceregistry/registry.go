@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -213,6 +214,9 @@ func (registry *Registry) EndRuntime(id instancepresence.InstanceID, mutation pr
 	return registry.ApplyRuntimeMutation(id, mutation)
 }
 
+// ApplyHookMutation applies an explicit producer-owned HookRevision from a
+// presence v2 HookStateMutation. Callers that need local runtime-owned
+// sequencing (Package 6 binding) should use ApplyNextHookMutation instead.
 func (registry *Registry) ApplyHookMutation(id instancepresence.InstanceID, mutation presencev2.HookStateMutation) (instancepresence.Instance, error) {
 	if err := id.Validate(); err != nil {
 		return instancepresence.Instance{}, fmt.Errorf("hook mutation instance ID: %w", err)
@@ -253,16 +257,86 @@ func (registry *Registry) ApplyHookMutation(id instancepresence.InstanceID, muta
 		return instancepresence.Instance{}, domainError("hook mutation", id, ErrRuntimeEnded, "hook mutation cannot reactivate an ended runtime")
 	}
 
-	claim, err := instancepresence.ApplyHookState(mutation.State)
+	return registry.applyHookLocked(record, mutation.ProducerEpoch, mutation.HookRevision, mutation.State, mutation.ObservedAt, mutation.IdempotencyKey, now)
+}
+
+// ApplyNextHookMutation assigns the next HookRevision for a runtime instance
+// under the registry lock. HookRevision is owned and sequenced per InstanceID
+// by the registry; ingress/session stream revisions must not be supplied here.
+//
+// Idempotency: a repeated key with the same logical payload (epoch, state,
+// observedAt) returns the current instance without advancing revision. A key
+// reused with a different logical payload is ErrIdempotencyConflict.
+func (registry *Registry) ApplyNextHookMutation(
+	id instancepresence.InstanceID,
+	producerEpoch instancepresence.ProducerEpoch,
+	state instancepresence.EffectiveState,
+	observedAt time.Time,
+	idempotencyKey string,
+) (instancepresence.Instance, error) {
+	if err := id.Validate(); err != nil {
+		return instancepresence.Instance{}, fmt.Errorf("next hook mutation instance ID: %w", err)
+	}
+	if err := producerEpoch.Validate(); err != nil {
+		return instancepresence.Instance{}, fmt.Errorf("next hook mutation producer epoch: %w", err)
+	}
+	if _, err := instancepresence.ApplyHookState(state); err != nil {
+		return instancepresence.Instance{}, fmt.Errorf("next hook mutation state: %w", err)
+	}
+	if observedAt.IsZero() {
+		return instancepresence.Instance{}, fmt.Errorf("next hook mutation observation time must not be zero")
+	}
+	if strings.TrimSpace(idempotencyKey) == "" {
+		return instancepresence.Instance{}, fmt.Errorf("next hook mutation idempotency key must not be empty")
+	}
+	now, err := registry.now()
 	if err != nil {
 		return instancepresence.Instance{}, err
 	}
+
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	record, ok := registry.instances[id]
+	if !ok {
+		return instancepresence.Instance{}, domainError("next hook mutation", id, ErrNotFound, "")
+	}
+	if previous, seen := record.hookIdempotency[idempotencyKey]; seen {
+		if previous.ProducerEpoch == producerEpoch && previous.State == state && previous.ObservedAt.Equal(observedAt) {
+			return cloneInstance(record.instance), nil
+		}
+		return instancepresence.Instance{}, domainError("next hook mutation", id, ErrIdempotencyConflict, "idempotency key was reused with a different payload")
+	}
+	if producerEpoch != record.instance.Revisions.ProducerEpoch {
+		return instancepresence.Instance{}, domainError("next hook mutation", id, ErrEpochConflict, "producer epochs are not directly comparable")
+	}
+	if record.instance.Status == instancepresence.RuntimeEnded {
+		return instancepresence.Instance{}, domainError("next hook mutation", id, ErrRuntimeEnded, "hook mutation cannot reactivate an ended runtime")
+	}
+
+	next := record.instance.Revisions.HookRevision + 1
+	return registry.applyHookLocked(record, producerEpoch, next, state, observedAt, idempotencyKey, now)
+}
+
+func (registry *Registry) applyHookLocked(
+	record *record,
+	producerEpoch instancepresence.ProducerEpoch,
+	hookRevision instancepresence.HookRevision,
+	state instancepresence.EffectiveState,
+	observedAt time.Time,
+	idempotencyKey string,
+	now time.Time,
+) (instancepresence.Instance, error) {
+	claim, err := instancepresence.ApplyHookState(state)
+	if err != nil {
+		return instancepresence.Instance{}, err
+	}
+	payload := hookPayload{producerEpoch, hookRevision, state, observedAt}
 	previousState := record.instance.State
-	record.hookIdempotency[mutation.IdempotencyKey] = payload
+	record.hookIdempotency[idempotencyKey] = payload
 	record.hookPayload = payload
-	record.instance.Revisions.HookRevision = mutation.HookRevision
+	record.instance.Revisions.HookRevision = hookRevision
 	record.instance.HookClaim = claim
-	record.instance.State = mutation.State
+	record.instance.State = state
 	if record.instance.State != previousState {
 		record.instance.Lifecycle.StateChangedAt = now
 	}

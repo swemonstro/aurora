@@ -48,13 +48,20 @@ const (
 	CodeRevisionOverflow           ErrorCode = "revision_overflow"
 	CodeRequestInProgress          ErrorCode = "request_in_progress"
 	CodeHandlerTimeout             ErrorCode = "handler_timeout"
+	CodeNoUniqueRuntimeLink        ErrorCode = "no_unique_runtime_link"
+	CodeAmbiguousRuntimeLink       ErrorCode = "ambiguous_runtime_link"
+	CodeSessionBindingConflict     ErrorCode = "session_binding_conflict"
+	CodeRuntimeNotRegistered       ErrorCode = "runtime_not_registered"
+	CodeRegistryMutationFailed     ErrorCode = "registry_mutation_failed"
 )
 
 // IngressPayload is the allowlisted Package 6 wire payload.
+// State carries exact effective state for non-ended events and is omitted for ended.
 type IngressPayload struct {
 	Tool           instancepresence.ToolKind       `json:"tool"`
 	HookSessionRef instancepresence.OpaqueIdentity `json:"hook_session_ref"`
 	Lifecycle      instancecorrelation.Lifecycle   `json:"lifecycle"`
+	State          instancepresence.EffectiveState `json:"state,omitempty"`
 }
 
 // IngestRequest is the protocol version 2 local ingress request envelope.
@@ -202,6 +209,7 @@ func IngressPayloadFromObservation(ingress hookadapter.IngressObservation) (Ingr
 		Tool:           ingress.Tool,
 		HookSessionRef: ingress.HookSessionRef,
 		Lifecycle:      ingress.Lifecycle,
+		State:          ingress.EffectiveState,
 	}, nil
 }
 
@@ -306,6 +314,15 @@ func ValidateIngestRequest(config IngestClientConfig, request IngestRequest) err
 	if err := request.Payload.Lifecycle.Validate(); err != nil {
 		return protocolError(CodeInvalidIngress, err)
 	}
+	if request.Payload.Lifecycle == instancecorrelation.LifecycleEnded {
+		if request.Payload.State != "" {
+			return protocolError(CodeInvalidIngress, errors.New("ended ingress must not carry state"))
+		}
+		return nil
+	}
+	if err := request.Payload.State.Validate(); err != nil {
+		return protocolError(CodeInvalidIngress, fmt.Errorf("ingress state: %w", err))
+	}
 	return nil
 }
 
@@ -318,9 +335,8 @@ func ValidateIngestResponse(response IngestResponse, requestID string) error {
 	default:
 		return protocolError(CodeMalformedRequest, fmt.Errorf("unsupported response status"))
 	}
-	if !response.NoBindingPerformed {
-		return protocolError(CodeMalformedRequest, fmt.Errorf("response must report no binding"))
-	}
+	// NoBindingPerformed may be false only when a binding/mutation actually
+	// completed; fail-closed paths keep it true. Both are content-free.
 	if response.RequestID != "" && response.RequestID != requestID {
 		return protocolError(CodeInvalidRequestID, fmt.Errorf("response request ID mismatch"))
 	}
