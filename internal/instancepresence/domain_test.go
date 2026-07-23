@@ -112,6 +112,35 @@ func TestEndedRuntimeHasNoActiveInstance(t *testing.T) {
 	}
 }
 
+func TestSuspendedRuntimeIsActiveAndMapsToAttention(t *testing.T) {
+	if !RuntimeSuspended.Active() {
+		t.Fatal("suspended runtime must be active")
+	}
+	tests := []struct {
+		name  string
+		claim HookClaim
+		want  EffectiveState
+	}{
+		{name: "idle claim", claim: NoHookClaim, want: StateAttention},
+		{name: "working claim", claim: ClaimWorking, want: StateAttention},
+		{name: "attention claim", claim: ClaimAttention, want: StateAttention},
+		{name: "error claim wins", claim: ClaimError, want: StateError},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, active, err := Effective(RuntimeSuspended, test.claim)
+			if err != nil || !active || got != test.want {
+				t.Fatalf("Effective(suspended) = %q, %t, %v; want %q", got, active, err, test.want)
+			}
+		})
+	}
+	// Resume restores hook claim presentation.
+	got, active, err := Effective(RuntimeAlive, ClaimWorking)
+	if err != nil || !active || got != StateWorking {
+		t.Fatalf("Effective after resume = %q, %t, %v", got, active, err)
+	}
+}
+
 func TestPresentationStatesAreRejectedAsInstanceStates(t *testing.T) {
 	for _, state := range []EffectiveState{"sleeping", "offline"} {
 		if err := state.Validate(); err == nil {

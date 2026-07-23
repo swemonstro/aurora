@@ -45,6 +45,11 @@ type Registration struct {
 	RuntimeRevision instancepresence.RuntimeRevision
 	ObservedAt      time.Time
 	IdempotencyKey  string
+	// Status is the initial runtime status. Empty defaults to RuntimeAlive.
+	// Only RuntimeAlive and RuntimeSuspended are valid at registration so a
+	// newly discovered stopped process can open as attention without a
+	// temporary idle presentation.
+	Status instancepresence.RuntimeStatus
 }
 
 func (registration Registration) validate() error {
@@ -72,7 +77,19 @@ func (registration Registration) validate() error {
 	if strings.TrimSpace(registration.IdempotencyKey) == "" {
 		return errors.New("registration idempotency key must not be empty")
 	}
+	switch registration.Status {
+	case "", instancepresence.RuntimeAlive, instancepresence.RuntimeSuspended:
+	default:
+		return fmt.Errorf("registration status %q is not allowed", registration.Status)
+	}
 	return nil
+}
+
+func (registration Registration) initialStatus() instancepresence.RuntimeStatus {
+	if registration.Status == "" {
+		return instancepresence.RuntimeAlive
+	}
+	return registration.Status
 }
 
 // ExpiryResult reports deterministic lifecycle transitions performed by one

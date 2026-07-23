@@ -25,10 +25,32 @@ func TestParseProcStatRejectsMalformedInput(t *testing.T) {
 	for _, input := range []string{
 		"", "123 no-parentheses R 1 2 3", "123 (name R 1 2 3",
 		"not-a-pid (name) R 1 2 3", "123 (name) R too-few",
+		// Missing / invalid process state (field 3).
+		"123 (name)  1 2 3 4 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 100",
+		"123 (name) QQ 1 2 3 4 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 100",
+		"123 (name) 9 1 2 3 4 0 0 0 0 0 0 0 0 0 0 0 0 0 0 100",
 	} {
 		t.Run(input, func(t *testing.T) {
 			if _, err := parseProcStat([]byte(input)); !errors.Is(err, ErrMalformedStat) {
 				t.Fatalf("parseProcStat(%q) error = %v, want %v", input, err, ErrMalformedStat)
+			}
+		})
+	}
+}
+
+func TestParseProcStatReadsStoppedStates(t *testing.T) {
+	for _, state := range []string{"T", "t"} {
+		t.Run(state, func(t *testing.T) {
+			line := statLineWithState(77, "claude", state, 1, 1, 1, 0, 100)
+			got, err := parseProcStat([]byte(line))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.State != state[0] {
+				t.Fatalf("state = %q, want %q", got.State, state)
+			}
+			if !processStateStopped(got.State) {
+				t.Fatal("expected stopped state")
 			}
 		})
 	}
@@ -42,11 +64,15 @@ func TestStartedAtUsesBootBoundTicks(t *testing.T) {
 }
 
 func statLine(pid uint64, comm string, ppid, group, session uint64, tty int64, start uint64) string {
+	return statLineWithState(pid, comm, "R", ppid, group, session, tty, start)
+}
+
+func statLineWithState(pid uint64, comm, state string, ppid, group, session uint64, tty int64, start uint64) string {
 	fields := make([]string, 23)
 	for index := range fields {
 		fields[index] = "0"
 	}
-	fields[0] = "R"
+	fields[0] = state
 	fields[1] = strconv.FormatUint(ppid, 10)
 	fields[2] = strconv.FormatUint(group, 10)
 	fields[3] = strconv.FormatUint(session, 10)

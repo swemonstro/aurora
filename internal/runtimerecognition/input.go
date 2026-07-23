@@ -132,6 +132,10 @@ type ProcessObservation struct {
 	OSSession           instancepresence.OpaqueIdentity
 	TerminalFingerprint instancepresence.OpaqueIdentity
 	OwnerIdentity       instancepresence.OpaqueIdentity
+	// Suspended is true when the process is stopped (SIGTSTP/SIGSTOP or
+	// tracing). It is recognition-local only and never appears on public
+	// instancepresence process snapshots or presence wire formats.
+	Suspended bool
 }
 
 func (observation ProcessObservation) Validate() error {

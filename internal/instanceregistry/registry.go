@@ -98,10 +98,15 @@ func (registry *Registry) Register(registration Registration) (instancepresence.
 	if err != nil {
 		return instancepresence.Instance{}, fmt.Errorf("register slot: %w", err)
 	}
+	status := registration.initialStatus()
+	effective, active, err := instancepresence.Effective(status, instancepresence.NoHookClaim)
+	if err != nil || !active {
+		return instancepresence.Instance{}, fmt.Errorf("register effective state: %w", err)
+	}
 	instance := instancepresence.Instance{
 		ID: registration.InstanceID, Tool: registration.Tool, Source: registration.Source,
-		Runtime: registration.Runtime, Status: instancepresence.RuntimeAlive,
-		HookClaim: instancepresence.NoHookClaim, State: instancepresence.StateIdle,
+		Runtime: registration.Runtime, Status: status,
+		HookClaim: instancepresence.NoHookClaim, State: effective,
 		Slot: instancepresence.Slot{Namespace: registry.namespace, Index: index, AssignedAt: now},
 		Lifecycle: instancepresence.LifecycleTimestamps{
 			DiscoveredAt: now, LastSeenAt: now, LeaseExpiresAt: now.Add(registry.leaseDuration), StateChangedAt: now,
@@ -113,7 +118,7 @@ func (registry *Registry) Register(registration Registration) (instancepresence.
 	}
 	payload := runtimePayload{
 		ProducerEpoch: registration.ProducerEpoch, RuntimeRevision: registration.RuntimeRevision,
-		Status: instancepresence.RuntimeAlive, ObservedAt: registration.ObservedAt,
+		Status: status, ObservedAt: registration.ObservedAt,
 	}
 	registry.instances[instance.ID] = &record{
 		instance: instance, registration: registration, runtimePayload: payload,
@@ -197,9 +202,22 @@ func (registry *Registry) ApplyRuntimeMutation(id instancepresence.InstanceID, m
 	if mutation.Status == instancepresence.RuntimeEnded {
 		registry.endLocked(record, now)
 	} else {
+		previousState := record.instance.State
+		// Preserve HookClaim across alive/suspended transitions; recompute State.
 		record.instance.Status = mutation.Status
 		record.instance.Lifecycle.LastSeenAt = now
 		record.instance.Lifecycle.LeaseExpiresAt = now.Add(registry.leaseDuration)
+		effective, active, err := instancepresence.Effective(record.instance.Status, record.instance.HookClaim)
+		if err != nil {
+			return instancepresence.Instance{}, err
+		}
+		if !active {
+			return instancepresence.Instance{}, domainError("runtime mutation", id, ErrRuntimeEnded, "runtime status is not active")
+		}
+		record.instance.State = effective
+		if record.instance.State != previousState {
+			record.instance.Lifecycle.StateChangedAt = now
+		}
 	}
 	if err := record.instance.Validate(); err != nil {
 		panic(fmt.Sprintf("instanceregistry runtime invariant: %v", err))
@@ -330,13 +348,23 @@ func (registry *Registry) applyHookLocked(
 	if err != nil {
 		return instancepresence.Instance{}, err
 	}
+	// Persist the wire request state in the hook payload for idempotency, but
+	// derive Instance.State from RuntimeStatus + HookClaim so suspended
+	// processes present as attention while claims are preserved.
 	payload := hookPayload{producerEpoch, hookRevision, state, observedAt}
 	previousState := record.instance.State
 	record.hookIdempotency[idempotencyKey] = payload
 	record.hookPayload = payload
 	record.instance.Revisions.HookRevision = hookRevision
 	record.instance.HookClaim = claim
-	record.instance.State = state
+	effective, active, err := instancepresence.Effective(record.instance.Status, claim)
+	if err != nil {
+		return instancepresence.Instance{}, err
+	}
+	if !active {
+		return instancepresence.Instance{}, domainError("hook mutation", record.instance.ID, ErrRuntimeEnded, "runtime is not active")
+	}
+	record.instance.State = effective
 	if record.instance.State != previousState {
 		record.instance.Lifecycle.StateChangedAt = now
 	}

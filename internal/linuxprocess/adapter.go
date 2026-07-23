@@ -184,6 +184,8 @@ func (adapter *Adapter) Observe(ctx context.Context) (Sample, error) {
 			LaunchIdentities:   append([]instancepresence.OpaqueIdentity{}, record.launchIdentities...),
 			ProcessGroupOrJob:  observation.ProcessGroupOrJob, OSSession: observation.OSSession,
 			TerminalFingerprint: observation.TerminalFingerprint, OwnerIdentity: observation.OwnerIdentity,
+			// Suspended stays recognition-local; public ProcessObservation omits it.
+			Suspended: processStateStopped(record.stat.State),
 		})
 	}
 	snapshot := instancepresence.ProcessSnapshot{ObservedAt: observedAt, Processes: observations}

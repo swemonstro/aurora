@@ -94,13 +94,14 @@ type RuntimeStatus string
 
 const (
 	RuntimeAlive          RuntimeStatus = "alive"
+	RuntimeSuspended      RuntimeStatus = "suspended"
 	RuntimeSuspectMissing RuntimeStatus = "suspect_missing"
 	RuntimeEnded          RuntimeStatus = "ended"
 )
 
 func (status RuntimeStatus) Validate() error {
 	switch status {
-	case RuntimeAlive, RuntimeSuspectMissing, RuntimeEnded:
+	case RuntimeAlive, RuntimeSuspended, RuntimeSuspectMissing, RuntimeEnded:
 		return nil
 	default:
 		return fmt.Errorf("unsupported runtime status %q", status)
@@ -108,9 +109,9 @@ func (status RuntimeStatus) Validate() error {
 }
 
 // Active reports whether the runtime still belongs in the active canonical
-// snapshot. Suspect-missing remains active until its grace period ends.
+// snapshot. Suspended and suspect-missing remain active until they end.
 func (status RuntimeStatus) Active() bool {
-	return status == RuntimeAlive || status == RuntimeSuspectMissing
+	return status == RuntimeAlive || status == RuntimeSuspended || status == RuntimeSuspectMissing
 }
 
 type EffectiveState string
@@ -170,8 +171,18 @@ func ApplyHookState(state EffectiveState) (HookClaim, error) {
 	}
 }
 
-// Effective derives status from the process-owned idle base and optional hook
-// claim. The bool is false when the runtime is no longer active.
+// Effective derives presentation state from RuntimeStatus and HookClaim.
+// Priority for active runtimes:
+//
+//	hook error            -> error
+//	runtime suspended     -> attention
+//	hook attention        -> attention
+//	hook working          -> working
+//	no hook claim         -> idle
+//
+// Suspended never clears or overwrites HookClaim; callers keep the claim so
+// resume can restore working/attention/error once the process is alive again.
+// The bool is false when the runtime is no longer active (ended).
 func Effective(runtime RuntimeStatus, claim HookClaim) (EffectiveState, bool, error) {
 	if err := runtime.Validate(); err != nil {
 		return "", false, err
@@ -181,6 +192,12 @@ func Effective(runtime RuntimeStatus, claim HookClaim) (EffectiveState, bool, er
 	}
 	if !runtime.Active() {
 		return "", false, nil
+	}
+	if claim == ClaimError {
+		return StateError, true, nil
+	}
+	if runtime == RuntimeSuspended {
+		return StateAttention, true, nil
 	}
 	if claim == NoHookClaim {
 		return StateIdle, true, nil

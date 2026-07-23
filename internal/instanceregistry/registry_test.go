@@ -504,6 +504,85 @@ func TestConcurrentReadsAndMutations(t *testing.T) {
 	}
 }
 
+func TestRegistryAliveSuspendedAlivePreservesSlotAndHookClaim(t *testing.T) {
+	registry, clock := newTestRegistry(t)
+	mustRegister(t, registry, registration("instance-a", 101))
+	working, err := registry.ApplyHookMutation("instance-a", hookMutation(1, instancepresence.StateWorking, "hook-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	slot := working.Slot
+	if working.State != instancepresence.StateWorking || working.HookClaim != instancepresence.ClaimWorking {
+		t.Fatalf("working = %#v", working)
+	}
+
+	clock.Advance(time.Second)
+	suspended, err := registry.ApplyRuntimeMutation("instance-a", runtimeMutation(2, instancepresence.RuntimeSuspended, "suspend-2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if suspended.Status != instancepresence.RuntimeSuspended {
+		t.Fatalf("status = %q", suspended.Status)
+	}
+	if suspended.State != instancepresence.StateAttention {
+		t.Fatalf("suspended state = %q, want attention", suspended.State)
+	}
+	if suspended.HookClaim != instancepresence.ClaimWorking {
+		t.Fatalf("hook claim cleared on suspend: %q", suspended.HookClaim)
+	}
+	if suspended.Slot != slot {
+		t.Fatalf("slot changed: %#v vs %#v", suspended.Slot, slot)
+	}
+	if suspended.Revisions.HookRevision != 1 {
+		t.Fatalf("hook revision changed on suspend: %d", suspended.Revisions.HookRevision)
+	}
+
+	// Idle hook under suspend clears claim but effective state stays attention.
+	clock.Advance(time.Second)
+	idle, err := registry.ApplyHookMutation("instance-a", hookMutation(2, instancepresence.StateIdle, "hook-2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if idle.HookClaim != instancepresence.NoHookClaim {
+		t.Fatalf("claim = %q", idle.HookClaim)
+	}
+	if idle.State != instancepresence.StateAttention {
+		t.Fatalf("idle under suspend state = %q", idle.State)
+	}
+
+	clock.Advance(time.Second)
+	// Restore working claim then resume.
+	if _, err := registry.ApplyHookMutation("instance-a", hookMutation(3, instancepresence.StateWorking, "hook-3")); err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := registry.ApplyRuntimeMutation("instance-a", runtimeMutation(3, instancepresence.RuntimeAlive, "resume-3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resumed.Status != instancepresence.RuntimeAlive || resumed.State != instancepresence.StateWorking {
+		t.Fatalf("resumed = %#v", resumed)
+	}
+	if resumed.Slot != slot {
+		t.Fatalf("slot after resume = %#v", resumed.Slot)
+	}
+}
+
+func TestRegisterSuspendedStartsAsAttention(t *testing.T) {
+	registry, _ := newTestRegistry(t)
+	value := registration("instance-s", 202)
+	value.Status = instancepresence.RuntimeSuspended
+	inst, err := registry.Register(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inst.Status != instancepresence.RuntimeSuspended || inst.State != instancepresence.StateAttention {
+		t.Fatalf("register suspended = %#v", inst)
+	}
+	if inst.HookClaim != instancepresence.NoHookClaim {
+		t.Fatalf("claim = %q", inst.HookClaim)
+	}
+}
+
 func TestApplyNextHookMutationSequencesPerRuntime(t *testing.T) {
 	registry, _ := newTestRegistry(t)
 	mustRegister(t, registry, registration("instance-a", 101))

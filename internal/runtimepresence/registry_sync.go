@@ -53,6 +53,7 @@ func NewRegistrySync(
 
 // ApplyRecognition registers/renews secure families and ends missing ones.
 // Handles 0→1→2→1→0 without mixing instances (identity is host+boot+pid+start).
+// Recognized families map to RuntimeAlive or RuntimeSuspended from root stop state.
 func (sync *RegistrySync) ApplyRecognition(result runtimerecognition.Result, bootID instancepresence.BootIdentity) error {
 	now := sync.clock().UTC()
 	seen := make(map[instancepresence.InstanceID]struct{})
@@ -64,6 +65,10 @@ func (sync *RegistrySync) ApplyRecognition(result runtimerecognition.Result, boo
 			id = runtimerecognition.StableInstanceID(sync.hostID, bootID, candidate.Tool, candidate.Runtime.RootProcess)
 		}
 		seen[id] = struct{}{}
+		status := instancepresence.RuntimeAlive
+		if family.Suspended {
+			status = instancepresence.RuntimeSuspended
+		}
 		if _, known := sync.known[id]; !known {
 			registration := instanceregistry.Registration{
 				InstanceID: id, Tool: candidate.Tool, Source: sync.source,
@@ -72,11 +77,16 @@ func (sync *RegistrySync) ApplyRecognition(result runtimerecognition.Result, boo
 				},
 				ProducerEpoch: sync.producerEpoch, RuntimeRevision: 1, ObservedAt: now,
 				IdempotencyKey: fmt.Sprintf("runtime-register|%s|1", id),
+				Status:         status,
 			}
 			if _, err := sync.registry.Register(registration); err != nil {
 				// Exact retry of identical registration is OK; identity conflicts are hard errors.
 				if existing, getErr := sync.registry.Get(id); getErr == nil {
 					sync.known[id] = existing.Revisions.RuntimeRevision
+					// Still apply current observed status if registration already exists.
+					if renewErr := sync.renew(id, status, now); renewErr != nil {
+						return renewErr
+					}
 					continue
 				}
 				return fmt.Errorf("register %s: %w", id, err)
@@ -84,16 +94,9 @@ func (sync *RegistrySync) ApplyRecognition(result runtimerecognition.Result, boo
 			sync.known[id] = 1
 			continue
 		}
-		next := sync.known[id] + 1
-		mutation := presencev2.RuntimeMutation{
-			ProducerEpoch: sync.producerEpoch, RuntimeRevision: next,
-			Status: instancepresence.RuntimeAlive, ObservedAt: now,
-			IdempotencyKey: fmt.Sprintf("runtime-lease|%s|%d", id, next),
+		if err := sync.renew(id, status, now); err != nil {
+			return err
 		}
-		if _, err := sync.registry.ApplyRuntimeMutation(id, mutation); err != nil {
-			return fmt.Errorf("renew %s: %w", id, err)
-		}
-		sync.known[id] = next
 	}
 
 	for id, revision := range sync.known {
@@ -111,6 +114,20 @@ func (sync *RegistrySync) ApplyRecognition(result runtimerecognition.Result, boo
 		}
 		delete(sync.known, id)
 	}
+	return nil
+}
+
+func (sync *RegistrySync) renew(id instancepresence.InstanceID, status instancepresence.RuntimeStatus, now time.Time) error {
+	next := sync.known[id] + 1
+	mutation := presencev2.RuntimeMutation{
+		ProducerEpoch: sync.producerEpoch, RuntimeRevision: next,
+		Status: status, ObservedAt: now,
+		IdempotencyKey: fmt.Sprintf("runtime-lease|%s|%d|%s", id, next, status),
+	}
+	if _, err := sync.registry.ApplyRuntimeMutation(id, mutation); err != nil {
+		return fmt.Errorf("renew %s: %w", id, err)
+	}
+	sync.known[id] = next
 	return nil
 }
 

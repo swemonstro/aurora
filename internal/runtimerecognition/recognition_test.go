@@ -334,6 +334,151 @@ func fixtureSnapshot(launch, native string) runtimerecognition.Snapshot {
 	child := process(103, start.Add(2*time.Second), &nodeID, 102, native, native)
 	return runtimeSnapshot([]runtimerecognition.ProcessObservation{root, node, child})
 }
+func TestRecognizeSuspendedRootOnly(t *testing.T) {
+	// Agent-neutral: suspension is derived only from the recognized root's
+	// stop state (T/t), for every RuntimeRecognizer (Claude + Codex) — not
+	// from hook event mappers in claudehook/codexhook.
+	start := fixtureTime()
+	recognizers := []runtimerecognition.AgentRuntimeRecognizer{
+		claudehook.RuntimeRecognizer(), codexhook.RuntimeRecognizer(),
+	}
+	for _, test := range []struct {
+		name   string
+		tool   instancepresence.ToolKind
+		exe    string
+		native string
+		launch string
+		pid    uint64
+	}{
+		{name: "Claude", tool: instancepresence.ToolClaude, exe: "claude", native: "claude-native-worker", launch: "launch:anthropic-claude-code", pid: 201},
+		{name: "Codex", tool: instancepresence.ToolCodex, exe: "codex", native: "codex-linux-x86_64", launch: "launch:openai-codex", pid: 211},
+	} {
+		t.Run(test.name+"/root_stopped", func(t *testing.T) {
+			root := process(test.pid, start, nil, 0, test.exe, test.exe)
+			root.Suspended = true
+			result, err := runtimerecognition.Recognize(
+				runtimeSnapshot([]runtimerecognition.ProcessObservation{root}),
+				"host-a", recognizers...,
+			)
+			if err != nil || len(result.Families) != 1 {
+				t.Fatalf("result = %#v err=%v", result, err)
+			}
+			family := result.Families[0]
+			if family.Candidate.Tool != test.tool {
+				t.Fatalf("tool = %q, want %q", family.Candidate.Tool, test.tool)
+			}
+			if !family.Suspended {
+				t.Fatal("root T/t must suspend family")
+			}
+		})
+		t.Run(test.name+"/unrecognized_helper_stopped_only", func(t *testing.T) {
+			aliveRoot := process(test.pid+100, start, nil, 0, test.exe, test.exe)
+			aliveRootID := aliveRoot.Process
+			stoppedChild := process(test.pid+101, start.Add(time.Second), &aliveRootID, test.pid+100, "helper", "helper")
+			stoppedChild.Suspended = true
+			result, err := runtimerecognition.Recognize(
+				runtimeSnapshot([]runtimerecognition.ProcessObservation{aliveRoot, stoppedChild}),
+				"host-a", recognizers...,
+			)
+			if err != nil || len(result.Families) != 1 {
+				t.Fatalf("result = %#v err=%v", result, err)
+			}
+			family := result.Families[0]
+			if family.Candidate.Tool != test.tool {
+				t.Fatalf("tool = %q, want %q", family.Candidate.Tool, test.tool)
+			}
+			if family.Suspended {
+				t.Fatal("stopped helper child must not suspend family")
+			}
+			if family.Candidate.Runtime.RootProcess.PID != test.pid+100 {
+				t.Fatalf("root = %#v", family.Candidate.Runtime.RootProcess)
+			}
+		})
+		// Recognized multi-process family: only the root stop state matters.
+		// A stopped native member must not alone suspend Claude or Codex.
+		t.Run(test.name+"/recognized_member_stopped_only", func(t *testing.T) {
+			root := process(test.pid+200, start, nil, 1, "bash", "bash")
+			root.LaunchIdentities = []instancepresence.OpaqueIdentity{instancepresence.OpaqueIdentity(test.launch)}
+			rootID := root.Process
+			node := process(test.pid+201, start.Add(time.Second), &rootID, test.pid+200, "node", "node")
+			node.LaunchIdentities = []instancepresence.OpaqueIdentity{instancepresence.OpaqueIdentity(test.launch)}
+			nodeID := node.Process
+			native := process(test.pid+202, start.Add(2*time.Second), &nodeID, test.pid+201, test.native, test.native)
+			native.Suspended = true
+			result, err := runtimerecognition.Recognize(
+				runtimeSnapshot([]runtimerecognition.ProcessObservation{root, node, native}),
+				"host-a", recognizers...,
+			)
+			if err != nil || len(result.Families) != 1 {
+				t.Fatalf("result = %#v err=%v", result, err)
+			}
+			family := result.Families[0]
+			if family.Candidate.Tool != test.tool {
+				t.Fatalf("tool = %q, want %q", family.Candidate.Tool, test.tool)
+			}
+			if len(family.Candidate.Members) != 3 {
+				t.Fatalf("members = %#v", family.Candidate.Members)
+			}
+			if family.Suspended {
+				t.Fatal("stopped recognized member must not suspend family when root is alive")
+			}
+			if family.Candidate.Runtime.RootProcess.PID != test.pid+200 {
+				t.Fatalf("root = %#v", family.Candidate.Runtime.RootProcess)
+			}
+		})
+	}
+}
+
+func TestRecognizeSuspendedIndependenceClaudeAndCodex(t *testing.T) {
+	// Concurrent multi-agent: stopping Claude root must not suspend Codex, and vice versa.
+	start := fixtureTime()
+	recognizers := []runtimerecognition.AgentRuntimeRecognizer{
+		claudehook.RuntimeRecognizer(), codexhook.RuntimeRecognizer(),
+	}
+	claude := process(401, start, nil, 0, "claude", "claude")
+	codex := process(402, start.Add(time.Second), nil, 0, "codex", "codex")
+
+	claude.Suspended = true
+	codex.Suspended = false
+	result, err := runtimerecognition.Recognize(
+		runtimeSnapshot([]runtimerecognition.ProcessObservation{claude, codex}),
+		"host-a", recognizers...,
+	)
+	if err != nil || len(result.Families) != 2 {
+		t.Fatalf("result = %#v err=%v", result, err)
+	}
+	byTool := map[instancepresence.ToolKind]bool{}
+	for _, family := range result.Families {
+		byTool[family.Candidate.Tool] = family.Suspended
+	}
+	if !byTool[instancepresence.ToolClaude] {
+		t.Fatal("Claude root stopped must be suspended")
+	}
+	if byTool[instancepresence.ToolCodex] {
+		t.Fatal("Codex must stay non-suspended when only Claude root is stopped")
+	}
+
+	claude.Suspended = false
+	codex.Suspended = true
+	result, err = runtimerecognition.Recognize(
+		runtimeSnapshot([]runtimerecognition.ProcessObservation{claude, codex}),
+		"host-a", recognizers...,
+	)
+	if err != nil || len(result.Families) != 2 {
+		t.Fatalf("result = %#v err=%v", result, err)
+	}
+	byTool = map[instancepresence.ToolKind]bool{}
+	for _, family := range result.Families {
+		byTool[family.Candidate.Tool] = family.Suspended
+	}
+	if byTool[instancepresence.ToolClaude] {
+		t.Fatal("Claude must stay non-suspended when only Codex root is stopped")
+	}
+	if !byTool[instancepresence.ToolCodex] {
+		t.Fatal("Codex root stopped must be suspended")
+	}
+}
+
 func runtimeSnapshot(processes []runtimerecognition.ProcessObservation) runtimerecognition.Snapshot {
 	return runtimerecognition.Snapshot{ObservedAt: fixtureTime().Add(10 * time.Second), BootID: "boot-a", Processes: processes}
 }

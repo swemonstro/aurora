@@ -37,8 +37,12 @@ func parseProcStat(data []byte) (procStat, error) {
 		return procStat{}, fmt.Errorf("%w: empty comm", ErrMalformedStat)
 	}
 	fields := strings.Fields(line[close+1:])
-	if len(fields) < 20 || len(fields[0]) != 1 {
+	if len(fields) < 20 {
 		return procStat{}, fmt.Errorf("%w: insufficient fields", ErrMalformedStat)
+	}
+	// Field 3 is the single-character process state (R,S,D,T,t,Z,...).
+	if len(fields[0]) != 1 || !isValidProcState(fields[0][0]) {
+		return procStat{}, fmt.Errorf("%w: invalid process state", ErrMalformedStat)
 	}
 	parent, err := strconv.ParseUint(fields[1], 10, 64)
 	if err != nil {
@@ -86,4 +90,20 @@ func startedAt(bootTime time.Time, startTicks, clockTicks uint64) time.Time {
 	remainder := startTicks % clockTicks
 	nanoseconds := remainder * uint64(time.Second) / clockTicks
 	return bootTime.Add(time.Duration(seconds)*time.Second + time.Duration(nanoseconds)).UTC()
+}
+
+// isValidProcState accepts Linux /proc/[pid]/stat task states (field 3).
+func isValidProcState(state byte) bool {
+	switch state {
+	case 'R', 'S', 'D', 'T', 't', 'Z', 'X', 'x', 'K', 'W', 'P', 'I':
+		return true
+	default:
+		return false
+	}
+}
+
+// processStateStopped reports SIGTSTP/SIGSTOP stopped tasks (T) and
+// tracing-stopped tasks (t).
+func processStateStopped(state byte) bool {
+	return state == 'T' || state == 't'
 }

@@ -103,8 +103,13 @@ const (
 )
 
 type Family struct {
-	Candidate   instancepresence.RuntimeCandidate
-	Shape       string
+	Candidate instancepresence.RuntimeCandidate
+	Shape     string
+	// Suspended is true when the family's unique recognized root process is
+	// stopped (Linux T/t). Helper/member children alone never set this flag.
+	// The flag is agent-neutral: any RuntimeRecognizer (Claude, Codex, …)
+	// shares the same root-only rule; hook adapters do not participate.
+	Suspended   bool
 	ReasonCodes []ReasonCode
 }
 
@@ -418,7 +423,11 @@ func buildFamilies(hostID string, bootID instancepresence.BootIdentity, records 
 		if err := candidate.Validate(); err != nil {
 			return nil, nil, fmt.Errorf("validate runtime candidate: %w", err)
 		}
-		families = append(families, Family{Candidate: candidate, Shape: familyShape(roles), ReasonCodes: reasons})
+		families = append(families, Family{
+			Candidate: candidate, Shape: familyShape(roles), ReasonCodes: reasons,
+			// Only the unique root's stop state suspends the family.
+			Suspended: root.Suspended,
+		})
 	}
 	sort.Slice(families, func(first, second int) bool {
 		if families[first].Candidate.Tool != families[second].Candidate.Tool {

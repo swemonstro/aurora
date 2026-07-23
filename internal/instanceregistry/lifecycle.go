@@ -25,9 +25,16 @@ func (registry *Registry) ExpireLeases() (ExpiryResult, error) {
 	for id, record := range registry.instances {
 		instance := &record.instance
 		switch instance.Status {
-		case instancepresence.RuntimeAlive:
+		case instancepresence.RuntimeAlive, instancepresence.RuntimeSuspended:
 			if !now.Before(instance.Lifecycle.LeaseExpiresAt) {
 				instance.Status = instancepresence.RuntimeSuspectMissing
+				// Recompute effective state after lease-driven status change.
+				if effective, active, err := instancepresence.Effective(instance.Status, instance.HookClaim); err == nil && active {
+					if instance.State != effective {
+						instance.State = effective
+						instance.Lifecycle.StateChangedAt = now
+					}
+				}
 				suspect = append(suspect, transition{id, instance.Slot.Index})
 			}
 		case instancepresence.RuntimeSuspectMissing:
