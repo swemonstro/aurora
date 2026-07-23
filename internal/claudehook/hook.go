@@ -121,7 +121,10 @@ func ParseEvent(input []byte) (Event, error) {
 		}
 		return Event{}, fmt.Errorf("decode trailing Claude hook input: %w", err)
 	}
+	event.HookEventName = strings.TrimSpace(event.HookEventName)
 	event.SessionID = strings.TrimSpace(event.SessionID)
+	event.NotificationType = strings.TrimSpace(event.NotificationType)
+	event.ToolName = strings.TrimSpace(event.ToolName)
 	return event, nil
 }
 
@@ -167,6 +170,14 @@ func MapEvent(event Event) (EventAction, bool) {
 		return EventAction{State: status.Working}, true
 	case "PostToolUse":
 		return EventAction{State: status.Working}, true
+	case "PostToolUseFailure":
+		// Esc / decline on AskUserQuestion surfaces as PostToolUseFailure with
+		// terminal text "User declined to answer questions". Only that tool
+		// clears attention; other tool failures must not invent idle.
+		if event.ToolName == "AskUserQuestion" {
+			return EventAction{State: status.Idle}, true
+		}
+		return EventAction{}, false
 	case "Stop":
 		return EventAction{State: status.Idle}, true
 	case "StopFailure":

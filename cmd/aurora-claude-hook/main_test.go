@@ -606,7 +606,89 @@ func TestLocalIngressUnsupportedEventIsNotDelivered(t *testing.T) {
 	}
 }
 
+func TestLocalIngressAskUserQuestionDeclineClearsAttention(t *testing.T) {
+	requests := make(chan localhooktransport.IngestRequest, 4)
+	socketPath := startLocalIngestSocketN(t, requests, 4)
+
+	relayHits := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		relayHits <- struct{}{}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	values := map[string]string{
+		claudehook.RelayURLEnv:                 server.URL,
+		claudehook.StateFileEnv:                filepath.Join(t.TempDir(), "sessions.json"),
+		localhooktransport.EnvLocalHookEnabled: "1",
+		localhooktransport.EnvLocalHookSocket:  socketPath,
+	}
+	getenv := func(key string) string { return values[key] }
+
+	// Two parallel Claude sessions both ask the user.
+	for _, session := range []string{"session-a", "session-b"} {
+		payload := fmt.Sprintf(
+			`{"hook_event_name":"PreToolUse","session_id":%q,"tool_name":"AskUserQuestion"}`,
+			session,
+		)
+		if err := run(context.Background(), strings.NewReader(payload), getenv); err != nil {
+			t.Fatalf("attention %s: %v", session, err)
+		}
+	}
+	// Esc / decline only on session-a.
+	if err := run(
+		context.Background(),
+		strings.NewReader(`{"hook_event_name":"PostToolUseFailure","session_id":"session-a","tool_name":"AskUserQuestion"}`),
+		getenv,
+	); err != nil {
+		t.Fatalf("decline session-a: %v", err)
+	}
+	// Ordinary tool failure must not clear attention.
+	if err := run(
+		context.Background(),
+		strings.NewReader(`{"hook_event_name":"PostToolUseFailure","session_id":"session-b","tool_name":"Bash"}`),
+		getenv,
+	); err != nil {
+		t.Fatalf("bash failure session-b: %v", err)
+	}
+
+	got := map[string]instancepresence.EffectiveState{}
+	for i := 0; i < 3; i++ {
+		select {
+		case request := <-requests:
+			got[string(request.Payload.HookSessionRef)] = request.Payload.State
+			if request.Payload.Tool != instancepresence.ToolClaude {
+				t.Fatalf("tool = %q", request.Payload.Tool)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("missing local delivery %d; got %#v", i+1, got)
+		}
+	}
+	// Only three deliveries: A attention, B attention, A idle. Bash failure is dropped.
+	if got["session-a"] != instancepresence.StateIdle {
+		t.Fatalf("session-a final = %q, want idle; all=%#v", got["session-a"], got)
+	}
+	if got["session-b"] != instancepresence.StateAttention {
+		t.Fatalf("session-b final = %q, want attention; all=%#v", got["session-b"], got)
+	}
+	select {
+	case extra := <-requests:
+		t.Fatalf("unexpected extra delivery: %#v", extra)
+	case <-time.After(150 * time.Millisecond):
+	}
+	select {
+	case <-relayHits:
+		t.Fatal("local mode must not publish to legacy relay")
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
 func startLocalIngestSocket(t *testing.T, requests chan<- localhooktransport.IngestRequest) string {
+	t.Helper()
+	return startLocalIngestSocketN(t, requests, 1)
+}
+
+func startLocalIngestSocketN(t *testing.T, requests chan<- localhooktransport.IngestRequest, accepts int) string {
 	t.Helper()
 	directory := secureTempDir(t)
 	socketPath := filepath.Join(directory, "hook.sock")
@@ -624,51 +706,55 @@ func startLocalIngestSocket(t *testing.T, requests chan<- localhooktransport.Ing
 	})
 
 	go func() {
-		connection, acceptErr := listener.AcceptUnix()
-		if acceptErr != nil {
-			return
-		}
-		defer connection.Close()
-		_ = connection.SetDeadline(time.Now().Add(time.Second))
+		for i := 0; i < accepts; i++ {
+			connection, acceptErr := listener.AcceptUnix()
+			if acceptErr != nil {
+				return
+			}
+			func() {
+				defer connection.Close()
+				_ = connection.SetDeadline(time.Now().Add(2 * time.Second))
 
-		var header [4]byte
-		if _, err := io.ReadFull(connection, header[:]); err != nil {
-			return
-		}
-		size := binary.BigEndian.Uint32(header[:])
-		if size == 0 || size > localhooktransport.DefaultIngestMaximumRequestBytes {
-			return
-		}
-		payload := make([]byte, size)
-		if _, err := io.ReadFull(connection, payload); err != nil {
-			return
-		}
-		request, err := localhooktransport.DecodeIngestRequestJSON(payload)
-		if err != nil {
-			return
-		}
-		response := localhooktransport.IngestResponse{
-			ProtocolVersion:    localhooktransport.IngestProtocolVersion,
-			RequestID:          request.RequestID,
-			Status:             localhooktransport.StatusOK,
-			ErrorCodes:         []localhooktransport.ErrorCode{},
-			NoBindingPerformed: true,
-		}
-		encoded, err := localhooktransport.EncodeIngestResponseJSON(response, localhooktransport.DefaultIngestMaximumResponseBytes)
-		if err != nil {
-			return
-		}
-		var responseHeader [4]byte
-		binary.BigEndian.PutUint32(responseHeader[:], uint32(len(encoded)))
-		if _, err := connection.Write(responseHeader[:]); err != nil {
-			return
-		}
-		if _, err := connection.Write(encoded); err != nil {
-			return
-		}
-		select {
-		case requests <- request:
-		default:
+				var header [4]byte
+				if _, err := io.ReadFull(connection, header[:]); err != nil {
+					return
+				}
+				size := binary.BigEndian.Uint32(header[:])
+				if size == 0 || size > localhooktransport.DefaultIngestMaximumRequestBytes {
+					return
+				}
+				payload := make([]byte, size)
+				if _, err := io.ReadFull(connection, payload); err != nil {
+					return
+				}
+				request, err := localhooktransport.DecodeIngestRequestJSON(payload)
+				if err != nil {
+					return
+				}
+				response := localhooktransport.IngestResponse{
+					ProtocolVersion:    localhooktransport.IngestProtocolVersion,
+					RequestID:          request.RequestID,
+					Status:             localhooktransport.StatusOK,
+					ErrorCodes:         []localhooktransport.ErrorCode{},
+					NoBindingPerformed: true,
+				}
+				encoded, err := localhooktransport.EncodeIngestResponseJSON(response, localhooktransport.DefaultIngestMaximumResponseBytes)
+				if err != nil {
+					return
+				}
+				var responseHeader [4]byte
+				binary.BigEndian.PutUint32(responseHeader[:], uint32(len(encoded)))
+				if _, err := connection.Write(responseHeader[:]); err != nil {
+					return
+				}
+				if _, err := connection.Write(encoded); err != nil {
+					return
+				}
+				select {
+				case requests <- request:
+				default:
+				}
+			}()
 		}
 	}()
 	return socketPath

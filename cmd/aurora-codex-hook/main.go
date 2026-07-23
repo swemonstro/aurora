@@ -26,6 +26,10 @@ const hookTimeout = time.Second
 const transcriptPollInterval = 100 * time.Millisecond
 const lifecycleLockTimeout = 3 * time.Second
 
+// startPermissionWatcher launches the detached transcript watcher. Tests may
+// replace it to avoid re-execing the test binary.
+var startPermissionWatcher = startWatcherProcess
+
 func main() {
 	if len(os.Args) == 3 && os.Args[1] == "--session-end-file" {
 		_ = runSessionEndFile(
@@ -72,7 +76,9 @@ func run(
 		localhooktransport.TryDeliverIngress(ctx, getenv, ingress)
 	}
 	if localEnabled {
-		return nil
+		// Keep session-store + permission watchers so Esc/turn_aborted can
+		// clear attention via local ingress. Never publish to the legacy relay.
+		return trackLocalPermission(event, getenv)
 	}
 
 	config, err := codexhook.ConfigFromEnv(getenv, os.UserHomeDir)
@@ -106,7 +112,37 @@ func run(
 	}
 
 	if watch != nil {
-		return startWatcherProcess(*watch, getenv)
+		return startPermissionWatcher(*watch, getenv)
+	}
+	return nil
+}
+
+// trackLocalPermission updates the session store and starts transcript watchers
+// without any legacy relay publication. Permission cancel recovery then delivers
+// idle through the local Unix socket for the same session_id only.
+func trackLocalPermission(event codexhook.Event, getenv func(string) string) error {
+	config, err := codexhook.ConfigFromEnv(getenv, os.UserHomeDir)
+	if err != nil {
+		return err
+	}
+	store, err := codexhook.NewSessionStore(config.StatePath, config.TTL)
+	if err != nil {
+		return err
+	}
+	var watch *codexhook.PermissionWatch
+	err = sourcelifecycle.WithLock(config.StatePath, lifecycleLockTimeout, func() error {
+		update, supported, updateErr := store.UpdateLifecycle(event)
+		if updateErr != nil || !supported {
+			return updateErr
+		}
+		watch = update.Watch
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if watch != nil {
+		return startPermissionWatcher(*watch, getenv)
 	}
 	return nil
 }
@@ -220,7 +256,21 @@ func watchPermission(
 			return sourcelifecycle.WithLock(config.StatePath, lifecycleLockTimeout, func() error {
 				update, recovered, recoverErr := store.RecoverCancelled(watch)
 				if recoverErr != nil || !recovered {
+					// Stop (or another lifecycle event) already cleared this
+					// permission watch — do not emit a duplicate transition.
 					return recoverErr
+				}
+				if localhooktransport.LocalHookEnabled(getenv(localhooktransport.EnvLocalHookEnabled)) {
+					// Per-session idle only; never aggregate via legacy relay.
+					ingress, ingressErr := codexhook.LocalIngressObservation(codexhook.Event{
+						HookEventName: "Stop",
+						SessionID:     watch.SessionID,
+					})
+					if ingressErr != nil {
+						return ingressErr
+					}
+					localhooktransport.TryDeliverIngress(ctx, getenv, ingress)
+					return nil
 				}
 				return publishLifecycle(ctx, config, update)
 			})

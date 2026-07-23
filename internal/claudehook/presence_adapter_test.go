@@ -66,6 +66,29 @@ func TestLocalIngressObservationMapsClaudeWithoutMetadata(t *testing.T) {
 	}
 }
 
+func TestLocalIngressObservationAskUserQuestionCancelIsIdle(t *testing.T) {
+	attention, err := LocalIngressObservation(Event{
+		HookEventName: "PreToolUse", SessionID: "session-a", ToolName: "AskUserQuestion",
+	})
+	if err != nil || attention.EffectiveState != instancepresence.StateAttention || attention.HookSessionRef != "session-a" {
+		t.Fatalf("attention = %#v err=%v", attention, err)
+	}
+	idle, err := LocalIngressObservation(Event{
+		HookEventName: "PostToolUseFailure", SessionID: "session-a", ToolName: "AskUserQuestion",
+	})
+	if err != nil || idle.EffectiveState != instancepresence.StateIdle || idle.Lifecycle != instancecorrelation.LifecycleIdle {
+		t.Fatalf("decline idle = %#v err=%v", idle, err)
+	}
+	if idle.HookSessionRef != "session-a" {
+		t.Fatalf("session = %q, want session-a", idle.HookSessionRef)
+	}
+	if _, err := LocalIngressObservation(Event{
+		HookEventName: "PostToolUseFailure", SessionID: "session-a", ToolName: "Bash",
+	}); err == nil {
+		t.Fatal("Bash PostToolUseFailure must not produce local ingress")
+	}
+}
+
 func TestClaudeWrapperLaunchRulesExcludeNPMAndAllowNPX(t *testing.T) {
 	var rule runtimerecognition.LaunchIdentityRule
 	for _, candidate := range LaunchIdentityRules() {

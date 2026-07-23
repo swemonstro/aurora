@@ -20,6 +20,7 @@ func TestMapEvent(t *testing.T) {
 		{name: "missing notification type", event: Event{HookEventName: "Notification"}, state: status.Attention},
 		{name: "question begins", event: Event{HookEventName: "PreToolUse", ToolName: "AskUserQuestion"}, state: status.Attention},
 		{name: "question answered", event: Event{HookEventName: "PostToolUse", ToolName: "AskUserQuestion"}, state: status.Working},
+		{name: "question declined", event: Event{HookEventName: "PostToolUseFailure", ToolName: "AskUserQuestion"}, state: status.Idle},
 		{name: "stop", event: Event{HookEventName: "Stop"}, state: status.Idle},
 		{name: "failure", event: Event{HookEventName: "StopFailure"}, state: status.Error},
 		{name: "session end removes", event: Event{HookEventName: "SessionEnd"}, remove: true},
@@ -47,6 +48,27 @@ func TestMapEventMapsOrdinaryToolEventsToWorking(t *testing.T) {
 			})
 			if !supported || action.State != status.Working {
 				t.Fatalf("action = %#v supported=%t, want working", action, supported)
+			}
+		})
+	}
+}
+
+func TestMapEventPostToolUseFailureOnlyClearsAskUserQuestion(t *testing.T) {
+	action, supported := MapEvent(Event{
+		HookEventName: "PostToolUseFailure",
+		ToolName:      "AskUserQuestion",
+	})
+	if !supported || action.State != status.Idle || action.Remove {
+		t.Fatalf("AskUserQuestion failure = %#v supported=%t, want idle", action, supported)
+	}
+	for _, tool := range []string{"Bash", "Edit", "Read", ""} {
+		t.Run(tool, func(t *testing.T) {
+			action, supported := MapEvent(Event{
+				HookEventName: "PostToolUseFailure",
+				ToolName:      tool,
+			})
+			if supported {
+				t.Fatalf("PostToolUseFailure for %q must not map (got %#v)", tool, action)
 			}
 		})
 	}

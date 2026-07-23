@@ -40,6 +40,7 @@ func TestSessionEventSemantics(t *testing.T) {
 		{name: "other notification", event: Event{HookEventName: "Notification", SessionID: "a", NotificationType: "other"}, want: status.Attention},
 		{name: "question begins", event: Event{HookEventName: "PreToolUse", SessionID: "a", ToolName: "AskUserQuestion"}, want: status.Attention},
 		{name: "question answered", event: Event{HookEventName: "PostToolUse", SessionID: "a", ToolName: "AskUserQuestion"}, want: status.Working},
+		{name: "question declined", event: Event{HookEventName: "PostToolUseFailure", SessionID: "a", ToolName: "AskUserQuestion"}, want: status.Idle},
 		{name: "failure", event: Event{HookEventName: "StopFailure", SessionID: "a"}, want: status.Error},
 	}
 
@@ -85,6 +86,34 @@ func TestToolActivityClearsAttentionUntilNextQuestion(t *testing.T) {
 		ToolName:      "AskUserQuestion",
 	}); got != status.Attention {
 		t.Fatalf("aggregate at next question = %q, want attention", got)
+	}
+
+	if got := mustUpdate(t, store, Event{
+		HookEventName: "PostToolUseFailure",
+		SessionID:     "a",
+		ToolName:      "AskUserQuestion",
+	}); got != status.Idle {
+		t.Fatalf("aggregate after decline = %q, want idle", got)
+	}
+}
+
+func TestAskUserQuestionDeclineClearsOnlyThatSession(t *testing.T) {
+	store := newTestStore(t)
+	mustUpdate(t, store, Event{
+		HookEventName: "PreToolUse", SessionID: "session-a", ToolName: "AskUserQuestion",
+	})
+	mustUpdate(t, store, Event{
+		HookEventName: "PreToolUse", SessionID: "session-b", ToolName: "AskUserQuestion",
+	})
+	if got := mustUpdate(t, store, Event{
+		HookEventName: "PostToolUseFailure", SessionID: "session-a", ToolName: "AskUserQuestion",
+	}); got != status.Attention {
+		t.Fatalf("aggregate after A decline = %q, want attention (B still asking)", got)
+	}
+	if got := mustUpdate(t, store, Event{
+		HookEventName: "PostToolUseFailure", SessionID: "session-b", ToolName: "AskUserQuestion",
+	}); got != status.Idle {
+		t.Fatalf("aggregate after both declines = %q, want idle", got)
 	}
 }
 

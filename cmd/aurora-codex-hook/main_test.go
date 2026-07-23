@@ -2,7 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
+	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,6 +16,7 @@ import (
 	"time"
 
 	"github.com/swemonstro/aurora/internal/codexhook"
+	"github.com/swemonstro/aurora/internal/instancepresence"
 	"github.com/swemonstro/aurora/internal/localhooktransport"
 	"github.com/swemonstro/aurora/internal/presence"
 	"github.com/swemonstro/aurora/internal/relay"
@@ -650,11 +655,369 @@ func TestRunLocalIngressEnabledSkipsLegacyStateAndRelay(t *testing.T) {
 		t.Fatal("local mode published to the legacy relay")
 	case <-time.After(150 * time.Millisecond):
 	}
+	// Local mode may maintain session state for permission-watcher
+	// coordination, but must never publish the aggregate to the relay.
+}
 
-	if _, err := os.Stat(stateFile); !os.IsNotExist(err) {
-		t.Fatalf(
-			"local mode created legacy state file: %v",
-			err,
-		)
+func TestLocalPermissionCancelDeliversIdleToSocket(t *testing.T) {
+	defer stubPermissionWatcher(t)()
+
+	requests := make(chan localhooktransport.IngestRequest, 4)
+	socketPath := startCodexLocalIngestSocketN(t, requests, 4)
+
+	relayHits := make(chan struct{}, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		relayHits <- struct{}{}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	directory := t.TempDir()
+	statePath := filepath.Join(directory, "state.json")
+	transcriptA := filepath.Join(directory, "a.jsonl")
+	transcriptB := filepath.Join(directory, "b.jsonl")
+	if err := os.WriteFile(transcriptA, nil, 0o600); err != nil {
+		t.Fatal(err)
 	}
+	if err := os.WriteFile(transcriptB, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	watcherDir := filepath.Join(directory, "watchers")
+	values := map[string]string{
+		codexhook.RelayURLEnv:                  server.URL,
+		codexhook.SourceEnv:                    "codex-api",
+		codexhook.StateFileEnv:                 statePath,
+		codexhook.SessionTTLEnv:                "1h",
+		codexhook.WatcherFileEnv:               watcherDir,
+		localhooktransport.EnvLocalHookEnabled: "1",
+		localhooktransport.EnvLocalHookSocket:  socketPath,
+	}
+	getenv := func(key string) string { return values[key] }
+
+	// Two concurrent Codex sessions both wait for permission.
+	if err := run(context.Background(), strings.NewReader(fmt.Sprintf(
+		`{"hook_event_name":"PermissionRequest","session_id":"session-a","turn_id":"turn-a","transcript_path":%q}`,
+		transcriptA,
+	)), getenv); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(context.Background(), strings.NewReader(fmt.Sprintf(
+		`{"hook_event_name":"PermissionRequest","session_id":"session-b","turn_id":"turn-b","transcript_path":%q}`,
+		transcriptB,
+	)), getenv); err != nil {
+		t.Fatal(err)
+	}
+
+	// Drain permission attention deliveries.
+	for i := 0; i < 2; i++ {
+		select {
+		case req := <-requests:
+			if req.Payload.State != instancepresence.StateAttention {
+				t.Fatalf("permission delivery %d = %#v", i+1, req.Payload)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("missing permission attention %d", i+1)
+		}
+	}
+
+	store, err := codexhook.NewSessionStore(statePath, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	watchA := mustPermissionWatch(t, statePath, "session-a", "turn-a", transcriptA)
+
+	// Esc / turn_aborted only for session-a.
+	if err := os.WriteFile(transcriptA, []byte(
+		`{"type":"event_msg","payload":{"type":"turn_aborted","turn_id":"turn-a"}}`+"\n",
+	), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := watchPermission(context.Background(), watchA, getenv); err != nil {
+		t.Fatalf("watchPermission A: %v", err)
+	}
+
+	select {
+	case req := <-requests:
+		if req.Payload.HookSessionRef != "session-a" {
+			t.Fatalf("cancel session = %q, want session-a", req.Payload.HookSessionRef)
+		}
+		if req.Payload.State != instancepresence.StateIdle {
+			t.Fatalf("cancel state = %q, want idle", req.Payload.State)
+		}
+		if req.Payload.Tool != instancepresence.ToolCodex {
+			t.Fatalf("tool = %q", req.Payload.Tool)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("local idle not delivered after transcript cancel")
+	}
+
+	// Session B remains pending (attention) — no spurious idle for B.
+	select {
+	case extra := <-requests:
+		t.Fatalf("unexpected extra delivery (session-b must stay untouched): %#v", extra)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	pendingB, err := store.PermissionPending(mustPermissionWatch(t, statePath, "session-b", "turn-b", transcriptB))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !pendingB {
+		t.Fatal("session-b permission must still be pending after A cancel")
+	}
+
+	select {
+	case <-relayHits:
+		t.Fatal("local mode must not publish cancel recovery to legacy relay")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	entries, err := os.ReadDir(watcherDir)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("watcher registration leaked: %#v", entries)
+	}
+}
+
+func TestLocalPermissionStopBeforeRecoverySkipsDuplicateIdle(t *testing.T) {
+	defer stubPermissionWatcher(t)()
+
+	requests := make(chan localhooktransport.IngestRequest, 4)
+	socketPath := startCodexLocalIngestSocketN(t, requests, 4)
+
+	directory := t.TempDir()
+	statePath := filepath.Join(directory, "state.json")
+	transcriptPath := filepath.Join(directory, "transcript.jsonl")
+	if err := os.WriteFile(transcriptPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	values := map[string]string{
+		codexhook.RelayURLEnv:                  "http://127.0.0.1:1",
+		codexhook.StateFileEnv:                 statePath,
+		codexhook.SessionTTLEnv:                "1h",
+		codexhook.WatcherFileEnv:               filepath.Join(directory, "watchers"),
+		localhooktransport.EnvLocalHookEnabled: "1",
+		localhooktransport.EnvLocalHookSocket:  socketPath,
+	}
+	getenv := func(key string) string { return values[key] }
+
+	if err := run(context.Background(), strings.NewReader(fmt.Sprintf(
+		`{"hook_event_name":"PermissionRequest","session_id":"session-a","turn_id":"turn-a","transcript_path":%q}`,
+		transcriptPath,
+	)), getenv); err != nil {
+		t.Fatal(err)
+	}
+	watch := mustPermissionWatch(t, statePath, "session-a", "turn-a", transcriptPath)
+
+	// Normal Stop restores the session before transcript recovery runs.
+	if err := run(context.Background(), strings.NewReader(
+		`{"hook_event_name":"Stop","session_id":"session-a"}`,
+	), getenv); err != nil {
+		t.Fatal(err)
+	}
+
+	// Drain attention + stop idle from the socket.
+	for i := 0; i < 2; i++ {
+		select {
+		case <-requests:
+		case <-time.After(time.Second):
+			t.Fatalf("missing delivery %d", i+1)
+		}
+	}
+
+	if err := os.WriteFile(transcriptPath, []byte(
+		`{"type":"event_msg","payload":{"type":"turn_aborted","turn_id":"turn-a"}}`+"\n",
+	), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := watchPermission(context.Background(), watch, getenv); err != nil {
+		t.Fatalf("watchPermission after Stop: %v", err)
+	}
+	select {
+	case extra := <-requests:
+		t.Fatalf("recovery must not deliver duplicate idle after Stop: %#v", extra)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func TestLocalPermissionApprovedFollowsWorkingIdle(t *testing.T) {
+	defer stubPermissionWatcher(t)()
+
+	requests := make(chan localhooktransport.IngestRequest, 4)
+	socketPath := startCodexLocalIngestSocketN(t, requests, 4)
+
+	directory := t.TempDir()
+	statePath := filepath.Join(directory, "state.json")
+	transcriptPath := filepath.Join(directory, "transcript.jsonl")
+	if err := os.WriteFile(transcriptPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	values := map[string]string{
+		codexhook.StateFileEnv:                 statePath,
+		codexhook.SessionTTLEnv:                "1h",
+		codexhook.WatcherFileEnv:               filepath.Join(directory, "watchers"),
+		localhooktransport.EnvLocalHookEnabled: "1",
+		localhooktransport.EnvLocalHookSocket:  socketPath,
+	}
+	getenv := func(key string) string { return values[key] }
+
+	steps := []struct {
+		payload string
+		want    instancepresence.EffectiveState
+	}{
+		{
+			payload: fmt.Sprintf(
+				`{"hook_event_name":"PermissionRequest","session_id":"session-a","turn_id":"turn-a","transcript_path":%q}`,
+				transcriptPath,
+			),
+			want: instancepresence.StateAttention,
+		},
+		{
+			payload: `{"hook_event_name":"PreToolUse","session_id":"session-a","tool_name":"Bash"}`,
+			want:    instancepresence.StateWorking,
+		},
+		{
+			payload: `{"hook_event_name":"Stop","session_id":"session-a"}`,
+			want:    instancepresence.StateIdle,
+		},
+	}
+	for _, step := range steps {
+		if err := run(context.Background(), strings.NewReader(step.payload), getenv); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case req := <-requests:
+			if req.Payload.State != step.want || req.Payload.HookSessionRef != "session-a" {
+				t.Fatalf("got %#v, want state=%q session-a", req.Payload, step.want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("missing delivery for %s", step.want)
+		}
+	}
+}
+
+func stubPermissionWatcher(t *testing.T) func() {
+	t.Helper()
+	previous := startPermissionWatcher
+	startPermissionWatcher = func(codexhook.PermissionWatch, func(string) string) error {
+		return nil
+	}
+	return func() { startPermissionWatcher = previous }
+}
+
+func mustPermissionWatch(
+	t *testing.T,
+	statePath, sessionID, turnID, transcriptPath string,
+) codexhook.PermissionWatch {
+	t.Helper()
+	// Rebuild watch identity from the live session store entry.
+	store, err := codexhook.NewSessionStore(statePath, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Probe revisions 1..32 until PermissionPending matches (stable in tests).
+	for revision := uint64(1); revision <= 32; revision++ {
+		watch := codexhook.PermissionWatch{
+			SessionID:        sessionID,
+			TurnID:           turnID,
+			TranscriptPath:   transcriptPath,
+			TranscriptOffset: 0,
+			Revision:         revision,
+		}
+		pending, err := store.PermissionPending(watch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pending {
+			return watch
+		}
+	}
+	t.Fatalf("no pending permission for session %s", sessionID)
+	return codexhook.PermissionWatch{}
+}
+
+func startCodexLocalIngestSocketN(t *testing.T, requests chan<- localhooktransport.IngestRequest, accepts int) string {
+	t.Helper()
+	// Package 6 rejects sockets under world-writable /tmp; use $HOME.
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory, err := os.MkdirTemp(home, "aurora-codex-hook-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(directory) })
+	if err := os.Chmod(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	socketPath := filepath.Join(directory, "hook.sock")
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: socketPath, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(socketPath, 0o600); err != nil {
+		listener.Close()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = listener.Close()
+		_ = os.Remove(socketPath)
+	})
+	go func() {
+		for i := 0; i < accepts; i++ {
+			connection, acceptErr := listener.AcceptUnix()
+			if acceptErr != nil {
+				return
+			}
+			func() {
+				defer connection.Close()
+				_ = connection.SetDeadline(time.Now().Add(2 * time.Second))
+				var header [4]byte
+				if _, err := io.ReadFull(connection, header[:]); err != nil {
+					return
+				}
+				size := binary.BigEndian.Uint32(header[:])
+				if size == 0 || size > localhooktransport.DefaultIngestMaximumRequestBytes {
+					return
+				}
+				payload := make([]byte, size)
+				if _, err := io.ReadFull(connection, payload); err != nil {
+					return
+				}
+				request, err := localhooktransport.DecodeIngestRequestJSON(payload)
+				if err != nil {
+					return
+				}
+				response := localhooktransport.IngestResponse{
+					ProtocolVersion:    localhooktransport.IngestProtocolVersion,
+					RequestID:          request.RequestID,
+					Status:             localhooktransport.StatusOK,
+					ErrorCodes:         []localhooktransport.ErrorCode{},
+					NoBindingPerformed: true,
+				}
+				encoded, err := localhooktransport.EncodeIngestResponseJSON(
+					response, localhooktransport.DefaultIngestMaximumResponseBytes,
+				)
+				if err != nil {
+					return
+				}
+				var responseHeader [4]byte
+				binary.BigEndian.PutUint32(responseHeader[:], uint32(len(encoded)))
+				if _, err := connection.Write(responseHeader[:]); err != nil {
+					return
+				}
+				if _, err := connection.Write(encoded); err != nil {
+					return
+				}
+				select {
+				case requests <- request:
+				default:
+				}
+			}()
+		}
+	}()
+	return socketPath
 }
