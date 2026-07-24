@@ -386,6 +386,183 @@ func writeFixtureFile(t *testing.T, root, name, contents string) {
 	}
 }
 
+func TestParseCmdlineArgvStructuralClassification(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		argv []string
+		want []string
+	}{
+		{name: "bare", argv: []string{"/usr/bin/codex"}, want: []string{"codex"}},
+		{name: "help long", argv: []string{"codex", "--help"}, want: []string{"codex", "help"}},
+		{name: "help short", argv: []string{"codex", "-h"}, want: []string{"codex", "help"}},
+		{name: "version long", argv: []string{"codex", "--version"}, want: []string{"codex", "version"}},
+		{name: "version short", argv: []string{"codex", "-V"}, want: []string{"codex", "version"}},
+		{name: "app", argv: []string{"codex", "app"}, want: []string{"codex", "app"}},
+		{name: "profile then exec", argv: []string{"codex", "--profile", "business", "exec", "ls"}, want: []string{"codex", "exec"}},
+		{name: "config flag then login", argv: []string{"codex", "-c", "key=value", "login"}, want: []string{"codex", "login"}},
+		{name: "model only", argv: []string{"codex", "--model", "gpt"}, want: []string{"codex"}},
+		{name: "model and free prompt", argv: []string{"codex", "--model", "gpt", "hemlig prompt"}, want: []string{"codex"}},
+		{name: "exec", argv: []string{"codex", "exec", "ls"}, want: []string{"codex", "exec"}},
+		{name: "login", argv: []string{"codex", "login"}, want: []string{"codex", "login"}},
+		{name: "config", argv: []string{"codex", "config"}, want: []string{"codex", "config"}},
+		{name: "status", argv: []string{"codex", "status"}, want: []string{"codex", "status"}},
+		{name: "resume", argv: []string{"codex", "resume", "sess-id"}, want: []string{"codex", "resume"}},
+		{
+			name: "node package wrapper exec",
+			argv: []string{"node", "/opt/node_modules/@openai/codex/bin/codex.js", "exec", "ls"},
+			want: []string{"codex", "exec"},
+		},
+		{
+			name: "node package wrapper interactive",
+			argv: []string{"node", "/opt/node_modules/@openai/codex/bin/codex.js"},
+			want: []string{"codex"},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := parseCmdlineArgv([]byte(joinCmdline(test.argv)), maxRecognitionArgv)
+			if !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("parseCmdlineArgv(%q) = %#v, want %#v", test.argv, got, test.want)
+			}
+			joined := strings.Join(got, " ")
+			if strings.Contains(joined, "hemlig") || strings.Contains(joined, "business") ||
+				strings.Contains(joined, "gpt") || strings.Contains(joined, "key=value") ||
+				strings.Contains(joined, "sess-id") || strings.Contains(joined, "/opt/") ||
+				strings.Contains(joined, "node_modules") {
+				t.Fatalf("sensitive path or free-form token retained: %#v", got)
+			}
+		})
+	}
+}
+
+func TestAdapterObserveWorkingDirectoryAndCodexHome(t *testing.T) {
+	root := newProcFixture(t)
+	cwdTarget := filepath.Join(t.TempDir(), "project")
+	if err := os.MkdirAll(cwdTarget, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeProcessFixture(t, root, 101, "codex", 1, 101, 10, 0, 250, []string{"/usr/bin/codex"})
+	if err := os.Symlink(cwdTarget, filepath.Join(root, "101", "cwd")); err != nil {
+		t.Fatal(err)
+	}
+	environ := "CODEX_HOME=/tmp/codex-profile\x00OPENAI_API_KEY=extremely-secret\x00OTHER_TOKEN=also-secret\x00"
+	writeFixtureFile(t, root, "101/environ", environ)
+
+	adapter, err := New(Config{
+		ProcRoot: root, HostID: "host-a", BootID: "boot-a",
+		Clock: fixedClock{now: time.Date(2026, 7, 22, 10, 0, 0, 0, time.UTC)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sample, err := adapter.Observe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sample.Recognition.Processes) != 1 {
+		t.Fatalf("processes = %#v", sample.Recognition.Processes)
+	}
+	rec := sample.Recognition.Processes[0]
+	if rec.WorkingDirectory != filepath.Clean(cwdTarget) {
+		t.Fatalf("WorkingDirectory = %q, want %q", rec.WorkingDirectory, cwdTarget)
+	}
+	if rec.EnvCodexHome != "/tmp/codex-profile" {
+		t.Fatalf("EnvCodexHome = %q", rec.EnvCodexHome)
+	}
+	// Public snapshot must not carry recognition-local trust fields.
+	pubDump := fmt.Sprintf("%#v", sample.Snapshot)
+	if strings.Contains(pubDump, "WorkingDirectory") || strings.Contains(pubDump, "EnvCodexHome") ||
+		strings.Contains(pubDump, "extremely-secret") || strings.Contains(pubDump, "also-secret") ||
+		strings.Contains(pubDump, cwdTarget) {
+		t.Fatalf("public snapshot leaked recognition-local data: %s", pubDump)
+	}
+	recDump := fmt.Sprintf("%#v", rec)
+	if strings.Contains(recDump, "extremely-secret") || strings.Contains(recDump, "also-secret") ||
+		strings.Contains(recDump, "OPENAI_API_KEY") || strings.Contains(recDump, "OTHER_TOKEN") {
+		t.Fatalf("secrets retained in recognition observation: %s", recDump)
+	}
+}
+
+func TestAdapterCodexHomeRejectionAndMissing(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		environ string
+		want    string
+	}{
+		{name: "missing", environ: "PATH=/usr/bin\x00", want: ""},
+		{name: "empty", environ: "CODEX_HOME=\x00", want: ""},
+		{name: "relative", environ: "CODEX_HOME=relative/home\x00", want: ""},
+		{name: "absolute", environ: "CODEX_HOME=/var/codex/home\x00", want: "/var/codex/home"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := newProcFixture(t)
+			writeProcessFixture(t, root, 101, "codex", 1, 101, 10, 0, 250, []string{"codex"})
+			writeFixtureFile(t, root, "101/environ", test.environ)
+			adapter, err := New(Config{
+				ProcRoot: root, HostID: "host-a", BootID: "boot-a",
+				Clock: fixedClock{now: time.Date(2026, 7, 22, 10, 0, 0, 0, time.UTC)},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			sample, err := adapter.Observe(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := sample.Recognition.Processes[0].EnvCodexHome; got != test.want {
+				t.Fatalf("EnvCodexHome = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestRootReaderReadLinkCwd(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "101"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "workdir")
+	if err := os.MkdirAll(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(root, "101", "cwd")); err != nil {
+		t.Fatal(err)
+	}
+	reader := openTestRootReader(t, root)
+	got, err := reader.ReadLink("101/cwd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != target {
+		t.Fatalf("ReadLink = %q, want %q", got, target)
+	}
+	// Absolute / traversing proc-relative names are rejected.
+	if _, err := reader.ReadLink("/101/cwd"); !errors.Is(err, ErrUnsafeProcEntry) {
+		t.Fatalf("absolute path error = %v", err)
+	}
+	if _, err := reader.ReadLink("../101/cwd"); !errors.Is(err, ErrUnsafeProcEntry) {
+		t.Fatalf("traversal error = %v", err)
+	}
+}
+
+func TestRootReaderReadLinkRejectsSymlinkPIDDirectory(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	if err := os.Symlink(filepath.Join(t.TempDir(), "cwd-target"), filepath.Join(outside, "cwd")); err != nil {
+		// Create a normal target for the outer fake pid dir.
+		_ = os.MkdirAll(outside, 0o755)
+		if err := os.Symlink(t.TempDir(), filepath.Join(outside, "cwd")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "101")); err != nil {
+		t.Fatal(err)
+	}
+	reader := openTestRootReader(t, root)
+	if _, err := reader.ReadLink("101/cwd"); !errors.Is(err, ErrUnsafeProcEntry) {
+		t.Fatalf("ReadLink via symlink PID dir error = %v, want %v", err, ErrUnsafeProcEntry)
+	}
+}
+
 func joinCmdline(arguments []string) string {
 	value := ""
 	for _, argument := range arguments {

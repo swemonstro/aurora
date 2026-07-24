@@ -17,12 +17,14 @@ import (
 )
 
 const (
-	defaultClockTicks = 100
-	statReadLimit     = 16 * 1024
-	commReadLimit     = 256
-	cmdlineReadLimit  = 1024
-	statusReadLimit   = 16 * 1024
-	bootIDReadLimit   = 256
+	defaultClockTicks  = 100
+	statReadLimit      = 16 * 1024
+	commReadLimit      = 256
+	cmdlineReadLimit   = 1024
+	statusReadLimit    = 16 * 1024
+	environReadLimit   = 64 * 1024
+	bootIDReadLimit    = 256
+	maxRecognitionArgv = 16
 )
 
 type readerFactory func() (procReader, error)
@@ -185,7 +187,10 @@ func (adapter *Adapter) Observe(ctx context.Context) (Sample, error) {
 			ProcessGroupOrJob:  observation.ProcessGroupOrJob, OSSession: observation.OSSession,
 			TerminalFingerprint: observation.TerminalFingerprint, OwnerIdentity: observation.OwnerIdentity,
 			// Suspended stays recognition-local; public ProcessObservation omits it.
-			Suspended: processStateStopped(record.stat.State),
+			Suspended:        processStateStopped(record.stat.State),
+			WorkingDirectory: record.workingDirectory,
+			EnvCodexHome:     record.envCodexHome,
+			Argv:             append([]string{}, record.argv...),
 		})
 	}
 	snapshot := instancepresence.ProcessSnapshot{ObservedAt: observedAt, Processes: observations}
@@ -246,6 +251,9 @@ type rawProcess struct {
 	argvBase         string
 	launchIdentities []instancepresence.OpaqueIdentity
 	ownerIdentity    string
+	workingDirectory string
+	envCodexHome     string
+	argv             []string
 }
 
 type readOutcome struct {
@@ -299,6 +307,9 @@ func readProcess(reader procReader, pid uint64, bootTime time.Time, clockTicks u
 		return rawProcess{}, outcome
 	}
 	launchIdentities := launchIdentities(argvData, rules)
+	argv := parseCmdlineArgv(argvData, maxRecognitionArgv)
+	cwd := optionalReadLink(reader, path.Join(directory, "cwd"), outcome.counts)
+	codexHome := codexHomeFromEnviron(optionalBytes(reader, path.Join(directory, "environ"), environReadLimit, outcome.counts))
 	outcome.accepted = true
 	return rawProcess{
 		stat: final,
@@ -306,7 +317,177 @@ func readProcess(reader procReader, pid uint64, bootTime time.Time, clockTicks u
 			PID: pid, StartedAt: startedAt(bootTime, final.StartTicks, clockTicks),
 		},
 		commBase: comm, argvBase: safeExecutableName(launchExecutable(argvData)), launchIdentities: launchIdentities, ownerIdentity: owner,
+		workingDirectory: cwd, envCodexHome: codexHome, argv: argv,
 	}, outcome
+}
+
+func optionalReadLink(reader procReader, name string, counts map[ReasonCode]uint64) string {
+	target, err := reader.ReadLink(name)
+	if err != nil {
+		counts[classifyReadError(err)]++
+		return ""
+	}
+	target = strings.TrimSpace(target)
+	if target == "" || !filepath.IsAbs(target) {
+		return ""
+	}
+	return filepath.Clean(target)
+}
+
+// parseCmdlineArgv retains only structural classification tokens for Codex
+// interactive detection: a synthetic "codex" marker (never absolute paths) plus
+// at most one allowlisted command token. Safe help/version flags become
+// "help"/"version". Flag values, launcher script paths, and free-form prompts
+// are discarded.
+func parseCmdlineArgv(data []byte, max int) []string {
+	if len(data) == 0 || max <= 0 {
+		return nil
+	}
+	parts := strings.Split(string(data), "\x00")
+	out := make([]string, 0, 2)
+	sawCodex := false
+	for index := 0; index < len(parts); index++ {
+		part := parts[index]
+		if part == "" {
+			continue
+		}
+		if part == "--" {
+			break
+		}
+		if mapped := structuralFlagToken(part); mapped != "" {
+			if !sawCodex {
+				out = append(out, "codex")
+				sawCodex = true
+			}
+			out = append(out, mapped)
+			break
+		}
+		if strings.HasPrefix(part, "-") {
+			if strings.Contains(part, "=") {
+				continue
+			}
+			if flagTakesValue(part) && index+1 < len(parts) && !strings.HasPrefix(parts[index+1], "-") {
+				index++ // skip value without retaining it
+			}
+			continue
+		}
+		// node / npx / package entrypoint: never store absolute paths.
+		if isCodexLauncherToken(part) {
+			continue
+		}
+		if isCodexEntrypointToken(part) {
+			if !sawCodex {
+				out = append(out, "codex")
+				sawCodex = true
+			}
+			continue
+		}
+		if token := structuralBareToken(part); token != "" {
+			if !sawCodex {
+				// Bare allowlisted command without an explicit codex marker is
+				// not classified (avoid false positives on unrelated tools).
+				if index == 0 {
+					break
+				}
+				out = append(out, "codex")
+				sawCodex = true
+			}
+			out = append(out, token)
+			break
+		}
+		// Free-form prompt or unrelated path: stop without storing it.
+		break
+	}
+	if len(out) > max {
+		return out[:max]
+	}
+	return out
+}
+
+func isCodexLauncherToken(part string) bool {
+	base := strings.ToLower(filepath.Base(part))
+	switch base {
+	case "node", "nodejs", "npx":
+		return true
+	default:
+		return false
+	}
+}
+
+func isCodexEntrypointToken(part string) bool {
+	base := strings.ToLower(filepath.Base(part))
+	switch base {
+	case "codex", "aurora-codex", "codex.js":
+		return true
+	default:
+		// package path .../@openai/codex/bin/codex.js already handled by Base.
+		return strings.HasPrefix(base, "codex.") && strings.HasSuffix(base, ".js")
+	}
+}
+
+// structuralFlagToken maps safe help/version flags to allowlisted tokens.
+func structuralFlagToken(arg string) string {
+	switch arg {
+	case "--help", "-h":
+		return "help"
+	case "--version", "-V":
+		return "version"
+	default:
+		return ""
+	}
+}
+
+// structuralBareToken returns an allowlisted Codex top-level command name.
+// Free-form prompt text and arbitrary words are rejected.
+func structuralBareToken(value string) string {
+	if value == "" || len(value) > 24 || strings.ContainsAny(value, "/\\=:.") {
+		return ""
+	}
+	lower := strings.ToLower(value)
+	switch lower {
+	case "exec", "e", "login", "logout", "config", "completion", "apply", "a",
+		"sandbox", "debug", "mcp", "mcp-server", "app-server", "app",
+		"plugin", "remote-control", "exec-server", "cloud",
+		"help", "features", "proto", "review", "status", "version",
+		"uninstall", "update", "doctor", "archive", "delete", "unarchive",
+		"resume", "fork":
+		return lower
+	default:
+		return ""
+	}
+}
+
+func flagTakesValue(flag string) bool {
+	switch flag {
+	case "-m", "--model", "-c", "--config", "-C", "--cd",
+		"--profile", "-p", "--sandbox", "--ask-for-approval", "-a",
+		"--output-schema", "--output-last-message", "--image", "-i",
+		"--enable", "--disable", "--remote", "--remote-auth-token-env",
+		"--local-provider":
+		return true
+	default:
+		return false
+	}
+}
+
+func codexHomeFromEnviron(data []byte) string {
+	if len(data) == 0 {
+		return ""
+	}
+	for _, entry := range strings.Split(string(data), "\x00") {
+		if entry == "" {
+			continue
+		}
+		const prefix = "CODEX_HOME="
+		if strings.HasPrefix(entry, prefix) {
+			value := strings.TrimSpace(strings.TrimPrefix(entry, prefix))
+			if value != "" && filepath.IsAbs(value) {
+				return filepath.Clean(value)
+			}
+			return ""
+		}
+	}
+	return ""
 }
 
 func optionalText(reader procReader, name string, limit int64, counts map[ReasonCode]uint64) string {

@@ -2,8 +2,10 @@ package runtimepresence
 
 import (
 	"fmt"
+	"os"
 	"time"
 
+	"github.com/swemonstro/aurora/internal/codextrust"
 	"github.com/swemonstro/aurora/internal/instancepresence"
 	"github.com/swemonstro/aurora/internal/instanceregistry"
 	"github.com/swemonstro/aurora/internal/presencev2"
@@ -21,10 +23,14 @@ type RegistrySync struct {
 	known map[instancepresence.InstanceID]instancepresence.RuntimeRevision
 	clock Clock
 	// observerStartedAt is the wall-clock moment this sync (observer) began.
-	// Claude roots with RootProcess.StartedAt strictly after this baseline are
-	// startup-pending until their first hook. Pre-existing processes at service
-	// restart stay idle without a hook.
+	// Runtimes with RootProcess.StartedAt strictly after this baseline may be
+	// startup-pending. Pre-existing processes at service restart stay idle
+	// without a hook (Claude) or trust metadata (Codex).
 	observerStartedAt time.Time
+	// userHome resolves ~/.codex when CODEX_HOME is unset. Tests may override.
+	userHome func() (string, error)
+	// projectTrust observes Codex config.toml trust. Tests may override.
+	projectTrust func(codexHomeEnv, projectDir, userHome string) codextrust.Status
 }
 
 // NewRegistrySync constructs a multi-instance registry synchronizer.
@@ -59,18 +65,28 @@ func NewRegistrySync(
 		registry: registry, hostID: hostID, producerEpoch: epoch, source: source,
 		known: make(map[instancepresence.InstanceID]instancepresence.RuntimeRevision), clock: clock,
 		observerStartedAt: baseline,
+		userHome:          os.UserHomeDir,
+		projectTrust:      codextrust.ProjectTrust,
 	}, nil
 }
 
-// ObserverStartedAt reports the baseline used for Claude startup-pending.
+// ObserverStartedAt reports the baseline used for startup-pending decisions.
 func (sync *RegistrySync) ObserverStartedAt() time.Time { return sync.observerStartedAt }
 
 // ApplyRecognition registers/renews secure families and ends missing ones.
 // Handles 0→1→2→1→0 without mixing instances (identity is host+boot+pid+start).
 // Recognized families map to RuntimeAlive or RuntimeSuspended from root stop state.
+// Claude/Codex startup-pending is set only for post-baseline generations; Codex
+// trust becomes idle when config.toml reports trust_level=trusted (no hook rev).
 func (sync *RegistrySync) ApplyRecognition(result runtimerecognition.Result, bootID instancepresence.BootIdentity) error {
 	now := sync.clock().UTC()
 	seen := make(map[instancepresence.InstanceID]struct{})
+	userHome := ""
+	if sync.userHome != nil {
+		if home, err := sync.userHome(); err == nil {
+			userHome = home
+		}
+	}
 
 	for _, family := range result.Families {
 		candidate := family.Candidate
@@ -92,14 +108,14 @@ func (sync *RegistrySync) ApplyRecognition(result runtimerecognition.Result, boo
 				ProducerEpoch: sync.producerEpoch, RuntimeRevision: 1, ObservedAt: now,
 				IdempotencyKey: fmt.Sprintf("runtime-register|%s|1", id),
 				Status:         status,
-				StartupPending: claudeStartupPending(candidate.Tool, candidate.Runtime.RootProcess.StartedAt, sync.observerStartedAt),
+				StartupPending: sync.startupPendingAtRegister(family, userHome),
 			}
 			if _, err := sync.registry.Register(registration); err != nil {
 				// Exact retry of identical registration is OK; identity conflicts are hard errors.
 				if existing, getErr := sync.registry.Get(id); getErr == nil {
 					sync.known[id] = existing.Revisions.RuntimeRevision
 					// Still apply current observed status if registration already exists.
-					if renewErr := sync.renew(id, status, now); renewErr != nil {
+					if renewErr := sync.renew(id, status, now, family, userHome); renewErr != nil {
 						return renewErr
 					}
 					continue
@@ -109,7 +125,7 @@ func (sync *RegistrySync) ApplyRecognition(result runtimerecognition.Result, boo
 			sync.known[id] = 1
 			continue
 		}
-		if err := sync.renew(id, status, now); err != nil {
+		if err := sync.renew(id, status, now, family, userHome); err != nil {
 			return err
 		}
 	}
@@ -132,14 +148,40 @@ func (sync *RegistrySync) ApplyRecognition(result runtimerecognition.Result, boo
 	return nil
 }
 
-func (sync *RegistrySync) renew(id instancepresence.InstanceID, status instancepresence.RuntimeStatus, now time.Time) error {
+func (sync *RegistrySync) renew(
+	id instancepresence.InstanceID,
+	status instancepresence.RuntimeStatus,
+	now time.Time,
+	family runtimerecognition.Family,
+	userHome string,
+) error {
 	next := sync.known[id] + 1
+	clearStartup := false
+	if existing, err := sync.registry.Get(id); err == nil && existing.StartupPending {
+		// Only clear when trust observation positively reports trusted.
+		// unknown/not_trusted preserve pending; never re-activate after clear.
+		if family.Candidate.Tool == instancepresence.ToolCodex {
+			if sync.observeCodexTrust(family, userHome) == codextrust.Trusted {
+				clearStartup = true
+			}
+		}
+	}
+	keySuffix := string(status)
+	if clearStartup {
+		keySuffix = string(status) + "|trust-cleared"
+	}
 	mutation := presencev2.RuntimeMutation{
 		ProducerEpoch: sync.producerEpoch, RuntimeRevision: next,
 		Status: status, ObservedAt: now,
-		IdempotencyKey: fmt.Sprintf("runtime-lease|%s|%d|%s", id, next, status),
+		IdempotencyKey: fmt.Sprintf("runtime-lease|%s|%d|%s", id, next, keySuffix),
 	}
-	if _, err := sync.registry.ApplyRuntimeMutation(id, mutation); err != nil {
+	var err error
+	if clearStartup {
+		_, err = sync.registry.ApplyRuntimeMutationClearingStartup(id, mutation)
+	} else {
+		_, err = sync.registry.ApplyRuntimeMutation(id, mutation)
+	}
+	if err != nil {
 		return fmt.Errorf("renew %s: %w", id, err)
 	}
 	sync.known[id] = next
@@ -149,9 +191,35 @@ func (sync *RegistrySync) renew(id instancepresence.InstanceID, status instancep
 // KnownCount reports tracked instances (tests).
 func (sync *RegistrySync) KnownCount() int { return len(sync.known) }
 
-// claudeStartupPending is true only for Claude roots whose /proc generation
-// start time is strictly after the observer baseline. Codex and processes that
-// already existed at observer start remain non-pending (idle without hooks).
+func (sync *RegistrySync) startupPendingAtRegister(family runtimerecognition.Family, userHome string) bool {
+	start := family.Candidate.Runtime.RootProcess.StartedAt
+	if start.IsZero() || sync.observerStartedAt.IsZero() || !start.After(sync.observerStartedAt) {
+		return false
+	}
+	switch family.Candidate.Tool {
+	case instancepresence.ToolClaude:
+		return true
+	case instancepresence.ToolCodex:
+		if !codextrust.InteractiveArgv(family.Argv) {
+			return false
+		}
+		// unknown → fail-safe not pending (no false attention).
+		// trusted → not pending. not_trusted → pending.
+		return sync.observeCodexTrust(family, userHome) == codextrust.NotTrusted
+	default:
+		return false
+	}
+}
+
+func (sync *RegistrySync) observeCodexTrust(family runtimerecognition.Family, userHome string) codextrust.Status {
+	lookup := sync.projectTrust
+	if lookup == nil {
+		lookup = codextrust.ProjectTrust
+	}
+	return lookup(family.EnvCodexHome, family.WorkingDirectory, userHome)
+}
+
+// claudeStartupPending is retained for tests covering Claude-only baseline rules.
 func claudeStartupPending(tool instancepresence.ToolKind, processStarted, observerStarted time.Time) bool {
 	if tool != instancepresence.ToolClaude {
 		return false

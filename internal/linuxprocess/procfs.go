@@ -10,11 +10,15 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 type procReader interface {
 	ReadDir(string) ([]fs.DirEntry, error)
 	ReadFile(string, int64) ([]byte, error)
+	// ReadLink reads a proc-relative symlink target (e.g. "101/cwd").
+	ReadLink(string) (string, error)
 	Close() error
 }
 
@@ -102,6 +106,29 @@ func (r *rootReader) ReadFile(name string, limit int64) ([]byte, error) {
 		return data[:limit], fmt.Errorf("%w: %s", ErrReadLimit, name)
 	}
 	return data, nil
+}
+
+func (r *rootReader) ReadLink(name string) (string, error) {
+	components, err := relativeComponents(name, false)
+	if err != nil {
+		return "", err
+	}
+	if len(components) == 0 {
+		return "", fmt.Errorf("%w: invalid proc link path %q", ErrUnsafeProcEntry, name)
+	}
+	directoryFD, err := r.walkDirectories(components[:len(components)-1])
+	if err != nil {
+		return "", err
+	}
+	defer syscall.Close(directoryFD)
+	base := components[len(components)-1]
+	// Readlinkat does not follow the final component.
+	var buf [4096]byte
+	n, err := unix.Readlinkat(directoryFD, base, buf[:])
+	if err != nil {
+		return "", pathOpenError(name, err)
+	}
+	return string(buf[:n]), nil
 }
 
 func (r *rootReader) openDirectory(name string) (int, error) {

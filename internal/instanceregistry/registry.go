@@ -158,6 +158,17 @@ func (registry *Registry) ActiveInstances() []instancepresence.Instance {
 }
 
 func (registry *Registry) ApplyRuntimeMutation(id instancepresence.InstanceID, mutation presencev2.RuntimeMutation) (instancepresence.Instance, error) {
+	return registry.applyRuntimeMutation(id, mutation, false)
+}
+
+// ApplyRuntimeMutationClearingStartup updates runtime status and permanently
+// clears StartupPending without touching HookRevision. Used when Codex project
+// trust becomes trusted (not a hook event).
+func (registry *Registry) ApplyRuntimeMutationClearingStartup(id instancepresence.InstanceID, mutation presencev2.RuntimeMutation) (instancepresence.Instance, error) {
+	return registry.applyRuntimeMutation(id, mutation, true)
+}
+
+func (registry *Registry) applyRuntimeMutation(id instancepresence.InstanceID, mutation presencev2.RuntimeMutation, clearStartupPending bool) (instancepresence.Instance, error) {
 	if err := id.Validate(); err != nil {
 		return instancepresence.Instance{}, fmt.Errorf("runtime mutation instance ID: %w", err)
 	}
@@ -205,7 +216,11 @@ func (registry *Registry) ApplyRuntimeMutation(id instancepresence.InstanceID, m
 	} else {
 		previousState := record.instance.State
 		// Preserve HookClaim across alive/suspended transitions; recompute State.
+		// StartupPending is never re-activated once cleared for a generation.
 		record.instance.Status = mutation.Status
+		if clearStartupPending {
+			record.instance.StartupPending = false
+		}
 		record.instance.Lifecycle.LastSeenAt = now
 		record.instance.Lifecycle.LeaseExpiresAt = now.Add(registry.leaseDuration)
 		effective, active, err := instancepresence.Effective(

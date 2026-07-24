@@ -479,6 +479,61 @@ func TestRecognizeSuspendedIndependenceClaudeAndCodex(t *testing.T) {
 	}
 }
 
+func TestRecognizePropagatesRootLocalCodexMetadataOnly(t *testing.T) {
+	start := fixtureTime()
+	root := process(201, start, nil, 0, "codex", "codex")
+	root.WorkingDirectory = "/tmp/root-project"
+	root.EnvCodexHome = "/tmp/root-codex-home"
+	root.Argv = []string{"codex", "exec"}
+	rootID := root.Process
+	child := process(202, start.Add(time.Second), &rootID, 201, "helper", "helper")
+	child.WorkingDirectory = "/tmp/child-project"
+	child.EnvCodexHome = "/tmp/child-codex-home"
+	child.Argv = []string{"helper", "noise"}
+
+	// Unrelated parallel codex must not leak into the first family.
+	other := process(301, start.Add(2*time.Second), nil, 0, "codex", "codex")
+	other.WorkingDirectory = "/tmp/other-project"
+	other.EnvCodexHome = "/tmp/other-home"
+	other.Argv = []string{"codex"}
+
+	result, err := runtimerecognition.Recognize(
+		runtimeSnapshot([]runtimerecognition.ProcessObservation{root, child, other}),
+		"host-a", codexhook.RuntimeRecognizer(),
+	)
+	if err != nil || len(result.Families) != 2 {
+		t.Fatalf("result = %#v err=%v", result, err)
+	}
+	var familyA, familyB *runtimerecognition.Family
+	for i := range result.Families {
+		switch result.Families[i].Candidate.Runtime.RootProcess.PID {
+		case 201:
+			familyA = &result.Families[i]
+		case 301:
+			familyB = &result.Families[i]
+		}
+	}
+	if familyA == nil || familyB == nil {
+		t.Fatalf("families = %#v", result.Families)
+	}
+	if familyA.WorkingDirectory != "/tmp/root-project" || familyA.EnvCodexHome != "/tmp/root-codex-home" {
+		t.Fatalf("family A metadata = cwd=%q home=%q", familyA.WorkingDirectory, familyA.EnvCodexHome)
+	}
+	if !reflect.DeepEqual(familyA.Argv, []string{"codex", "exec"}) {
+		t.Fatalf("family A argv = %#v", familyA.Argv)
+	}
+	if familyA.WorkingDirectory == familyB.WorkingDirectory || familyA.EnvCodexHome == familyB.EnvCodexHome {
+		t.Fatal("parallel Codex families must keep independent metadata")
+	}
+	if familyB.WorkingDirectory != "/tmp/other-project" || familyB.EnvCodexHome != "/tmp/other-home" {
+		t.Fatalf("family B metadata = %#v", familyB)
+	}
+	// Child metadata must not be selected for the root family.
+	if familyA.WorkingDirectory == "/tmp/child-project" || familyA.EnvCodexHome == "/tmp/child-codex-home" {
+		t.Fatal("child metadata leaked into root family")
+	}
+}
+
 func runtimeSnapshot(processes []runtimerecognition.ProcessObservation) runtimerecognition.Snapshot {
 	return runtimerecognition.Snapshot{ObservedAt: fixtureTime().Add(10 * time.Second), BootID: "boot-a", Processes: processes}
 }

@@ -50,9 +50,9 @@ type Registration struct {
 	// newly discovered stopped process can open as attention without a
 	// temporary idle presentation.
 	Status instancepresence.RuntimeStatus
-	// StartupPending marks a Claude runtime born after the observer baseline
-	// with no hooks yet (trust dialog). Codex and pre-existing processes
-	// leave this false.
+	// StartupPending marks a runtime born after the observer baseline that is
+	// still in a startup trust dialog (Claude or interactive Codex). Pre-existing
+	// processes and non-interactive Codex leave this false.
 	StartupPending bool
 }
 

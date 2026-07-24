@@ -111,6 +111,12 @@ type Family struct {
 	// shares the same root-only rule; hook adapters do not participate.
 	Suspended   bool
 	ReasonCodes []ReasonCode
+	// WorkingDirectory is the root process absolute cwd (recognition-local).
+	WorkingDirectory string
+	// EnvCodexHome is the root process CODEX_HOME when set (recognition-local).
+	EnvCodexHome string
+	// Argv is the root process cmdline prefix (recognition-local).
+	Argv []string
 }
 
 type UncertainFamily struct {
@@ -426,7 +432,10 @@ func buildFamilies(hostID string, bootID instancepresence.BootIdentity, records 
 		families = append(families, Family{
 			Candidate: candidate, Shape: familyShape(roles), ReasonCodes: reasons,
 			// Only the unique root's stop state suspends the family.
-			Suspended: root.Suspended,
+			Suspended:        root.Suspended,
+			WorkingDirectory: root.WorkingDirectory,
+			EnvCodexHome:     root.EnvCodexHome,
+			Argv:             append([]string{}, root.Argv...),
 		})
 	}
 	sort.Slice(families, func(first, second int) bool {

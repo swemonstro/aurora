@@ -136,6 +136,15 @@ type ProcessObservation struct {
 	// tracing). It is recognition-local only and never appears on public
 	// instancepresence process snapshots or presence wire formats.
 	Suspended bool
+	// WorkingDirectory is the absolute cwd of the process (from /proc cwd).
+	// Recognition-local only; empty when unavailable.
+	WorkingDirectory string
+	// EnvCodexHome is the process CODEX_HOME value when set. Empty means the
+	// default ~/.codex should be used by trust observation.
+	EnvCodexHome string
+	// Argv is a bounded null-split cmdline prefix for structural classification
+	// (e.g. interactive vs `codex exec`). Never logged; recognition-local only.
+	Argv []string
 }
 
 func (observation ProcessObservation) Validate() error {

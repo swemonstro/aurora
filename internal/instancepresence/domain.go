@@ -315,11 +315,12 @@ type Instance struct {
 	Slot      Slot
 	Lifecycle LifecycleTimestamps
 	Revisions Revisions
-	// StartupPending is true for Claude runtimes discovered after the
-	// observer baseline with no bound hook yet (e.g. "Do you trust this
-	// folder?"). It is not a wire field; presentation uses State only.
-	// Cleared on the first accepted hook mutation. Never set for Codex or
-	// for processes that already existed at observer start.
+	// StartupPending is true for post-baseline runtimes waiting on startup
+	// trust (Claude SessionStart / Codex project trust_level). It is not a
+	// wire field; presentation uses State only. Cleared by the first accepted
+	// hook mutation, or for Codex by observing trust_level=trusted. Never
+	// re-activated for the same process generation. Processes that already
+	// existed at observer start are never pending.
 	StartupPending bool
 }
 

@@ -1,9 +1,12 @@
 package runtimepresence
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/swemonstro/aurora/internal/codextrust"
 	"github.com/swemonstro/aurora/internal/instancepresence"
 	"github.com/swemonstro/aurora/internal/instanceregistry"
 	"github.com/swemonstro/aurora/internal/runtimerecognition"
@@ -660,7 +663,7 @@ func TestClaudePIDReuseDoesNotInheritStartupPending(t *testing.T) {
 func TestClaudeStartupPendingHelper(t *testing.T) {
 	baseline := time.Date(2026, 7, 24, 15, 0, 0, 0, time.UTC)
 	if claudeStartupPending(instancepresence.ToolCodex, baseline.Add(time.Second), baseline) {
-		t.Fatal("Codex must never be startup-pending")
+		t.Fatal("claudeStartupPending helper is Claude-only")
 	}
 	if claudeStartupPending(instancepresence.ToolClaude, baseline.Add(-time.Second), baseline) {
 		t.Fatal("pre-baseline Claude must not be pending")
@@ -670,6 +673,332 @@ func TestClaudeStartupPendingHelper(t *testing.T) {
 	}
 	if !claudeStartupPending(instancepresence.ToolClaude, baseline.Add(time.Nanosecond), baseline) {
 		t.Fatal("post-baseline Claude must be pending")
+	}
+}
+
+func TestCodexTrustStartupPending(t *testing.T) {
+	clock := &fakeClock{now: time.Date(2026, 7, 24, 16, 0, 0, 0, time.UTC)}
+	registry, err := instanceregistry.New(instanceregistry.Config{
+		Clock: clock, SlotNamespace: "default", LeaseDuration: time.Minute, GracePeriod: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	userHome := t.TempDir()
+	trustHomeA := filepath.Join(t.TempDir(), "codex-a")
+	trustHomeB := filepath.Join(t.TempDir(), "codex-b")
+	_ = os.MkdirAll(trustHomeA, 0o700)
+	_ = os.MkdirAll(trustHomeB, 0o700)
+	projectA := filepath.Join(t.TempDir(), "proj-a")
+	projectB := filepath.Join(t.TempDir(), "proj-b")
+	_ = os.MkdirAll(projectA, 0o700)
+	_ = os.MkdirAll(projectB, 0o700)
+
+	sync, err := NewRegistrySync(registry, "host-a", "epoch-runtime", instancepresence.SourceDescriptor{
+		Provider: "linux-runtime", Profile: "default", CollectorID: "runtime-presence",
+	}, clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sync.userHome = func() (string, error) { return userHome, nil }
+
+	baseline := sync.ObserverStartedAt()
+	boot := instancepresence.BootIdentity("boot-a")
+
+	// Pre-baseline interactive Codex without project trust → idle (service restart).
+	preStart := baseline.Add(-time.Hour)
+	idPre := runtimerecognition.StableInstanceID("host-a", boot, instancepresence.ToolCodex, instancepresence.ProcessIdentity{PID: 300, StartedAt: preStart})
+	// New interactive, missing project → pending attention.
+	newStart := baseline.Add(time.Second)
+	idNew := runtimerecognition.StableInstanceID("host-a", boot, instancepresence.ToolCodex, instancepresence.ProcessIdentity{PID: 301, StartedAt: newStart})
+	// New interactive, already trusted → idle.
+	trustedStart := baseline.Add(2 * time.Second)
+	idTrusted := runtimerecognition.StableInstanceID("host-a", boot, instancepresence.ToolCodex, instancepresence.ProcessIdentity{PID: 302, StartedAt: trustedStart})
+	projectTrusted := filepath.Join(t.TempDir(), "already-trusted")
+	_ = os.MkdirAll(projectTrusted, 0o700)
+	writeCodexTrust(t, trustHomeA, projectTrusted, "trusted")
+	// codex exec after baseline → never pending.
+	execStart := baseline.Add(3 * time.Second)
+	idExec := runtimerecognition.StableInstanceID("host-a", boot, instancepresence.ToolCodex, instancepresence.ProcessIdentity{PID: 303, StartedAt: execStart})
+	// Claude after baseline still pending (unchanged).
+	claudeStart := baseline.Add(4 * time.Second)
+	idClaude := runtimerecognition.StableInstanceID("host-a", boot, instancepresence.ToolClaude, instancepresence.ProcessIdentity{PID: 304, StartedAt: claudeStart})
+
+	codexFamily := func(id instancepresence.InstanceID, pid uint64, start time.Time, cwd, home string, argv []string, suspended bool) runtimerecognition.Family {
+		return runtimerecognition.Family{
+			Suspended: suspended,
+			Candidate: instancepresence.RuntimeCandidate{
+				InstanceID: id, Tool: instancepresence.ToolCodex,
+				Runtime: instancepresence.RuntimeIdentity{
+					HostID: "host-a", BootID: boot, RootProcess: instancepresence.ProcessIdentity{PID: pid, StartedAt: start},
+				},
+				Members: []instancepresence.ProcessIdentity{{PID: pid, StartedAt: start}},
+			},
+			WorkingDirectory: cwd,
+			EnvCodexHome:     home,
+			Argv:             argv,
+		}
+	}
+	claudeFamily := func(id instancepresence.InstanceID, pid uint64, start time.Time) runtimerecognition.Family {
+		return runtimerecognition.Family{Candidate: instancepresence.RuntimeCandidate{
+			InstanceID: id, Tool: instancepresence.ToolClaude,
+			Runtime: instancepresence.RuntimeIdentity{
+				HostID: "host-a", BootID: boot, RootProcess: instancepresence.ProcessIdentity{PID: pid, StartedAt: start},
+			},
+			Members: []instancepresence.ProcessIdentity{{PID: pid, StartedAt: start}},
+		}}
+	}
+
+	if err := sync.ApplyRecognition(runtimerecognition.Result{Families: []runtimerecognition.Family{
+		codexFamily(idPre, 300, preStart, projectA, trustHomeA, []string{"codex"}, false),
+		codexFamily(idNew, 301, newStart, projectA, trustHomeA, []string{"codex"}, false),
+		codexFamily(idTrusted, 302, trustedStart, projectTrusted, trustHomeA, []string{"codex"}, false),
+		codexFamily(idExec, 303, execStart, projectA, trustHomeA, []string{"codex", "exec", "ls"}, false),
+		claudeFamily(idClaude, 304, claudeStart),
+	}}, boot); err != nil {
+		t.Fatal(err)
+	}
+
+	pre, _ := registry.Get(idPre)
+	if pre.StartupPending || pre.State != instancepresence.StateIdle {
+		t.Fatalf("pre-existing Codex = %#v", pre)
+	}
+	neu, _ := registry.Get(idNew)
+	if !neu.StartupPending || neu.State != instancepresence.StateAttention || neu.Revisions.HookRevision != 0 {
+		t.Fatalf("new untrusted Codex = %#v", neu)
+	}
+	slotNew := neu.Slot
+	revNew := neu.Revisions.RuntimeRevision
+
+	tr, _ := registry.Get(idTrusted)
+	if tr.StartupPending || tr.State != instancepresence.StateIdle {
+		t.Fatalf("already-trusted Codex = %#v", tr)
+	}
+	ex, _ := registry.Get(idExec)
+	if ex.StartupPending || ex.State != instancepresence.StateIdle {
+		t.Fatalf("codex exec = %#v", ex)
+	}
+	cl, _ := registry.Get(idClaude)
+	if !cl.StartupPending || cl.State != instancepresence.StateAttention {
+		t.Fatalf("Claude pending broken: %#v", cl)
+	}
+
+	// Trust becomes trusted for A: attention → idle, same ID/slot, hook_rev=0, runtime rev advances.
+	writeCodexTrust(t, trustHomeA, projectA, "trusted")
+	clock.now = clock.now.Add(time.Second)
+	if err := sync.ApplyRecognition(runtimerecognition.Result{Families: []runtimerecognition.Family{
+		codexFamily(idNew, 301, newStart, projectA, trustHomeA, []string{"codex"}, false),
+		claudeFamily(idClaude, 304, claudeStart),
+	}}, boot); err != nil {
+		t.Fatal(err)
+	}
+	after, err := registry.Get(idNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.StartupPending || after.State != instancepresence.StateIdle || after.Revisions.HookRevision != 0 {
+		t.Fatalf("after trust = %#v", after)
+	}
+	if after.Slot != slotNew || after.ID != idNew {
+		t.Fatalf("slot/id changed: %#v", after)
+	}
+	if after.Revisions.RuntimeRevision <= revNew {
+		t.Fatalf("runtime revision did not advance: %d -> %d", revNew, after.Revisions.RuntimeRevision)
+	}
+
+	// Removing project trust must not re-pending.
+	if err := os.Remove(filepath.Join(trustHomeA, "config.toml")); err != nil {
+		t.Fatal(err)
+	}
+	clock.now = clock.now.Add(time.Second)
+	if err := sync.ApplyRecognition(runtimerecognition.Result{Families: []runtimerecognition.Family{
+		codexFamily(idNew, 301, newStart, projectA, trustHomeA, []string{"codex"}, false),
+	}}, boot); err != nil {
+		t.Fatal(err)
+	}
+	stable, _ := registry.Get(idNew)
+	if stable.StartupPending || stable.State != instancepresence.StateIdle {
+		t.Fatalf("pending re-activated: %#v", stable)
+	}
+
+	// Two profiles / cwds: B still pending while A is green.
+	bStart := baseline.Add(5 * time.Second)
+	idB := runtimerecognition.StableInstanceID("host-a", boot, instancepresence.ToolCodex, instancepresence.ProcessIdentity{PID: 305, StartedAt: bStart})
+	clock.now = clock.now.Add(time.Second)
+	if err := sync.ApplyRecognition(runtimerecognition.Result{Families: []runtimerecognition.Family{
+		codexFamily(idNew, 301, newStart, projectA, trustHomeA, []string{"codex"}, false),
+		codexFamily(idB, 305, bStart, projectB, trustHomeB, []string{"codex"}, false),
+	}}, boot); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := registry.Get(idB)
+	if !b.StartupPending || b.State != instancepresence.StateAttention {
+		t.Fatalf("B pending = %#v", b)
+	}
+	a, _ := registry.Get(idNew)
+	if a.StartupPending || a.State != instancepresence.StateIdle {
+		t.Fatalf("A must stay idle: %#v", a)
+	}
+}
+
+func TestCodexTrustUnknownAndParseFailures(t *testing.T) {
+	clock := &fakeClock{now: time.Date(2026, 7, 24, 17, 0, 0, 0, time.UTC)}
+	registry, err := instanceregistry.New(instanceregistry.Config{
+		Clock: clock, SlotNamespace: "default", LeaseDuration: time.Minute, GracePeriod: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sync, err := NewRegistrySync(registry, "host-a", "epoch-runtime", instancepresence.SourceDescriptor{
+		Provider: "linux-runtime", Profile: "default", CollectorID: "runtime-presence",
+	}, clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Force unknown at registration → no false attention.
+	sync.projectTrust = func(string, string, string) codextrust.Status { return codextrust.Unknown }
+	boot := instancepresence.BootIdentity("boot-a")
+	start := sync.ObserverStartedAt().Add(time.Second)
+	id := runtimerecognition.StableInstanceID("host-a", boot, instancepresence.ToolCodex, instancepresence.ProcessIdentity{PID: 401, StartedAt: start})
+	family := runtimerecognition.Family{
+		Candidate: instancepresence.RuntimeCandidate{
+			InstanceID: id, Tool: instancepresence.ToolCodex,
+			Runtime: instancepresence.RuntimeIdentity{
+				HostID: "host-a", BootID: boot, RootProcess: instancepresence.ProcessIdentity{PID: 401, StartedAt: start},
+			},
+			Members: []instancepresence.ProcessIdentity{{PID: 401, StartedAt: start}},
+		},
+		WorkingDirectory: filepath.Join(t.TempDir(), "p"),
+		EnvCodexHome:     t.TempDir(),
+		Argv:             []string{"codex"},
+	}
+	if err := sync.ApplyRecognition(runtimerecognition.Result{Families: []runtimerecognition.Family{family}}, boot); err != nil {
+		t.Fatal(err)
+	}
+	inst, _ := registry.Get(id)
+	if inst.StartupPending || inst.State != instancepresence.StateIdle {
+		t.Fatalf("unknown at register = %#v", inst)
+	}
+
+	// Pending preserved across temporary unknown during renew.
+	// Register a pending instance via not_trusted first.
+	sync2, err := NewRegistrySync(registry, "host-a", "epoch-runtime-2", instancepresence.SourceDescriptor{
+		Provider: "linux-runtime", Profile: "default", CollectorID: "runtime-presence",
+	}, clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Use separate registry for clean isolation.
+	registry2, err := instanceregistry.New(instanceregistry.Config{
+		Clock: clock, SlotNamespace: "default", LeaseDuration: time.Minute, GracePeriod: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sync2.registry = registry2
+	sync2.projectTrust = func(string, string, string) codextrust.Status { return codextrust.NotTrusted }
+	start2 := sync2.ObserverStartedAt().Add(time.Second)
+	id2 := runtimerecognition.StableInstanceID("host-a", boot, instancepresence.ToolCodex, instancepresence.ProcessIdentity{PID: 402, StartedAt: start2})
+	family2 := family
+	family2.Candidate.InstanceID = id2
+	family2.Candidate.Runtime.RootProcess = instancepresence.ProcessIdentity{PID: 402, StartedAt: start2}
+	family2.Candidate.Members = []instancepresence.ProcessIdentity{{PID: 402, StartedAt: start2}}
+	if err := sync2.ApplyRecognition(runtimerecognition.Result{Families: []runtimerecognition.Family{family2}}, boot); err != nil {
+		t.Fatal(err)
+	}
+	pending, _ := registry2.Get(id2)
+	if !pending.StartupPending {
+		t.Fatalf("expected pending: %#v", pending)
+	}
+	sync2.projectTrust = func(string, string, string) codextrust.Status { return codextrust.Unknown }
+	clock.now = clock.now.Add(time.Second)
+	if err := sync2.ApplyRecognition(runtimerecognition.Result{Families: []runtimerecognition.Family{family2}}, boot); err != nil {
+		t.Fatal(err)
+	}
+	still, _ := registry2.Get(id2)
+	if !still.StartupPending || still.State != instancepresence.StateAttention {
+		t.Fatalf("unknown must preserve pending: %#v", still)
+	}
+}
+
+func TestCodexTrustSuspendAndHookPriority(t *testing.T) {
+	clock := &fakeClock{now: time.Date(2026, 7, 24, 18, 0, 0, 0, time.UTC)}
+	registry, err := instanceregistry.New(instanceregistry.Config{
+		Clock: clock, SlotNamespace: "default", LeaseDuration: time.Minute, GracePeriod: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	project := filepath.Join(t.TempDir(), "p")
+	_ = os.MkdirAll(project, 0o700)
+	sync, err := NewRegistrySync(registry, "host-a", "epoch-runtime", instancepresence.SourceDescriptor{
+		Provider: "linux-runtime", Profile: "default", CollectorID: "runtime-presence",
+	}, clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	boot := instancepresence.BootIdentity("boot-a")
+	start := sync.ObserverStartedAt().Add(time.Second)
+	id := runtimerecognition.StableInstanceID("host-a", boot, instancepresence.ToolCodex, instancepresence.ProcessIdentity{PID: 501, StartedAt: start})
+	family := func(suspended bool) runtimerecognition.Family {
+		return runtimerecognition.Family{
+			Suspended: suspended,
+			Candidate: instancepresence.RuntimeCandidate{
+				InstanceID: id, Tool: instancepresence.ToolCodex,
+				Runtime: instancepresence.RuntimeIdentity{
+					HostID: "host-a", BootID: boot, RootProcess: instancepresence.ProcessIdentity{PID: 501, StartedAt: start},
+				},
+				Members: []instancepresence.ProcessIdentity{{PID: 501, StartedAt: start}},
+			},
+			WorkingDirectory: project,
+			EnvCodexHome:     home,
+			Argv:             []string{"codex"},
+		}
+	}
+	if err := sync.ApplyRecognition(runtimerecognition.Result{Families: []runtimerecognition.Family{family(false)}}, boot); err != nil {
+		t.Fatal(err)
+	}
+	// Suspend / resume before trust: attention + pending.
+	clock.now = clock.now.Add(time.Second)
+	_ = sync.ApplyRecognition(runtimerecognition.Result{Families: []runtimerecognition.Family{family(true)}}, boot)
+	susp, _ := registry.Get(id)
+	if !susp.StartupPending || susp.State != instancepresence.StateAttention {
+		t.Fatalf("suspend before trust = %#v", susp)
+	}
+	clock.now = clock.now.Add(time.Second)
+	_ = sync.ApplyRecognition(runtimerecognition.Result{Families: []runtimerecognition.Family{family(false)}}, boot)
+	res, _ := registry.Get(id)
+	if !res.StartupPending || res.State != instancepresence.StateAttention {
+		t.Fatalf("resume before trust = %#v", res)
+	}
+	// First hook wins before trust metadata.
+	clock.now = clock.now.Add(time.Second)
+	working, err := registry.ApplyNextHookMutation(id, "epoch-runtime", instancepresence.StateWorking, clock.now, "hook-1")
+	if err != nil || working.State != instancepresence.StateWorking || working.StartupPending {
+		t.Fatalf("hook wins = %#v err=%v", working, err)
+	}
+	// End process before trust on a fresh pending instance.
+	start2 := sync.ObserverStartedAt().Add(10 * time.Second)
+	id2 := runtimerecognition.StableInstanceID("host-a", boot, instancepresence.ToolCodex, instancepresence.ProcessIdentity{PID: 502, StartedAt: start2})
+	f2 := family(false)
+	f2.Candidate.InstanceID = id2
+	f2.Candidate.Runtime.RootProcess = instancepresence.ProcessIdentity{PID: 502, StartedAt: start2}
+	f2.Candidate.Members = []instancepresence.ProcessIdentity{{PID: 502, StartedAt: start2}}
+	_ = sync.ApplyRecognition(runtimerecognition.Result{Families: []runtimerecognition.Family{f2}}, boot)
+	clock.now = clock.now.Add(time.Second)
+	_ = sync.ApplyRecognition(runtimerecognition.Result{}, boot)
+	ended, err := registry.Get(id2)
+	if err != nil || ended.Status != instancepresence.RuntimeEnded {
+		t.Fatalf("end before trust = %#v err=%v", ended, err)
+	}
+}
+
+func writeCodexTrust(t *testing.T, home, project, trust string) {
+	t.Helper()
+	body := "[projects." + `"` + project + `"` + "]\ntrust_level = " + `"` + trust + `"` + "\n"
+	if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
 
