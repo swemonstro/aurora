@@ -479,7 +479,7 @@ func TestRecognizeSuspendedIndependenceClaudeAndCodex(t *testing.T) {
 	}
 }
 
-func TestRecognizePropagatesRootLocalCodexMetadataOnly(t *testing.T) {
+func TestRecognizePropagatesLaunchProcessCodexMetadataOnly(t *testing.T) {
 	start := fixtureTime()
 	root := process(201, start, nil, 0, "codex", "codex")
 	root.WorkingDirectory = "/tmp/root-project"
@@ -516,6 +516,9 @@ func TestRecognizePropagatesRootLocalCodexMetadataOnly(t *testing.T) {
 	if familyA == nil || familyB == nil {
 		t.Fatalf("families = %#v", result.Families)
 	}
+	if familyA.LaunchProcess.PID != 201 {
+		t.Fatalf("LaunchProcess = %#v, want pid 201", familyA.LaunchProcess)
+	}
 	if familyA.WorkingDirectory != "/tmp/root-project" || familyA.EnvCodexHome != "/tmp/root-codex-home" {
 		t.Fatalf("family A metadata = cwd=%q home=%q", familyA.WorkingDirectory, familyA.EnvCodexHome)
 	}
@@ -528,9 +531,122 @@ func TestRecognizePropagatesRootLocalCodexMetadataOnly(t *testing.T) {
 	if familyB.WorkingDirectory != "/tmp/other-project" || familyB.EnvCodexHome != "/tmp/other-home" {
 		t.Fatalf("family B metadata = %#v", familyB)
 	}
-	// Child metadata must not be selected for the root family.
+	// Child metadata must not be selected for the launch family.
 	if familyA.WorkingDirectory == "/tmp/child-project" || familyA.EnvCodexHome == "/tmp/child-codex-home" {
-		t.Fatal("child metadata leaked into root family")
+		t.Fatal("child metadata leaked into launch family")
+	}
+}
+
+func TestRecognizeShellNodeNativeChoosesNodeLaunchProcess(t *testing.T) {
+	// Production shape: old bash terminal as family root, new Node codex
+	// launcher, native child. Shell has launch identity so it is RootProcess
+	// but remains a terminal name so LaunchProcess selection skips it.
+	baseline := fixtureTime()
+	shellStart := baseline.Add(-2 * time.Hour)
+	nodeStart := baseline.Add(time.Second)
+	nativeStart := baseline.Add(2 * time.Second)
+
+	shell := process(100, shellStart, nil, 1, "bash", "bash")
+	shell.Argv = []string{"-bash"}
+	shell.LaunchIdentities = []instancepresence.OpaqueIdentity{"launch:openai-codex"}
+	shell.ProcessGroupOrJob = "pgrp:shared"
+	shell.OSSession = "session:shared"
+	shell.WorkingDirectory = "/tmp/old-shell-cwd"
+	shellID := shell.Process
+
+	node := process(200, nodeStart, &shellID, 100, "node", "node")
+	node.LaunchIdentities = []instancepresence.OpaqueIdentity{"launch:openai-codex"}
+	node.ProcessGroupOrJob = "pgrp:shared"
+	node.OSSession = "session:shared"
+	node.WorkingDirectory = "/tmp/untrusted-project"
+	node.EnvCodexHome = "/tmp/codex-home"
+	node.Argv = []string{"codex"}
+	nodeID := node.Process
+
+	native := process(201, nativeStart, &nodeID, 200, "codex-linux-x86_64", "codex-linux-x86_64")
+	native.ProcessGroupOrJob = "pgrp:shared"
+	native.OSSession = "session:shared"
+	native.WorkingDirectory = "/tmp/native-cwd"
+	native.EnvCodexHome = "/tmp/native-home"
+	native.Argv = []string{"codex-linux-x86_64"}
+
+	result, err := runtimerecognition.Recognize(
+		runtimeSnapshot([]runtimerecognition.ProcessObservation{shell, node, native}),
+		"host-a", codexhook.RuntimeRecognizer(),
+	)
+	if err != nil || len(result.Families) != 1 {
+		t.Fatalf("result = %#v err=%v", result, err)
+	}
+	family := result.Families[0]
+	if family.Candidate.Runtime.RootProcess != shell.Process {
+		t.Fatalf("RootProcess = %#v, want shell", family.Candidate.Runtime.RootProcess)
+	}
+	if family.LaunchProcess != node.Process {
+		t.Fatalf("LaunchProcess = %#v, want node", family.LaunchProcess)
+	}
+	if family.WorkingDirectory != "/tmp/untrusted-project" || family.EnvCodexHome != "/tmp/codex-home" {
+		t.Fatalf("metadata from node expected: cwd=%q home=%q", family.WorkingDirectory, family.EnvCodexHome)
+	}
+	if !reflect.DeepEqual(family.Argv, []string{"codex"}) {
+		t.Fatalf("Argv = %#v, want [codex] from node (not shell -bash)", family.Argv)
+	}
+}
+
+func TestRecognizeNativeOnlyLaunchProcess(t *testing.T) {
+	start := fixtureTime()
+	native := process(55, start, nil, 1, "codex-linux-x86_64", "codex-linux-x86_64")
+	native.WorkingDirectory = "/tmp/only-native"
+	native.Argv = []string{"codex-linux-x86_64"}
+	result, err := runtimerecognition.Recognize(
+		runtimeSnapshot([]runtimerecognition.ProcessObservation{native}),
+		"host-a", codexhook.RuntimeRecognizer(),
+	)
+	if err != nil || len(result.Families) != 1 {
+		t.Fatalf("result = %#v err=%v", result, err)
+	}
+	if result.Families[0].LaunchProcess.PID != 55 {
+		t.Fatalf("LaunchProcess = %#v", result.Families[0].LaunchProcess)
+	}
+	if result.Families[0].WorkingDirectory != "/tmp/only-native" {
+		t.Fatalf("cwd = %q", result.Families[0].WorkingDirectory)
+	}
+}
+
+func TestRecognizeClaudeMetadataStaysOnRoot(t *testing.T) {
+	// Claude must not use LaunchProcess-style child selection: root cwd/argv win.
+	start := fixtureTime()
+	root := process(401, start, nil, 1, "claude", "claude")
+	root.WorkingDirectory = "/tmp/claude-root-cwd"
+	root.EnvCodexHome = "/tmp/claude-root-home"
+	root.Argv = []string{"claude", "root-arg"}
+	rootID := root.Process
+	child := process(402, start.Add(time.Second), &rootID, 401, "claude-native-worker", "claude-native-worker")
+	child.WorkingDirectory = "/tmp/claude-child-cwd"
+	child.EnvCodexHome = "/tmp/claude-child-home"
+	child.Argv = []string{"claude-native-worker", "child-arg"}
+
+	result, err := runtimerecognition.Recognize(
+		runtimeSnapshot([]runtimerecognition.ProcessObservation{root, child}),
+		"host-a", claudehook.RuntimeRecognizer(),
+	)
+	if err != nil || len(result.Families) != 1 {
+		t.Fatalf("result = %#v err=%v", result, err)
+	}
+	family := result.Families[0]
+	if family.Candidate.Tool != instancepresence.ToolClaude {
+		t.Fatalf("tool = %q", family.Candidate.Tool)
+	}
+	if family.Candidate.Runtime.RootProcess.PID != 401 {
+		t.Fatalf("RootProcess = %#v", family.Candidate.Runtime.RootProcess)
+	}
+	if family.WorkingDirectory != "/tmp/claude-root-cwd" || family.EnvCodexHome != "/tmp/claude-root-home" {
+		t.Fatalf("Claude metadata must stay on root: cwd=%q home=%q", family.WorkingDirectory, family.EnvCodexHome)
+	}
+	if !reflect.DeepEqual(family.Argv, []string{"claude", "root-arg"}) {
+		t.Fatalf("Claude Argv = %#v, want root argv", family.Argv)
+	}
+	if family.WorkingDirectory == "/tmp/claude-child-cwd" || family.EnvCodexHome == "/tmp/claude-child-home" {
+		t.Fatal("Claude child metadata must not replace root metadata")
 	}
 }
 

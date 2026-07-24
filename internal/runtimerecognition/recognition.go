@@ -111,11 +111,20 @@ type Family struct {
 	// shares the same root-only rule; hook adapters do not participate.
 	Suspended   bool
 	ReasonCodes []ReasonCode
-	// WorkingDirectory is the root process absolute cwd (recognition-local).
+	// LaunchProcess carries generation- and trust-sensitive process identity
+	// for local observation only (not wire format). Semantics:
+	//   - Codex: outermost matched Codex process (Node launcher preferred over
+	//     native child); terminal shells are never chosen.
+	//   - Claude and other tools: the family root, preserving historical
+	//     metadata semantics (WorkingDirectory/Argv from root).
+	// InstanceID still always uses Candidate.Runtime.RootProcess.
+	LaunchProcess instancepresence.ProcessIdentity
+	// WorkingDirectory is absolute cwd from the process selected as
+	// LaunchProcess (Codex launch process, otherwise family root).
 	WorkingDirectory string
-	// EnvCodexHome is the root process CODEX_HOME when set (recognition-local).
+	// EnvCodexHome is CODEX_HOME from that same selected process when set.
 	EnvCodexHome string
-	// Argv is the root process cmdline prefix (recognition-local).
+	// Argv is classification tokens from that same selected process.
 	Argv []string
 }
 
@@ -429,13 +438,24 @@ func buildFamilies(hostID string, bootID instancepresence.BootIdentity, records 
 		if err := candidate.Validate(); err != nil {
 			return nil, nil, fmt.Errorf("validate runtime candidate: %w", err)
 		}
+		// Default: all tools use the family root for local metadata (historical
+		// Claude/other behaviour). Codex overrides with the outermost matched
+		// Codex process so a pre-baseline terminal shell is never used for
+		// trust/generation classification.
+		launch := root
+		if value.tool == instancepresence.ToolCodex {
+			if selected := selectAgentLaunchObservation(value.tool, records, value.indices, byIdentity); selected.Process.PID != 0 {
+				launch = selected
+			}
+		}
 		families = append(families, Family{
 			Candidate: candidate, Shape: familyShape(roles), ReasonCodes: reasons,
 			// Only the unique root's stop state suspends the family.
 			Suspended:        root.Suspended,
-			WorkingDirectory: root.WorkingDirectory,
-			EnvCodexHome:     root.EnvCodexHome,
-			Argv:             append([]string{}, root.Argv...),
+			LaunchProcess:    launch.Process,
+			WorkingDirectory: launch.WorkingDirectory,
+			EnvCodexHome:     launch.EnvCodexHome,
+			Argv:             append([]string{}, launch.Argv...),
 		})
 	}
 	sort.Slice(families, func(first, second int) bool {
@@ -526,6 +546,92 @@ func familyShape(roles map[Role]struct{}) string {
 		return "unknown"
 	}
 	return strings.Join(parts, "+")
+}
+
+// selectAgentLaunchObservation picks the outermost matched agent process among
+// family members for trust/generation metadata. Terminal shells are never
+// chosen. Preference among outermost candidates: node launcher, wrapper,
+// direct, then native child.
+func selectAgentLaunchObservation(tool instancepresence.ToolKind, records []processRecord, memberIndices []int, byIdentity map[string]int) ProcessObservation {
+	type candidate struct {
+		index int
+		role  Role
+	}
+	candidates := make([]candidate, 0, len(memberIndices))
+	candidateSet := make(map[int]struct{}, len(memberIndices))
+	for _, index := range memberIndices {
+		record := records[index]
+		if !record.recognized || record.recognition.Tool != tool {
+			continue
+		}
+		if isTerminalShellObservation(record.observation) {
+			continue
+		}
+		candidates = append(candidates, candidate{index: index, role: record.recognition.Role})
+		candidateSet[index] = struct{}{}
+	}
+	if len(candidates) == 0 {
+		return ProcessObservation{}
+	}
+	outermost := make([]candidate, 0, len(candidates))
+	for _, cand := range candidates {
+		parent, exact := knownParent(records[cand.index].observation, byIdentity, records)
+		if !exact {
+			outermost = append(outermost, cand)
+			continue
+		}
+		if _, parentIsAgent := candidateSet[parent]; !parentIsAgent {
+			outermost = append(outermost, cand)
+		}
+	}
+	if len(outermost) == 0 {
+		outermost = candidates
+	}
+	roleRank := map[Role]int{
+		RoleNode: 0, RoleWrapper: 1, RoleDirect: 2, RoleNative: 3,
+	}
+	sort.Slice(outermost, func(first, second int) bool {
+		rankFirst, rankSecond := roleRank[outermost[first].role], roleRank[outermost[second].role]
+		if rankFirst != rankSecond {
+			return rankFirst < rankSecond
+		}
+		return processIdentityKey(records[outermost[first].index].observation.Process) <
+			processIdentityKey(records[outermost[second].index].observation.Process)
+	})
+	return records[outermost[0].index].observation
+}
+
+func isTerminalShellObservation(observation ProcessObservation) bool {
+	names := []string{
+		normalizedProcessName(observation.CommIdentity),
+		normalizedProcessName(observation.ExecutableIdentity),
+	}
+	for _, arg := range observation.Argv {
+		names = append(names, strings.TrimPrefix(strings.ToLower(filepathBase(arg)), "-"))
+	}
+	for _, name := range names {
+		switch name {
+		case "bash", "sh", "zsh", "fish", "dash", "csh", "tcsh", "ksh",
+			"-bash", "-sh", "-zsh", "-fish":
+			return true
+		}
+	}
+	return false
+}
+
+func normalizedProcessName(identity instancepresence.OpaqueIdentity) string {
+	return strings.TrimPrefix(strings.ToLower(string(identity)), "exe:")
+}
+
+func filepathBase(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if index := strings.LastIndexAny(value, "/\\"); index >= 0 {
+		return value[index+1:]
+	}
+	return value
 }
 
 type disjointSet struct{ parents []int }

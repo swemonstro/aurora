@@ -90,8 +90,15 @@ func (sync *RegistrySync) ObserverStartedAt() time.Time { return sync.observerSt
 // ApplyRecognition registers/renews secure families and ends missing ones.
 // Handles 0→1→2→1→0 without mixing instances (identity is host+boot+pid+start).
 // Recognized families map to RuntimeAlive or RuntimeSuspended from root stop state.
-// Claude/Codex startup-pending is set only for post-baseline generations; Codex
-// trust may resolve after an initial Unknown poll without inventing hook revisions.
+//
+// Startup-pending uses a generation start time that is strictly after the
+// observer baseline:
+//   - Claude: Candidate.Runtime.RootProcess.StartedAt
+//   - Codex:  Family.LaunchProcess.StartedAt (outermost matched Codex process,
+//     e.g. Node launcher — never a pre-baseline terminal shell)
+//
+// Codex trust may resolve after an initial Unknown poll without inventing hook
+// revisions (unresolved → pending → resolved).
 func (sync *RegistrySync) ApplyRecognition(result runtimerecognition.Result, bootID instancepresence.BootIdentity) error {
 	now := sync.clock().UTC()
 	seen := make(map[instancepresence.InstanceID]struct{})
@@ -294,8 +301,17 @@ func (sync *RegistrySync) codexTrustStateFor(id instancepresence.InstanceID) (co
 
 // startupAtRegister decides StartupPending and optional Codex trust tracking.
 // track is true only for post-baseline interactive Codex generations.
+//
+// Claude uses RootProcess.StartedAt (unchanged). Codex uses LaunchProcess
+// (outermost matched Codex process such as the Node launcher), never a
+// terminal shell that may predate the observer baseline.
 func (sync *RegistrySync) startupAtRegister(family runtimerecognition.Family, userHome string) (pending bool, state codexStartupTrustState, track bool) {
 	start := family.Candidate.Runtime.RootProcess.StartedAt
+	if family.Candidate.Tool == instancepresence.ToolCodex {
+		if family.LaunchProcess.PID != 0 && !family.LaunchProcess.StartedAt.IsZero() {
+			start = family.LaunchProcess.StartedAt
+		}
+	}
 	if start.IsZero() || sync.observerStartedAt.IsZero() || !start.After(sync.observerStartedAt) {
 		return false, 0, false
 	}
@@ -303,6 +319,7 @@ func (sync *RegistrySync) startupAtRegister(family runtimerecognition.Family, us
 	case instancepresence.ToolClaude:
 		return true, 0, false
 	case instancepresence.ToolCodex:
+		// Interactivity from LaunchProcess argv only — never shell argv.
 		if !codextrust.InteractiveArgv(family.Argv) {
 			return false, 0, false
 		}

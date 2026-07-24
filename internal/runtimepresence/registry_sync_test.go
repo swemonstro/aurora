@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/swemonstro/aurora/internal/codexhook"
 	"github.com/swemonstro/aurora/internal/codextrust"
 	"github.com/swemonstro/aurora/internal/instancepresence"
 	"github.com/swemonstro/aurora/internal/instanceregistry"
@@ -992,6 +993,382 @@ func TestCodexTrustSuspendAndHookPriority(t *testing.T) {
 	ended, err := registry.Get(id2)
 	if err != nil || ended.Status != instancepresence.RuntimeEnded {
 		t.Fatalf("end before trust = %#v err=%v", ended, err)
+	}
+}
+
+func TestCodexShellNodeNativeEndToEndRecognizeToRegistry(t *testing.T) {
+	// Full chain: Recognize(real Codex recognizer) → ApplyRecognition.
+	// Does not manually set LaunchProcess / WorkingDirectory / Argv on Family.
+	//
+	// Production-shaped family: long-lived shell is the component root (pre-
+	// baseline InstanceID), while the post-baseline Node launcher supplies
+	// LaunchProcess metadata. The shell carries a Codex launch identity so it
+	// is the family root under current recognition rules, but remains a
+	// terminal shell name so LaunchProcess selection never picks it.
+	clock := &fakeClock{now: time.Date(2026, 7, 27, 14, 0, 0, 0, time.UTC)}
+	registry, err := instanceregistry.New(instanceregistry.Config{
+		Clock: clock, SlotNamespace: "default", LeaseDuration: time.Minute, GracePeriod: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sync, err := NewRegistrySync(registry, "host-a", "epoch-runtime", instancepresence.SourceDescriptor{
+		Provider: "linux-runtime", Profile: "default", CollectorID: "runtime-presence",
+	}, clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sync.projectTrust = func(_, projectDir, _ string) codextrust.Status {
+		if projectDir == "/tmp/untrusted-project" {
+			return codextrust.NotTrusted
+		}
+		return codextrust.Unknown
+	}
+
+	baseline := sync.ObserverStartedAt()
+	boot := instancepresence.BootIdentity("boot-a")
+	shellStart := baseline.Add(-3 * time.Hour)
+	nodeStart := baseline.Add(time.Second)
+	nativeStart := baseline.Add(2 * time.Second)
+
+	shell := runtimerecognition.ProcessObservation{
+		Process:       instancepresence.ProcessIdentity{PID: 100, StartedAt: shellStart},
+		ParentPIDHint: 1,
+		CommIdentity:  "exe:bash", ExecutableIdentity: "exe:bash",
+		// Outer family member / component root (pre-baseline). Terminal name
+		// ensures LaunchProcess selection skips it in favour of Node.
+		LaunchIdentities:  []instancepresence.OpaqueIdentity{"launch:openai-codex"},
+		ProcessGroupOrJob: "pgrp:shared", OSSession: "session:shared",
+		OwnerIdentity:    "owner:fixture",
+		WorkingDirectory: "/tmp/old-shell-cwd",
+		Argv:             []string{"-bash"},
+	}
+	shellID := shell.Process
+	wantID := runtimerecognition.StableInstanceID("host-a", boot, instancepresence.ToolCodex, shell.Process)
+
+	node := runtimerecognition.ProcessObservation{
+		Process: instancepresence.ProcessIdentity{PID: 200, StartedAt: nodeStart},
+		Parent:  &shellID, ParentPIDHint: 100,
+		CommIdentity: "exe:node", ExecutableIdentity: "exe:node",
+		LaunchIdentities:  []instancepresence.OpaqueIdentity{"launch:openai-codex"},
+		ProcessGroupOrJob: "pgrp:shared", OSSession: "session:shared",
+		OwnerIdentity:    "owner:fixture",
+		WorkingDirectory: "/tmp/untrusted-project",
+		EnvCodexHome:     "/tmp/codex-home",
+		Argv:             []string{"codex"},
+	}
+	nodeID := node.Process
+	native := runtimerecognition.ProcessObservation{
+		Process: instancepresence.ProcessIdentity{PID: 201, StartedAt: nativeStart},
+		Parent:  &nodeID, ParentPIDHint: 200,
+		CommIdentity: "exe:codex-linux-x86_64", ExecutableIdentity: "exe:codex-linux-x86_64",
+		ProcessGroupOrJob: "pgrp:shared", OSSession: "session:shared",
+		OwnerIdentity:    "owner:fixture",
+		WorkingDirectory: "/tmp/native-cwd",
+		EnvCodexHome:     "/tmp/native-home",
+		Argv:             []string{"codex-linux-x86_64"},
+	}
+
+	result, err := runtimerecognition.Recognize(
+		runtimerecognition.Snapshot{
+			ObservedAt: baseline.Add(10 * time.Second),
+			BootID:     boot,
+			Processes:  []runtimerecognition.ProcessObservation{shell, node, native},
+		},
+		"host-a",
+		codexhook.RuntimeRecognizer(),
+	)
+	if err != nil || len(result.Families) != 1 {
+		t.Fatalf("Recognize = %#v err=%v", result, err)
+	}
+	family := result.Families[0]
+	if family.Candidate.Tool != instancepresence.ToolCodex {
+		t.Fatalf("tool = %q", family.Candidate.Tool)
+	}
+	if family.Candidate.Runtime.RootProcess != shell.Process {
+		t.Fatalf("RootProcess = %#v, want shell %#v (PID 200 is not allowed)", family.Candidate.Runtime.RootProcess, shell.Process)
+	}
+	if family.Candidate.InstanceID != wantID {
+		t.Fatalf("InstanceID = %q, want shell-based %q", family.Candidate.InstanceID, wantID)
+	}
+	if family.LaunchProcess != node.Process {
+		t.Fatalf("LaunchProcess = %#v, want Node %#v", family.LaunchProcess, node.Process)
+	}
+	if family.WorkingDirectory != "/tmp/untrusted-project" || family.EnvCodexHome != "/tmp/codex-home" {
+		t.Fatalf("metadata must come from Node: cwd=%q home=%q", family.WorkingDirectory, family.EnvCodexHome)
+	}
+	if len(family.Argv) == 0 || family.Argv[0] != "codex" {
+		t.Fatalf("Argv from Node = %#v", family.Argv)
+	}
+	for _, token := range family.Argv {
+		if token == "-bash" || token == "bash" {
+			t.Fatalf("shell argv leaked: %#v", family.Argv)
+		}
+	}
+	if !family.LaunchProcess.StartedAt.After(baseline) {
+		t.Fatal("LaunchProcess must be post-baseline")
+	}
+	if !family.Candidate.Runtime.RootProcess.StartedAt.Before(baseline) {
+		t.Fatal("RootProcess (shell) must be pre-baseline")
+	}
+
+	if err := sync.ApplyRecognition(result, boot); err != nil {
+		t.Fatal(err)
+	}
+	inst, err := registry.Get(wantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inst.ID != wantID {
+		t.Fatalf("registry ID = %q, want %q", inst.ID, wantID)
+	}
+	if inst.Runtime.RootProcess != shell.Process {
+		t.Fatalf("registry RootProcess = %#v, want shell", inst.Runtime.RootProcess)
+	}
+	if !inst.StartupPending || inst.State != instancepresence.StateAttention || inst.Revisions.HookRevision != 0 {
+		t.Fatalf("want startup attention from LaunchProcess generation: %#v", inst)
+	}
+	slot := inst.Slot
+
+	// Trust accepted on the same recognition result (no manual Family rewrite).
+	sync.projectTrust = func(_, _, _ string) codextrust.Status { return codextrust.Trusted }
+	clock.now = clock.now.Add(time.Second)
+	if err := sync.ApplyRecognition(result, boot); err != nil {
+		t.Fatal(err)
+	}
+	after, err := registry.Get(wantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.StartupPending || after.State != instancepresence.StateIdle || after.Revisions.HookRevision != 0 {
+		t.Fatalf("after trust = %#v", after)
+	}
+	if after.ID != wantID || after.Slot != slot {
+		t.Fatalf("id/slot changed: %#v", after)
+	}
+	if after.Runtime.RootProcess != shell.Process {
+		t.Fatalf("RootProcess after trust = %#v", after.Runtime.RootProcess)
+	}
+}
+
+func TestCodexOldShellNewNodeLauncherIsStartupPending(t *testing.T) {
+	// Production regression: long-lived bash (pre-baseline) + post-baseline
+	// Node codex launcher + native child. Trust NotTrusted. Must be attention
+	// even when family RootProcess is the old shell.
+	clock := &fakeClock{now: time.Date(2026, 7, 27, 10, 0, 0, 0, time.UTC)}
+	registry, err := instanceregistry.New(instanceregistry.Config{
+		Clock: clock, SlotNamespace: "default", LeaseDuration: time.Minute, GracePeriod: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sync, err := NewRegistrySync(registry, "host-a", "epoch-runtime", instancepresence.SourceDescriptor{
+		Provider: "linux-runtime", Profile: "default", CollectorID: "runtime-presence",
+	}, clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sync.projectTrust = func(_, _, _ string) codextrust.Status { return codextrust.NotTrusted }
+
+	baseline := sync.ObserverStartedAt()
+	boot := instancepresence.BootIdentity("boot-a")
+	shellStart := baseline.Add(-3 * time.Hour)
+	nodeStart := baseline.Add(time.Second)
+	nativeStart := baseline.Add(2 * time.Second)
+
+	// RootProcess identity follows the shell (pre-baseline) for InstanceID stability.
+	root := instancepresence.ProcessIdentity{PID: 100, StartedAt: shellStart}
+	id := runtimerecognition.StableInstanceID("host-a", boot, instancepresence.ToolCodex, root)
+	family := runtimerecognition.Family{
+		Candidate: instancepresence.RuntimeCandidate{
+			InstanceID: id, Tool: instancepresence.ToolCodex,
+			Runtime: instancepresence.RuntimeIdentity{
+				HostID: "host-a", BootID: boot, RootProcess: root,
+			},
+			Members: []instancepresence.ProcessIdentity{
+				root,
+				{PID: 200, StartedAt: nodeStart},
+				{PID: 201, StartedAt: nativeStart},
+			},
+		},
+		// LaunchProcess is the post-baseline Node launcher.
+		LaunchProcess:    instancepresence.ProcessIdentity{PID: 200, StartedAt: nodeStart},
+		WorkingDirectory: "/tmp/untrusted-project",
+		EnvCodexHome:     "/tmp/codex-home",
+		Argv:             []string{"codex"}, // from node, not shell -bash
+	}
+
+	if err := sync.ApplyRecognition(runtimerecognition.Result{Families: []runtimerecognition.Family{family}}, boot); err != nil {
+		t.Fatal(err)
+	}
+	inst, err := registry.Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !inst.StartupPending || inst.State != instancepresence.StateAttention || inst.Revisions.HookRevision != 0 {
+		t.Fatalf("want startup attention, got %#v", inst)
+	}
+	// Instance identity remains shell-rooted.
+	if inst.Runtime.RootProcess.PID != 100 || !inst.Runtime.RootProcess.StartedAt.Equal(shellStart) {
+		t.Fatalf("RootProcess identity changed: %#v", inst.Runtime.RootProcess)
+	}
+	slot := inst.Slot
+
+	// Trust accepted: attention -> idle, same ID/slot, hook_rev stays 0.
+	sync.projectTrust = func(_, _, _ string) codextrust.Status { return codextrust.Trusted }
+	clock.now = clock.now.Add(time.Second)
+	if err := sync.ApplyRecognition(runtimerecognition.Result{Families: []runtimerecognition.Family{family}}, boot); err != nil {
+		t.Fatal(err)
+	}
+	after, err := registry.Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.StartupPending || after.State != instancepresence.StateIdle || after.Revisions.HookRevision != 0 {
+		t.Fatalf("after trust = %#v", after)
+	}
+	if after.Slot != slot || after.ID != id {
+		t.Fatalf("id/slot changed: %#v", after)
+	}
+}
+
+func TestCodexOldShellNewExecIsNotPending(t *testing.T) {
+	clock := &fakeClock{now: time.Date(2026, 7, 27, 11, 0, 0, 0, time.UTC)}
+	registry, err := instanceregistry.New(instanceregistry.Config{
+		Clock: clock, SlotNamespace: "default", LeaseDuration: time.Minute, GracePeriod: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sync, err := NewRegistrySync(registry, "host-a", "epoch-runtime", instancepresence.SourceDescriptor{
+		Provider: "linux-runtime", Profile: "default", CollectorID: "runtime-presence",
+	}, clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sync.projectTrust = func(_, _, _ string) codextrust.Status { return codextrust.NotTrusted }
+	baseline := sync.ObserverStartedAt()
+	boot := instancepresence.BootIdentity("boot-a")
+	shellStart := baseline.Add(-time.Hour)
+	nodeStart := baseline.Add(time.Second)
+	root := instancepresence.ProcessIdentity{PID: 50, StartedAt: shellStart}
+	id := runtimerecognition.StableInstanceID("host-a", boot, instancepresence.ToolCodex, root)
+	family := runtimerecognition.Family{
+		Candidate: instancepresence.RuntimeCandidate{
+			InstanceID: id, Tool: instancepresence.ToolCodex,
+			Runtime: instancepresence.RuntimeIdentity{HostID: "host-a", BootID: boot, RootProcess: root},
+			Members: []instancepresence.ProcessIdentity{root, {PID: 51, StartedAt: nodeStart}},
+		},
+		LaunchProcess:    instancepresence.ProcessIdentity{PID: 51, StartedAt: nodeStart},
+		WorkingDirectory: "/tmp/p",
+		Argv:             []string{"codex", "exec"},
+	}
+	if err := sync.ApplyRecognition(runtimerecognition.Result{Families: []runtimerecognition.Family{family}}, boot); err != nil {
+		t.Fatal(err)
+	}
+	inst, _ := registry.Get(id)
+	if inst.StartupPending || inst.State != instancepresence.StateIdle {
+		t.Fatalf("exec must not be pending: %#v", inst)
+	}
+	if _, ok := sync.codexTrustStateFor(id); ok {
+		t.Fatal("exec must not install trust tracking")
+	}
+}
+
+func TestCodexPreBaselineShellAndLauncherIdle(t *testing.T) {
+	clock := &fakeClock{now: time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)}
+	registry, err := instanceregistry.New(instanceregistry.Config{
+		Clock: clock, SlotNamespace: "default", LeaseDuration: time.Minute, GracePeriod: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sync, err := NewRegistrySync(registry, "host-a", "epoch-runtime", instancepresence.SourceDescriptor{
+		Provider: "linux-runtime", Profile: "default", CollectorID: "runtime-presence",
+	}, clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sync.projectTrust = func(_, _, _ string) codextrust.Status { return codextrust.NotTrusted }
+	baseline := sync.ObserverStartedAt()
+	boot := instancepresence.BootIdentity("boot-a")
+	shellStart := baseline.Add(-2 * time.Hour)
+	nodeStart := baseline.Add(-time.Hour) // launcher also pre-baseline (service restart)
+	root := instancepresence.ProcessIdentity{PID: 60, StartedAt: shellStart}
+	id := runtimerecognition.StableInstanceID("host-a", boot, instancepresence.ToolCodex, root)
+	family := runtimerecognition.Family{
+		Candidate: instancepresence.RuntimeCandidate{
+			InstanceID: id, Tool: instancepresence.ToolCodex,
+			Runtime: instancepresence.RuntimeIdentity{HostID: "host-a", BootID: boot, RootProcess: root},
+			Members: []instancepresence.ProcessIdentity{root, {PID: 61, StartedAt: nodeStart}},
+		},
+		LaunchProcess:    instancepresence.ProcessIdentity{PID: 61, StartedAt: nodeStart},
+		WorkingDirectory: "/tmp/p",
+		Argv:             []string{"codex"},
+	}
+	if err := sync.ApplyRecognition(runtimerecognition.Result{Families: []runtimerecognition.Family{family}}, boot); err != nil {
+		t.Fatal(err)
+	}
+	inst, _ := registry.Get(id)
+	if inst.StartupPending || inst.State != instancepresence.StateIdle {
+		t.Fatalf("pre-baseline launcher must be idle: %#v", inst)
+	}
+}
+
+func TestCodexTwoOldShellsIndependentLaunchPending(t *testing.T) {
+	clock := &fakeClock{now: time.Date(2026, 7, 27, 13, 0, 0, 0, time.UTC)}
+	registry, err := instanceregistry.New(instanceregistry.Config{
+		Clock: clock, SlotNamespace: "default", LeaseDuration: time.Minute, GracePeriod: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sync, err := NewRegistrySync(registry, "host-a", "epoch-runtime", instancepresence.SourceDescriptor{
+		Provider: "linux-runtime", Profile: "default", CollectorID: "runtime-presence",
+	}, clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sync.projectTrust = func(_, projectDir, _ string) codextrust.Status {
+		if projectDir == "/tmp/untrusted" {
+			return codextrust.NotTrusted
+		}
+		return codextrust.Trusted
+	}
+	baseline := sync.ObserverStartedAt()
+	boot := instancepresence.BootIdentity("boot-a")
+	shellStart := baseline.Add(-time.Hour)
+	nodeA := baseline.Add(time.Second)
+	nodeB := baseline.Add(2 * time.Second)
+	rootA := instancepresence.ProcessIdentity{PID: 70, StartedAt: shellStart}
+	rootB := instancepresence.ProcessIdentity{PID: 71, StartedAt: shellStart.Add(time.Minute)}
+	idA := runtimerecognition.StableInstanceID("host-a", boot, instancepresence.ToolCodex, rootA)
+	idB := runtimerecognition.StableInstanceID("host-a", boot, instancepresence.ToolCodex, rootB)
+	family := func(id instancepresence.InstanceID, root, launch instancepresence.ProcessIdentity, cwd string) runtimerecognition.Family {
+		return runtimerecognition.Family{
+			Candidate: instancepresence.RuntimeCandidate{
+				InstanceID: id, Tool: instancepresence.ToolCodex,
+				Runtime: instancepresence.RuntimeIdentity{HostID: "host-a", BootID: boot, RootProcess: root},
+				Members: []instancepresence.ProcessIdentity{root, launch},
+			},
+			LaunchProcess:    launch,
+			WorkingDirectory: cwd,
+			Argv:             []string{"codex"},
+		}
+	}
+	if err := sync.ApplyRecognition(runtimerecognition.Result{Families: []runtimerecognition.Family{
+		family(idA, rootA, instancepresence.ProcessIdentity{PID: 80, StartedAt: nodeA}, "/tmp/untrusted"),
+		family(idB, rootB, instancepresence.ProcessIdentity{PID: 81, StartedAt: nodeB}, "/tmp/trusted"),
+	}}, boot); err != nil {
+		t.Fatal(err)
+	}
+	a, _ := registry.Get(idA)
+	b, _ := registry.Get(idB)
+	if !a.StartupPending || a.State != instancepresence.StateAttention {
+		t.Fatalf("untrusted A = %#v", a)
+	}
+	if b.StartupPending || b.State != instancepresence.StateIdle {
+		t.Fatalf("trusted B = %#v", b)
 	}
 }
 
