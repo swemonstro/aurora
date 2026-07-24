@@ -20,9 +20,15 @@ type RegistrySync struct {
 	// known maps instance ID → last runtime revision applied by this sync.
 	known map[instancepresence.InstanceID]instancepresence.RuntimeRevision
 	clock Clock
+	// observerStartedAt is the wall-clock moment this sync (observer) began.
+	// Claude roots with RootProcess.StartedAt strictly after this baseline are
+	// startup-pending until their first hook. Pre-existing processes at service
+	// restart stay idle without a hook.
+	observerStartedAt time.Time
 }
 
 // NewRegistrySync constructs a multi-instance registry synchronizer.
+// The observer baseline is taken from clock() at construction time.
 func NewRegistrySync(
 	registry *instanceregistry.Registry,
 	hostID string,
@@ -45,11 +51,19 @@ func NewRegistrySync(
 	if clock == nil {
 		return nil, fmt.Errorf("clock must not be nil")
 	}
+	baseline := clock().UTC()
+	if baseline.IsZero() {
+		return nil, fmt.Errorf("observer baseline clock returned zero time")
+	}
 	return &RegistrySync{
 		registry: registry, hostID: hostID, producerEpoch: epoch, source: source,
 		known: make(map[instancepresence.InstanceID]instancepresence.RuntimeRevision), clock: clock,
+		observerStartedAt: baseline,
 	}, nil
 }
+
+// ObserverStartedAt reports the baseline used for Claude startup-pending.
+func (sync *RegistrySync) ObserverStartedAt() time.Time { return sync.observerStartedAt }
 
 // ApplyRecognition registers/renews secure families and ends missing ones.
 // Handles 0→1→2→1→0 without mixing instances (identity is host+boot+pid+start).
@@ -78,6 +92,7 @@ func (sync *RegistrySync) ApplyRecognition(result runtimerecognition.Result, boo
 				ProducerEpoch: sync.producerEpoch, RuntimeRevision: 1, ObservedAt: now,
 				IdempotencyKey: fmt.Sprintf("runtime-register|%s|1", id),
 				Status:         status,
+				StartupPending: claudeStartupPending(candidate.Tool, candidate.Runtime.RootProcess.StartedAt, sync.observerStartedAt),
 			}
 			if _, err := sync.registry.Register(registration); err != nil {
 				// Exact retry of identical registration is OK; identity conflicts are hard errors.
@@ -133,6 +148,19 @@ func (sync *RegistrySync) renew(id instancepresence.InstanceID, status instancep
 
 // KnownCount reports tracked instances (tests).
 func (sync *RegistrySync) KnownCount() int { return len(sync.known) }
+
+// claudeStartupPending is true only for Claude roots whose /proc generation
+// start time is strictly after the observer baseline. Codex and processes that
+// already existed at observer start remain non-pending (idle without hooks).
+func claudeStartupPending(tool instancepresence.ToolKind, processStarted, observerStarted time.Time) bool {
+	if tool != instancepresence.ToolClaude {
+		return false
+	}
+	if processStarted.IsZero() || observerStarted.IsZero() {
+		return false
+	}
+	return processStarted.After(observerStarted)
+}
 
 // Ensure time import used when clock advances in tests via external.
 var _ = time.Second

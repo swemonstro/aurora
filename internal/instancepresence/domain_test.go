@@ -80,13 +80,13 @@ func TestEffectiveStateUsesIdleProcessBaseAndHookClaim(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			got, active, err := Effective(RuntimeAlive, test.claim)
+			got, active, err := Effective(RuntimeAlive, test.claim, false)
 			if err != nil || !active || got != test.want {
 				t.Fatalf("Effective = %q, %t, %v; want %q, true, nil", got, active, err, test.want)
 			}
 			// A process observation changes runtime ownership only. Retaining the
 			// claim proves a poll cannot lower hook-owned state.
-			gotAfterPoll, active, err := Effective(RuntimeAlive, test.claim)
+			gotAfterPoll, active, err := Effective(RuntimeAlive, test.claim, false)
 			if err != nil || !active || gotAfterPoll != test.want {
 				t.Fatalf("Effective after process update = %q, %t, %v; want %q", gotAfterPoll, active, err, test.want)
 			}
@@ -99,16 +99,42 @@ func TestHookIdleClearsClaim(t *testing.T) {
 	if err != nil || claim != NoHookClaim {
 		t.Fatalf("ApplyHookState(idle) = %q, %v; want empty claim", claim, err)
 	}
-	state, active, err := Effective(RuntimeAlive, claim)
+	state, active, err := Effective(RuntimeAlive, claim, false)
 	if err != nil || !active || state != StateIdle {
 		t.Fatalf("Effective after hook idle = %q, %t, %v", state, active, err)
 	}
 }
 
 func TestEndedRuntimeHasNoActiveInstance(t *testing.T) {
-	state, active, err := Effective(RuntimeEnded, ClaimWorking)
+	state, active, err := Effective(RuntimeEnded, ClaimWorking, false)
 	if err != nil || active || state != "" {
 		t.Fatalf("Effective(ended) = %q, %t, %v; want empty, false, nil", state, active, err)
+	}
+}
+
+func TestStartupPendingIsAttentionUntilHook(t *testing.T) {
+	got, active, err := Effective(RuntimeAlive, NoHookClaim, true)
+	if err != nil || !active || got != StateAttention {
+		t.Fatalf("startup pending = %q, %t, %v; want attention", got, active, err)
+	}
+	// Explicit hooks win over startup-pending.
+	got, active, err = Effective(RuntimeAlive, ClaimWorking, true)
+	if err != nil || !active || got != StateWorking {
+		t.Fatalf("working claim with startup pending = %q, %t, %v", got, active, err)
+	}
+	got, active, err = Effective(RuntimeAlive, ClaimError, true)
+	if err != nil || !active || got != StateError {
+		t.Fatalf("error claim with startup pending = %q, %t, %v", got, active, err)
+	}
+	// After SessionStart clears claim and startup-pending flag is cleared by registry.
+	got, active, err = Effective(RuntimeAlive, NoHookClaim, false)
+	if err != nil || !active || got != StateIdle {
+		t.Fatalf("post-sessionstart idle = %q, %t, %v", got, active, err)
+	}
+	// Suspended still attention during startup-pending.
+	got, active, err = Effective(RuntimeSuspended, NoHookClaim, true)
+	if err != nil || !active || got != StateAttention {
+		t.Fatalf("suspended startup = %q, %t, %v", got, active, err)
 	}
 }
 
@@ -128,14 +154,14 @@ func TestSuspendedRuntimeIsActiveAndMapsToAttention(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			got, active, err := Effective(RuntimeSuspended, test.claim)
+			got, active, err := Effective(RuntimeSuspended, test.claim, false)
 			if err != nil || !active || got != test.want {
 				t.Fatalf("Effective(suspended) = %q, %t, %v; want %q", got, active, err, test.want)
 			}
 		})
 	}
 	// Resume restores hook claim presentation.
-	got, active, err := Effective(RuntimeAlive, ClaimWorking)
+	got, active, err := Effective(RuntimeAlive, ClaimWorking, false)
 	if err != nil || !active || got != StateWorking {
 		t.Fatalf("Effective after resume = %q, %t, %v", got, active, err)
 	}

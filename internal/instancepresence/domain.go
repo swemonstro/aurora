@@ -171,19 +171,22 @@ func ApplyHookState(state EffectiveState) (HookClaim, error) {
 	}
 }
 
-// Effective derives presentation state from RuntimeStatus and HookClaim.
+// Effective derives presentation state from RuntimeStatus, HookClaim, and
+// optional Claude startup-pending (trust dialog before first hook).
 // Priority for active runtimes:
 //
-//	hook error            -> error
-//	runtime suspended     -> attention
-//	hook attention        -> attention
-//	hook working          -> working
-//	no hook claim         -> idle
+//	hook error                         -> error
+//	runtime suspended                  -> attention
+//	hook attention                     -> attention
+//	hook working                       -> working
+//	startup-pending (no later claim)   -> attention
+//	no hook claim                      -> idle
 //
 // Suspended never clears or overwrites HookClaim; callers keep the claim so
 // resume can restore working/attention/error once the process is alive again.
-// The bool is false when the runtime is no longer active (ended).
-func Effective(runtime RuntimeStatus, claim HookClaim) (EffectiveState, bool, error) {
+// Startup-pending never overrides an explicit hook claim. The bool is false
+// when the runtime is no longer active (ended).
+func Effective(runtime RuntimeStatus, claim HookClaim, startupPending bool) (EffectiveState, bool, error) {
 	if err := runtime.Validate(); err != nil {
 		return "", false, err
 	}
@@ -199,10 +202,17 @@ func Effective(runtime RuntimeStatus, claim HookClaim) (EffectiveState, bool, er
 	if runtime == RuntimeSuspended {
 		return StateAttention, true, nil
 	}
-	if claim == NoHookClaim {
-		return StateIdle, true, nil
+	if claim == ClaimAttention {
+		return StateAttention, true, nil
 	}
-	return EffectiveState(claim), true, nil
+	if claim == ClaimWorking {
+		return StateWorking, true, nil
+	}
+	// claim is NoHookClaim (SessionStart idle clears the claim).
+	if startupPending {
+		return StateAttention, true, nil
+	}
+	return StateIdle, true, nil
 }
 
 type Slot struct {
@@ -305,6 +315,12 @@ type Instance struct {
 	Slot      Slot
 	Lifecycle LifecycleTimestamps
 	Revisions Revisions
+	// StartupPending is true for Claude runtimes discovered after the
+	// observer baseline with no bound hook yet (e.g. "Do you trust this
+	// folder?"). It is not a wire field; presentation uses State only.
+	// Cleared on the first accepted hook mutation. Never set for Codex or
+	// for processes that already existed at observer start.
+	StartupPending bool
 }
 
 func (instance Instance) Validate() error {
@@ -334,7 +350,7 @@ func (instance Instance) Validate() error {
 		return errors.New("hook claim requires a positive hook revision")
 	}
 
-	effective, active, err := Effective(instance.Status, instance.HookClaim)
+	effective, active, err := Effective(instance.Status, instance.HookClaim, instance.StartupPending)
 	if err != nil {
 		return err
 	}
@@ -347,6 +363,9 @@ func (instance Instance) Validate() error {
 	}
 	if !active && instance.HookClaim != NoHookClaim {
 		return errors.New("ended runtime must not retain a hook claim")
+	}
+	if !active && instance.StartupPending {
+		return errors.New("ended runtime must not retain startup-pending")
 	}
 	return nil
 }

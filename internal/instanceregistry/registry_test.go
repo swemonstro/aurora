@@ -583,6 +583,33 @@ func TestRegisterSuspendedStartsAsAttention(t *testing.T) {
 	}
 }
 
+func TestRegisterStartupPendingAttentionClearedBySessionStart(t *testing.T) {
+	registry, clock := newTestRegistry(t)
+	value := registration("instance-trust", 303)
+	value.StartupPending = true
+	inst, err := registry.Register(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !inst.StartupPending || inst.State != instancepresence.StateAttention || inst.Revisions.HookRevision != 0 {
+		t.Fatalf("register startup-pending = %#v", inst)
+	}
+	slot := inst.Slot
+	clock.Advance(time.Second)
+	after, err := registry.ApplyNextHookMutation(
+		"instance-trust", "epoch-a", instancepresence.StateIdle, clock.Now(), "session-start",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.StartupPending || after.State != instancepresence.StateIdle || after.Revisions.HookRevision != 1 {
+		t.Fatalf("after SessionStart = %#v", after)
+	}
+	if after.Slot != slot || after.ID != "instance-trust" {
+		t.Fatalf("slot/id changed: %#v", after)
+	}
+}
+
 func TestApplyNextHookMutationSequencesPerRuntime(t *testing.T) {
 	registry, _ := newTestRegistry(t)
 	mustRegister(t, registry, registration("instance-a", 101))

@@ -13,6 +13,7 @@ func TestMapEvent(t *testing.T) {
 		state  status.State
 		remove bool
 	}{
+		{name: "session start after trust", event: Event{HookEventName: "SessionStart"}, state: status.Idle},
 		{name: "prompt", event: Event{HookEventName: "UserPromptSubmit"}, state: status.Working},
 		{name: "permission notification", event: Event{HookEventName: "Notification", NotificationType: "permission_prompt"}, state: status.Attention},
 		{name: "idle notification", event: Event{HookEventName: "Notification", NotificationType: "idle_prompt"}, state: status.Idle},

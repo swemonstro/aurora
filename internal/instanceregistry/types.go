@@ -50,6 +50,10 @@ type Registration struct {
 	// newly discovered stopped process can open as attention without a
 	// temporary idle presentation.
 	Status instancepresence.RuntimeStatus
+	// StartupPending marks a Claude runtime born after the observer baseline
+	// with no hooks yet (trust dialog). Codex and pre-existing processes
+	// leave this false.
+	StartupPending bool
 }
 
 func (registration Registration) validate() error {

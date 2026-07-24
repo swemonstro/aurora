@@ -158,6 +158,10 @@ func sanitizeFilenamePart(value string) string {
 
 func MapEvent(event Event) (EventAction, bool) {
 	switch event.HookEventName {
+	case "SessionStart":
+		// Emitted after the user passes the startup trust dialog
+		// ("Do you trust this folder?"). Clears startup-pending to idle.
+		return EventAction{State: status.Idle}, true
 	case "UserPromptSubmit":
 		return EventAction{State: status.Working}, true
 	case "Notification":

@@ -29,7 +29,7 @@ func (registry *Registry) ExpireLeases() (ExpiryResult, error) {
 			if !now.Before(instance.Lifecycle.LeaseExpiresAt) {
 				instance.Status = instancepresence.RuntimeSuspectMissing
 				// Recompute effective state after lease-driven status change.
-				if effective, active, err := instancepresence.Effective(instance.Status, instance.HookClaim); err == nil && active {
+				if effective, active, err := instancepresence.Effective(instance.Status, instance.HookClaim, instance.StartupPending); err == nil && active {
 					if instance.State != effective {
 						instance.State = effective
 						instance.Lifecycle.StateChangedAt = now
@@ -44,6 +44,7 @@ func (registry *Registry) ExpireLeases() (ExpiryResult, error) {
 				// producer revision. The last accepted producer payload remains.
 				instance.Status = instancepresence.RuntimeEnded
 				instance.HookClaim = instancepresence.NoHookClaim
+				instance.StartupPending = false
 				instance.State = ""
 				instance.Lifecycle.EndedAt = timePointer(now)
 				instance.Lifecycle.SlotReleasedAt = timePointer(now)

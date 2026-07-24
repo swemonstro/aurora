@@ -99,7 +99,7 @@ func (registry *Registry) Register(registration Registration) (instancepresence.
 		return instancepresence.Instance{}, fmt.Errorf("register slot: %w", err)
 	}
 	status := registration.initialStatus()
-	effective, active, err := instancepresence.Effective(status, instancepresence.NoHookClaim)
+	effective, active, err := instancepresence.Effective(status, instancepresence.NoHookClaim, registration.StartupPending)
 	if err != nil || !active {
 		return instancepresence.Instance{}, fmt.Errorf("register effective state: %w", err)
 	}
@@ -111,7 +111,8 @@ func (registry *Registry) Register(registration Registration) (instancepresence.
 		Lifecycle: instancepresence.LifecycleTimestamps{
 			DiscoveredAt: now, LastSeenAt: now, LeaseExpiresAt: now.Add(registry.leaseDuration), StateChangedAt: now,
 		},
-		Revisions: instancepresence.Revisions{ProducerEpoch: registration.ProducerEpoch, RuntimeRevision: registration.RuntimeRevision},
+		Revisions:      instancepresence.Revisions{ProducerEpoch: registration.ProducerEpoch, RuntimeRevision: registration.RuntimeRevision},
+		StartupPending: registration.StartupPending,
 	}
 	if err := instance.Validate(); err != nil {
 		return instancepresence.Instance{}, fmt.Errorf("register invariant: %w", err)
@@ -207,7 +208,9 @@ func (registry *Registry) ApplyRuntimeMutation(id instancepresence.InstanceID, m
 		record.instance.Status = mutation.Status
 		record.instance.Lifecycle.LastSeenAt = now
 		record.instance.Lifecycle.LeaseExpiresAt = now.Add(registry.leaseDuration)
-		effective, active, err := instancepresence.Effective(record.instance.Status, record.instance.HookClaim)
+		effective, active, err := instancepresence.Effective(
+			record.instance.Status, record.instance.HookClaim, record.instance.StartupPending,
+		)
 		if err != nil {
 			return instancepresence.Instance{}, err
 		}
@@ -351,13 +354,15 @@ func (registry *Registry) applyHookLocked(
 	// Persist the wire request state in the hook payload for idempotency, but
 	// derive Instance.State from RuntimeStatus + HookClaim so suspended
 	// processes present as attention while claims are preserved.
+	// Any accepted hook ends Claude startup-pending (SessionStart, prompt, …).
 	payload := hookPayload{producerEpoch, hookRevision, state, observedAt}
 	previousState := record.instance.State
 	record.hookIdempotency[idempotencyKey] = payload
 	record.hookPayload = payload
 	record.instance.Revisions.HookRevision = hookRevision
 	record.instance.HookClaim = claim
-	effective, active, err := instancepresence.Effective(record.instance.Status, claim)
+	record.instance.StartupPending = false
+	effective, active, err := instancepresence.Effective(record.instance.Status, claim, false)
 	if err != nil {
 		return instancepresence.Instance{}, err
 	}
@@ -384,6 +389,7 @@ func checkIdempotency[T comparable](op string, id instancepresence.InstanceID, k
 func (registry *Registry) endLocked(record *record, now time.Time) {
 	record.instance.Status = instancepresence.RuntimeEnded
 	record.instance.HookClaim = instancepresence.NoHookClaim
+	record.instance.StartupPending = false
 	record.instance.State = ""
 	record.instance.Lifecycle.LastSeenAt = now
 	record.instance.Lifecycle.LeaseExpiresAt = now

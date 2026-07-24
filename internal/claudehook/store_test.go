@@ -45,6 +45,7 @@ func TestSessionEventSemantics(t *testing.T) {
 		event Event
 		want  status.State
 	}{
+		{name: "session start", event: Event{HookEventName: "SessionStart", SessionID: "a"}, want: status.Idle},
 		{name: "prompt", event: Event{HookEventName: "UserPromptSubmit", SessionID: "a"}, want: status.Working},
 		{name: "stop for unknown session", event: Event{HookEventName: "Stop", SessionID: "a"}, want: status.Idle},
 		{name: "permission", event: Event{HookEventName: "Notification", SessionID: "a", NotificationType: "permission_prompt"}, want: status.Attention},
