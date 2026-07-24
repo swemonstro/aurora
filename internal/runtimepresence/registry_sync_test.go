@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/swemonstro/aurora/internal/claudetrust"
 	"github.com/swemonstro/aurora/internal/codexhook"
 	"github.com/swemonstro/aurora/internal/codextrust"
 	"github.com/swemonstro/aurora/internal/instancepresence"
@@ -375,6 +376,9 @@ func TestClaudeStartupPendingAfterObserverBaseline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	sync.claudeTrust = func(pid uint64, userHome, cwd string) claudetrust.Status {
+		return claudetrust.ProjectMissing
+	}
 	boot := instancepresence.BootIdentity("boot-a")
 	baseline := sync.ObserverStartedAt()
 
@@ -493,6 +497,273 @@ func TestClaudeStartupPendingAfterObserverBaseline(t *testing.T) {
 	}
 }
 
+func TestRegistrySyncClaudeTrust_PostBaselineMissingRegistersAttention(t *testing.T) {
+	clock := &fakeClock{now: time.Date(2026, 7, 24, 12, 30, 0, 0, time.UTC)}
+	registry, err := instanceregistry.New(instanceregistry.Config{
+		Clock: clock, SlotNamespace: "default", LeaseDuration: time.Minute, GracePeriod: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sync, err := NewRegistrySync(registry, "host-a", "epoch-runtime", instancepresence.SourceDescriptor{
+		Provider: "linux-runtime", Profile: "default", CollectorID: "runtime-presence",
+	}, clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sync.userHome = func() (string, error) { return "/home/carl", nil }
+	sync.claudeTrust = func(pid uint64, userHome, cwd string) claudetrust.Status {
+		return claudetrust.ProjectMissing
+	}
+
+	boot := instancepresence.BootIdentity("boot-a")
+	start := sync.ObserverStartedAt().Add(time.Second)
+	id := runtimerecognition.StableInstanceID("host-a", boot, instancepresence.ToolClaude, instancepresence.ProcessIdentity{PID: 500, StartedAt: start})
+	family := runtimerecognition.Family{
+		Candidate: instancepresence.RuntimeCandidate{
+			InstanceID: id, Tool: instancepresence.ToolClaude,
+			Runtime: instancepresence.RuntimeIdentity{
+				HostID: "host-a", BootID: boot, RootProcess: instancepresence.ProcessIdentity{PID: 500, StartedAt: start},
+			},
+			Members: []instancepresence.ProcessIdentity{{PID: 500, StartedAt: start}},
+		},
+		WorkingDirectory: "/home/carl/proj",
+	}
+
+	if err := sync.ApplyRecognition(runtimerecognition.Result{Families: []runtimerecognition.Family{family}}, boot); err != nil {
+		t.Fatal(err)
+	}
+	inst, err := registry.Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !inst.StartupPending || inst.State != instancepresence.StateAttention || inst.Revisions.HookRevision != 0 {
+		t.Fatalf("got %#v, want attention pending hook_rev=0", inst)
+	}
+}
+
+func TestRegistrySyncClaudeTrust_RegisterPresentOrUnknownIsIdle(t *testing.T) {
+	clock := &fakeClock{now: time.Date(2026, 7, 24, 12, 45, 0, 0, time.UTC)}
+	registry, err := instanceregistry.New(instanceregistry.Config{
+		Clock: clock, SlotNamespace: "default", LeaseDuration: time.Minute, GracePeriod: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sync, err := NewRegistrySync(registry, "host-a", "epoch-runtime", instancepresence.SourceDescriptor{
+		Provider: "linux-runtime", Profile: "default", CollectorID: "runtime-presence",
+	}, clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sync.userHome = func() (string, error) { return "/home/carl", nil }
+
+	boot := instancepresence.BootIdentity("boot-a")
+	startA := sync.ObserverStartedAt().Add(time.Second)
+	idA := runtimerecognition.StableInstanceID("host-a", boot, instancepresence.ToolClaude, instancepresence.ProcessIdentity{PID: 501, StartedAt: startA})
+	startB := sync.ObserverStartedAt().Add(2 * time.Second)
+	idB := runtimerecognition.StableInstanceID("host-a", boot, instancepresence.ToolClaude, instancepresence.ProcessIdentity{PID: 502, StartedAt: startB})
+
+	sync.claudeTrust = func(pid uint64, userHome, cwd string) claudetrust.Status {
+		if pid == 501 {
+			return claudetrust.ProjectPresent
+		}
+		return claudetrust.Unknown
+	}
+	family := func(id instancepresence.InstanceID, pid uint64, start time.Time) runtimerecognition.Family {
+		return runtimerecognition.Family{
+			Candidate: instancepresence.RuntimeCandidate{
+				InstanceID: id, Tool: instancepresence.ToolClaude,
+				Runtime: instancepresence.RuntimeIdentity{
+					HostID: "host-a", BootID: boot, RootProcess: instancepresence.ProcessIdentity{PID: pid, StartedAt: start},
+				},
+				Members: []instancepresence.ProcessIdentity{{PID: pid, StartedAt: start}},
+			},
+			WorkingDirectory: "/home/carl/proj",
+		}
+	}
+
+	if err := sync.ApplyRecognition(runtimerecognition.Result{Families: []runtimerecognition.Family{
+		family(idA, 501, startA),
+		family(idB, 502, startB),
+	}}, boot); err != nil {
+		t.Fatal(err)
+	}
+	a, _ := registry.Get(idA)
+	if a.StartupPending || a.State != instancepresence.StateIdle || a.Revisions.HookRevision != 0 {
+		t.Fatalf("present got %#v want idle non-pending hook_rev=0", a)
+	}
+	b, _ := registry.Get(idB)
+	if b.StartupPending || b.State != instancepresence.StateIdle || b.Revisions.HookRevision != 0 {
+		t.Fatalf("unknown got %#v want idle non-pending hook_rev=0", b)
+	}
+}
+
+func TestRegistrySyncClaudeTrust_UnknownToMissingSetsPending(t *testing.T) {
+	clock := &fakeClock{now: time.Date(2026, 7, 24, 13, 10, 0, 0, time.UTC)}
+	registry, err := instanceregistry.New(instanceregistry.Config{
+		Clock: clock, SlotNamespace: "default", LeaseDuration: time.Minute, GracePeriod: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sync, err := NewRegistrySync(registry, "host-a", "epoch-runtime", instancepresence.SourceDescriptor{
+		Provider: "linux-runtime", Profile: "default", CollectorID: "runtime-presence",
+	}, clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sync.userHome = func() (string, error) { return "/home/carl", nil }
+
+	boot := instancepresence.BootIdentity("boot-a")
+	start := sync.ObserverStartedAt().Add(time.Second)
+	id := runtimerecognition.StableInstanceID("host-a", boot, instancepresence.ToolClaude, instancepresence.ProcessIdentity{PID: 503, StartedAt: start})
+	family := runtimerecognition.Family{
+		Candidate: instancepresence.RuntimeCandidate{
+			InstanceID: id, Tool: instancepresence.ToolClaude,
+			Runtime: instancepresence.RuntimeIdentity{
+				HostID: "host-a", BootID: boot, RootProcess: instancepresence.ProcessIdentity{PID: 503, StartedAt: start},
+			},
+			Members: []instancepresence.ProcessIdentity{{PID: 503, StartedAt: start}},
+		},
+		WorkingDirectory: "/home/carl/proj",
+	}
+
+	state := claudetrust.Unknown
+	sync.claudeTrust = func(pid uint64, userHome, cwd string) claudetrust.Status { return state }
+
+	if err := sync.ApplyRecognition(runtimerecognition.Result{Families: []runtimerecognition.Family{family}}, boot); err != nil {
+		t.Fatal(err)
+	}
+	first, _ := registry.Get(id)
+	if first.StartupPending || first.State != instancepresence.StateIdle {
+		t.Fatalf("first got %#v want idle non-pending", first)
+	}
+
+	state = claudetrust.ProjectMissing
+	clock.now = clock.now.Add(time.Second)
+	if err := sync.ApplyRecognition(runtimerecognition.Result{Families: []runtimerecognition.Family{family}}, boot); err != nil {
+		t.Fatal(err)
+	}
+	second, _ := registry.Get(id)
+	if !second.StartupPending || second.State != instancepresence.StateAttention || second.Revisions.HookRevision != 0 {
+		t.Fatalf("second got %#v want attention pending hook_rev=0", second)
+	}
+}
+
+func TestRegistrySyncClaudeTrust_MissingToPresentClearsPendingPreservesSlot(t *testing.T) {
+	clock := &fakeClock{now: time.Date(2026, 7, 24, 13, 20, 0, 0, time.UTC)}
+	registry, err := instanceregistry.New(instanceregistry.Config{
+		Clock: clock, SlotNamespace: "default", LeaseDuration: time.Minute, GracePeriod: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sync, err := NewRegistrySync(registry, "host-a", "epoch-runtime", instancepresence.SourceDescriptor{
+		Provider: "linux-runtime", Profile: "default", CollectorID: "runtime-presence",
+	}, clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sync.userHome = func() (string, error) { return "/home/carl", nil }
+
+	boot := instancepresence.BootIdentity("boot-a")
+	start := sync.ObserverStartedAt().Add(time.Second)
+	id := runtimerecognition.StableInstanceID("host-a", boot, instancepresence.ToolClaude, instancepresence.ProcessIdentity{PID: 504, StartedAt: start})
+	family := runtimerecognition.Family{
+		Candidate: instancepresence.RuntimeCandidate{
+			InstanceID: id, Tool: instancepresence.ToolClaude,
+			Runtime: instancepresence.RuntimeIdentity{
+				HostID: "host-a", BootID: boot, RootProcess: instancepresence.ProcessIdentity{PID: 504, StartedAt: start},
+			},
+			Members: []instancepresence.ProcessIdentity{{PID: 504, StartedAt: start}},
+		},
+		WorkingDirectory: "/home/carl/proj",
+	}
+
+	state := claudetrust.ProjectMissing
+	sync.claudeTrust = func(pid uint64, userHome, cwd string) claudetrust.Status { return state }
+
+	if err := sync.ApplyRecognition(runtimerecognition.Result{Families: []runtimerecognition.Family{family}}, boot); err != nil {
+		t.Fatal(err)
+	}
+	first, _ := registry.Get(id)
+	if !first.StartupPending || first.State != instancepresence.StateAttention {
+		t.Fatalf("first got %#v want attention pending", first)
+	}
+	slot := first.Slot
+
+	state = claudetrust.ProjectPresent
+	clock.now = clock.now.Add(time.Second)
+	if err := sync.ApplyRecognition(runtimerecognition.Result{Families: []runtimerecognition.Family{family}}, boot); err != nil {
+		t.Fatal(err)
+	}
+	second, _ := registry.Get(id)
+	if second.ID != id || second.Slot != slot || second.Revisions.HookRevision != 0 {
+		t.Fatalf("id/slot/hook changed: %#v", second)
+	}
+	if second.StartupPending || second.State != instancepresence.StateIdle {
+		t.Fatalf("cleared got %#v want idle non-pending", second)
+	}
+}
+
+func TestRegistrySyncClaudeTrust_HookWinsNoReactivation(t *testing.T) {
+	clock := &fakeClock{now: time.Date(2026, 7, 24, 13, 30, 0, 0, time.UTC)}
+	registry, err := instanceregistry.New(instanceregistry.Config{
+		Clock: clock, SlotNamespace: "default", LeaseDuration: time.Minute, GracePeriod: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sync, err := NewRegistrySync(registry, "host-a", "epoch-runtime", instancepresence.SourceDescriptor{
+		Provider: "linux-runtime", Profile: "default", CollectorID: "runtime-presence",
+	}, clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sync.userHome = func() (string, error) { return "/home/carl", nil }
+
+	boot := instancepresence.BootIdentity("boot-a")
+	start := sync.ObserverStartedAt().Add(time.Second)
+	id := runtimerecognition.StableInstanceID("host-a", boot, instancepresence.ToolClaude, instancepresence.ProcessIdentity{PID: 505, StartedAt: start})
+	family := runtimerecognition.Family{
+		Candidate: instancepresence.RuntimeCandidate{
+			InstanceID: id, Tool: instancepresence.ToolClaude,
+			Runtime: instancepresence.RuntimeIdentity{
+				HostID: "host-a", BootID: boot, RootProcess: instancepresence.ProcessIdentity{PID: 505, StartedAt: start},
+			},
+			Members: []instancepresence.ProcessIdentity{{PID: 505, StartedAt: start}},
+		},
+		WorkingDirectory: "/home/carl/proj",
+	}
+
+	state := claudetrust.ProjectPresent
+	sync.claudeTrust = func(pid uint64, userHome, cwd string) claudetrust.Status { return state }
+
+	if err := sync.ApplyRecognition(runtimerecognition.Result{Families: []runtimerecognition.Family{family}}, boot); err != nil {
+		t.Fatal(err)
+	}
+	first, _ := registry.Get(id)
+	if first.StartupPending || first.State != instancepresence.StateIdle {
+		t.Fatalf("register got %#v want idle non-pending", first)
+	}
+
+	clock.now = clock.now.Add(time.Second)
+	if _, err := registry.ApplyNextHookMutation(id, "epoch-runtime", instancepresence.StateWorking, clock.now, "hook"); err != nil {
+		t.Fatal(err)
+	}
+
+	state = claudetrust.ProjectMissing
+	clock.now = clock.now.Add(time.Second)
+	if err := sync.ApplyRecognition(runtimerecognition.Result{Families: []runtimerecognition.Family{family}}, boot); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := registry.Get(id)
+	if after.StartupPending {
+		t.Fatalf("startup pending reactivated: %#v", after)
+	}
+}
+
 func TestClaudeStartupPendingSuspendAndFirstHookWins(t *testing.T) {
 	clock := &fakeClock{now: time.Date(2026, 7, 24, 13, 0, 0, 0, time.UTC)}
 	registry, err := instanceregistry.New(instanceregistry.Config{
@@ -506,6 +777,9 @@ func TestClaudeStartupPendingSuspendAndFirstHookWins(t *testing.T) {
 	}, clock.Now)
 	if err != nil {
 		t.Fatal(err)
+	}
+	sync.claudeTrust = func(pid uint64, userHome, cwd string) claudetrust.Status {
+		return claudetrust.ProjectMissing
 	}
 	boot := instancepresence.BootIdentity("boot-a")
 	start := sync.ObserverStartedAt().Add(time.Second)
@@ -623,6 +897,9 @@ func TestClaudePIDReuseDoesNotInheritStartupPending(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	sync.claudeTrust = func(pid uint64, userHome, cwd string) claudetrust.Status {
+		return claudetrust.ProjectMissing
+	}
 	boot := instancepresence.BootIdentity("boot-a")
 	start1 := sync.ObserverStartedAt().Add(time.Second)
 	id1 := runtimerecognition.StableInstanceID("host-a", boot, instancepresence.ToolClaude, instancepresence.ProcessIdentity{PID: 77, StartedAt: start1})
@@ -703,6 +980,9 @@ func TestCodexTrustStartupPending(t *testing.T) {
 		t.Fatal(err)
 	}
 	sync.userHome = func() (string, error) { return userHome, nil }
+	sync.claudeTrust = func(pid uint64, userHome, cwd string) claudetrust.Status {
+		return claudetrust.ProjectMissing
+	}
 
 	baseline := sync.ObserverStartedAt()
 	boot := instancepresence.BootIdentity("boot-a")

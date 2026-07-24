@@ -5,6 +5,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/swemonstro/aurora/internal/claudetrust"
 	"github.com/swemonstro/aurora/internal/codextrust"
 	"github.com/swemonstro/aurora/internal/instancepresence"
 	"github.com/swemonstro/aurora/internal/instanceregistry"
@@ -44,6 +45,9 @@ type RegistrySync struct {
 	userHome func() (string, error)
 	// projectTrust observes Codex config.toml trust. Tests may override.
 	projectTrust func(codexHomeEnv, projectDir, userHome string) codextrust.Status
+	// claudeTrust observes Claude project presence in ~/.claude.json through /proc/<pid>/root.
+	// Tests may override.
+	claudeTrust func(pid uint64, userHome, cwd string) claudetrust.Status
 }
 
 // NewRegistrySync constructs a multi-instance registry synchronizer.
@@ -81,6 +85,7 @@ func NewRegistrySync(
 		codexStartupTrust: make(map[instancepresence.InstanceID]codexStartupTrustState),
 		userHome:          os.UserHomeDir,
 		projectTrust:      codextrust.ProjectTrust,
+		claudeTrust:       claudetrust.Observer{ProcRoot: "/proc"}.Observe,
 	}, nil
 }
 
@@ -207,12 +212,26 @@ func (sync *RegistrySync) renew(
 	)
 	action := renewLeave
 	keySuffix := string(status)
+	var existing instancepresence.Instance
+	haveExisting := false
+	getExisting := func() (instancepresence.Instance, error) {
+		if haveExisting {
+			return existing, nil
+		}
+		inst, err := sync.registry.Get(id)
+		if err != nil {
+			return instancepresence.Instance{}, err
+		}
+		existing = inst
+		haveExisting = true
+		return existing, nil
+	}
 	// nextTrust is applied only after a successful registry mutation.
 	var nextTrust codexStartupTrustState
 	var commitTrust bool
 
 	if trustState, tracked := sync.codexStartupTrust[id]; tracked {
-		existing, err := sync.registry.Get(id)
+		existing, err := getExisting()
 		if err != nil {
 			return fmt.Errorf("renew %s: %w", id, err)
 		}
@@ -248,6 +267,37 @@ func (sync *RegistrySync) renew(
 			}
 		case codexTrustResolved:
 			// Never re-evaluate trust or re-activate pending.
+		}
+	}
+
+	// Claude trust observer: only post-baseline generations participate.
+	if family.Candidate.Tool == instancepresence.ToolClaude &&
+		family.Candidate.Runtime.RootProcess.StartedAt.After(sync.observerStartedAt) {
+		inst, err := getExisting()
+		if err != nil {
+			return fmt.Errorf("renew %s: %w", id, err)
+		}
+		// Once a hook owns the instance, never reactivate Claude startup pending.
+		if inst.Revisions.HookRevision == 0 &&
+			inst.HookClaim == instancepresence.NoHookClaim {
+			observe := sync.claudeTrust
+			if observe == nil {
+				observe = claudetrust.Observer{ProcRoot: "/proc"}.Observe
+			}
+			switch observe(family.Candidate.Runtime.RootProcess.PID, userHome, family.WorkingDirectory) {
+			case claudetrust.ProjectMissing:
+				if !inst.StartupPending {
+					action = renewSet
+					keySuffix = string(status) + "|claude-startup-pending"
+				}
+			case claudetrust.ProjectPresent:
+				if inst.StartupPending {
+					action = renewClear
+					keySuffix = string(status) + "|claude-startup-cleared"
+				}
+			case claudetrust.Unknown:
+				// Leave unchanged: do not invent attention or clear pending on uncertainty.
+			}
 		}
 	}
 
@@ -317,7 +367,18 @@ func (sync *RegistrySync) startupAtRegister(family runtimerecognition.Family, us
 	}
 	switch family.Candidate.Tool {
 	case instancepresence.ToolClaude:
-		return true, 0, false
+		observe := sync.claudeTrust
+		if observe == nil {
+			observe = claudetrust.Observer{ProcRoot: "/proc"}.Observe
+		}
+		switch observe(family.Candidate.Runtime.RootProcess.PID, userHome, family.WorkingDirectory) {
+		case claudetrust.ProjectMissing:
+			return true, 0, false
+		case claudetrust.ProjectPresent, claudetrust.Unknown:
+			return false, 0, false
+		default:
+			return false, 0, false
+		}
 	case instancepresence.ToolCodex:
 		// Interactivity from LaunchProcess argv only — never shell argv.
 		if !codextrust.InteractiveArgv(family.Argv) {
