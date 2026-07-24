@@ -17,6 +17,7 @@ import (
 const (
 	StateFileEnv      = "AURORA_CLAUDE_STATE_FILE"
 	SessionTTLEnv     = "AURORA_CLAUDE_SESSION_TTL"
+	WatcherFileEnv    = "AURORA_CLAUDE_WATCHER_FILE"
 	DefaultSessionTTL = 12 * time.Hour
 	stateLockTimeout  = time.Second
 	stateLockRetry    = 10 * time.Millisecond
@@ -28,12 +29,17 @@ type StateConfig struct {
 }
 
 type Session struct {
-	State     status.State `json:"state"`
-	UpdatedAt time.Time    `json:"updated_at"`
+	State            status.State `json:"state"`
+	UpdatedAt        time.Time    `json:"updated_at"`
+	ToolUseID        string       `json:"tool_use_id,omitempty"`
+	TranscriptPath   string       `json:"transcript_path,omitempty"`
+	TranscriptOffset int64        `json:"transcript_offset,omitempty"`
+	Revision         uint64       `json:"revision,omitempty"`
 }
 
 type sessionState struct {
-	Sessions map[string]Session `json:"sessions"`
+	Sessions     map[string]Session `json:"sessions"`
+	NextRevision uint64             `json:"next_revision,omitempty"`
 }
 
 type SessionStore struct {
@@ -42,9 +48,19 @@ type SessionStore struct {
 	now  func() time.Time
 }
 
+// QuestionWatch identifies one AskUserQuestion pending Esc recovery.
+type QuestionWatch struct {
+	SessionID        string `json:"session_id"`
+	ToolUseID        string `json:"tool_use_id"`
+	TranscriptPath   string `json:"transcript_path"`
+	TranscriptOffset int64  `json:"transcript_offset"`
+	Revision         uint64 `json:"revision"`
+}
+
 type LifecycleUpdate struct {
 	State  status.State
 	Active bool
+	Watch  *QuestionWatch
 }
 
 func StateConfigFromEnv(getenv func(string) string, userHomeDir func() (string, error)) (StateConfig, error) {
@@ -117,12 +133,81 @@ func (s *SessionStore) UpdateLifecycle(event Event) (LifecycleUpdate, bool, erro
 	}
 	now := s.now().UTC()
 	pruneStale(state.Sessions, now, s.ttl)
-	applyEvent(state.Sessions, event.SessionID, action, now)
+	watch := applyEvent(&state, event, action, now)
 	aggregate := Aggregate(state.Sessions)
 	if err := s.writeAtomic(directory, state); err != nil {
 		return LifecycleUpdate{}, true, err
 	}
-	return LifecycleUpdate{State: aggregate, Active: len(state.Sessions) > 0}, true, nil
+	return LifecycleUpdate{
+		State:  aggregate,
+		Active: len(state.Sessions) > 0,
+		Watch:  watch,
+	}, true, nil
+}
+
+// QuestionPending reports whether the watched AskUserQuestion is still the
+// active pending question for that session (same tool_use_id and revision).
+func (s *SessionStore) QuestionPending(watch QuestionWatch) (bool, error) {
+	state, err := s.read()
+	if err != nil {
+		return false, err
+	}
+	return questionMatches(state.Sessions[watch.SessionID], watch), nil
+}
+
+// RecoverCancelledQuestion marks a cancelled AskUserQuestion as idle when the
+// watch still matches. recovered is false when a newer lifecycle event already
+// superseded this watch (no duplicate transition).
+func (s *SessionStore) RecoverCancelledQuestion(watch QuestionWatch) (LifecycleUpdate, bool, error) {
+	directory := filepath.Dir(s.path)
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return LifecycleUpdate{}, false, fmt.Errorf("create session state directory: %w", err)
+	}
+	lock, err := os.OpenFile(s.path+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return LifecycleUpdate{}, false, fmt.Errorf("open session state lock: %w", err)
+	}
+	defer lock.Close()
+	if err := lock.Chmod(0o600); err != nil {
+		return LifecycleUpdate{}, false, fmt.Errorf("set session state lock permissions: %w", err)
+	}
+	if err := lockFile(lock, stateLockTimeout); err != nil {
+		return LifecycleUpdate{}, false, fmt.Errorf("lock session state: %w", err)
+	}
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+
+	state, err := s.read()
+	if err != nil {
+		return LifecycleUpdate{}, false, err
+	}
+	now := s.now().UTC()
+	pruneStale(state.Sessions, now, s.ttl)
+	session, exists := state.Sessions[watch.SessionID]
+	if !exists || !questionMatches(session, watch) {
+		return LifecycleUpdate{}, false, nil
+	}
+	state.NextRevision++
+	state.Sessions[watch.SessionID] = Session{
+		State:     status.Idle,
+		UpdatedAt: now,
+		Revision:  state.NextRevision,
+	}
+	if err := s.writeAtomic(directory, state); err != nil {
+		return LifecycleUpdate{}, false, err
+	}
+	return LifecycleUpdate{
+		State:  Aggregate(state.Sessions),
+		Active: true,
+	}, true, nil
+}
+
+func questionMatches(session Session, watch QuestionWatch) bool {
+	return session.State == status.Attention &&
+		session.ToolUseID == watch.ToolUseID &&
+		session.TranscriptPath == watch.TranscriptPath &&
+		session.Revision == watch.Revision &&
+		watch.ToolUseID != "" &&
+		watch.TranscriptPath != ""
 }
 
 func (s *SessionStore) read() (sessionState, error) {
@@ -210,16 +295,96 @@ func (s *SessionStore) writeAtomic(directory string, state sessionState) error {
 	return nil
 }
 
-func applyEvent(sessions map[string]Session, rawSessionID string, action EventAction, now time.Time) {
-	sessionID := strings.TrimSpace(rawSessionID)
+func applyEvent(state *sessionState, event Event, action EventAction, now time.Time) *QuestionWatch {
+	sessionID := strings.TrimSpace(event.SessionID)
 	if sessionID == "" {
-		return
+		return nil
 	}
 	if action.Remove {
-		delete(sessions, sessionID)
-		return
+		delete(state.Sessions, sessionID)
+		return nil
 	}
-	sessions[sessionID] = Session{State: action.State, UpdatedAt: now}
+
+	// New AskUserQuestion with transcript identity starts (or replaces) a watch.
+	if event.HookEventName == "PreToolUse" &&
+		event.ToolName == "AskUserQuestion" &&
+		event.ToolUseID != "" &&
+		event.TranscriptPath != "" {
+		state.NextRevision++
+		session := Session{
+			State:            action.State,
+			UpdatedAt:        now,
+			ToolUseID:        event.ToolUseID,
+			TranscriptPath:   event.TranscriptPath,
+			TranscriptOffset: transcriptEnd(event.TranscriptPath),
+			Revision:         state.NextRevision,
+		}
+		state.Sessions[sessionID] = session
+		return &QuestionWatch{
+			SessionID:        sessionID,
+			ToolUseID:        session.ToolUseID,
+			TranscriptPath:   session.TranscriptPath,
+			TranscriptOffset: session.TranscriptOffset,
+			Revision:         session.Revision,
+		}
+	}
+
+	existing := state.Sessions[sessionID]
+	if preservesQuestionWatch(event, existing) {
+		// Keep the pending question identity so Esc recovery stays valid across
+		// the verified permission_prompt follow-up for the same ask.
+		state.Sessions[sessionID] = Session{
+			State:            action.State,
+			UpdatedAt:        now,
+			ToolUseID:        existing.ToolUseID,
+			TranscriptPath:   existing.TranscriptPath,
+			TranscriptOffset: existing.TranscriptOffset,
+			Revision:         existing.Revision,
+		}
+		return nil
+	}
+
+	// Any other lifecycle progress invalidates an older question watcher and
+	// clears tool_use_id / transcript_path / prior revision identity.
+	state.NextRevision++
+	state.Sessions[sessionID] = Session{
+		State:     action.State,
+		UpdatedAt: now,
+		Revision:  state.NextRevision,
+	}
+	return nil
+}
+
+// preservesQuestionWatch is true only for the verified follow-up after
+// PreToolUse AskUserQuestion: Notification permission_prompt while the session
+// is still attention with an active question identity. idle_prompt, unknown
+// notification types, and all other lifecycle events must clear that identity
+// so a later permission_prompt cannot revive a stale watch.
+func preservesQuestionWatch(event Event, existing Session) bool {
+	if event.HookEventName != "Notification" {
+		return false
+	}
+	if event.NotificationType != "permission_prompt" {
+		return false
+	}
+	if existing.State != status.Attention {
+		return false
+	}
+	if existing.ToolUseID == "" || existing.TranscriptPath == "" {
+		return false
+	}
+	return true
+}
+
+func transcriptEnd(path string) int64 {
+	if strings.TrimSpace(path) == "" {
+		return 0
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	return info.Size()
 }
 
 func pruneStale(sessions map[string]Session, now time.Time, ttl time.Duration) {

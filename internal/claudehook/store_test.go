@@ -27,6 +27,18 @@ func TestParseEventFields(t *testing.T) {
 	}
 }
 
+func TestParseEventAskUserQuestionWatchFields(t *testing.T) {
+	event, err := ParseEvent([]byte(
+		`{"hook_event_name":"PreToolUse","session_id":" session-a ","tool_name":"AskUserQuestion","tool_use_id":" toolu-a ","transcript_path":" /tmp/t.jsonl "}`,
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if event.ToolUseID != "toolu-a" || event.TranscriptPath != "/tmp/t.jsonl" {
+		t.Fatalf("event = %#v", event)
+	}
+}
+
 func TestSessionEventSemantics(t *testing.T) {
 	tests := []struct {
 		name  string

@@ -438,9 +438,8 @@ func TestLocalIngressEnabledReachesSocketWithZeroRelay(t *testing.T) {
 		t.Fatal("enabled local mode must not call relay")
 	case <-time.After(100 * time.Millisecond):
 	}
-	if _, err := os.Stat(stateFile); err == nil {
-		t.Fatal("enabled local mode must not create legacy session store")
-	}
+	// Local mode may maintain session state for AskUserQuestion transcript
+	// watchers, but must never publish the aggregate to the legacy relay.
 }
 
 func TestLocalIngressDisabledUsesLegacyRelay(t *testing.T) {
@@ -607,6 +606,8 @@ func TestLocalIngressUnsupportedEventIsNotDelivered(t *testing.T) {
 }
 
 func TestLocalIngressAskUserQuestionDeclineClearsAttention(t *testing.T) {
+	defer stubQuestionWatcher(t)()
+
 	requests := make(chan localhooktransport.IngestRequest, 4)
 	socketPath := startLocalIngestSocketN(t, requests, 4)
 
@@ -635,7 +636,7 @@ func TestLocalIngressAskUserQuestionDeclineClearsAttention(t *testing.T) {
 			t.Fatalf("attention %s: %v", session, err)
 		}
 	}
-	// Esc / decline only on session-a.
+	// Esc / decline only on session-a (defensive PostToolUseFailure fallback).
 	if err := run(
 		context.Background(),
 		strings.NewReader(`{"hook_event_name":"PostToolUseFailure","session_id":"session-a","tool_name":"AskUserQuestion"}`),
@@ -681,6 +682,322 @@ func TestLocalIngressAskUserQuestionDeclineClearsAttention(t *testing.T) {
 		t.Fatal("local mode must not publish to legacy relay")
 	case <-time.After(50 * time.Millisecond):
 	}
+}
+
+func TestLocalQuestionTranscriptCancelDeliversIdle(t *testing.T) {
+	defer stubQuestionWatcher(t)()
+
+	requests := make(chan localhooktransport.IngestRequest, 6)
+	socketPath := startLocalIngestSocketN(t, requests, 6)
+
+	relayHits := make(chan struct{}, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		relayHits <- struct{}{}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	directory := t.TempDir()
+	statePath := filepath.Join(directory, "sessions.json")
+	transcriptA := filepath.Join(directory, "a.jsonl")
+	transcriptB := filepath.Join(directory, "b.jsonl")
+	if err := os.WriteFile(transcriptA, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(transcriptB, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	watcherDir := filepath.Join(directory, "watchers")
+	values := map[string]string{
+		claudehook.RelayURLEnv:                 server.URL,
+		claudehook.StateFileEnv:                statePath,
+		claudehook.SessionTTLEnv:               "1h",
+		claudehook.WatcherFileEnv:              watcherDir,
+		localhooktransport.EnvLocalHookEnabled: "1",
+		localhooktransport.EnvLocalHookSocket:  socketPath,
+	}
+	getenv := func(key string) string { return values[key] }
+
+	// PreToolUse AskUserQuestion starts watcher identity for two sessions.
+	if err := run(context.Background(), strings.NewReader(fmt.Sprintf(
+		`{"hook_event_name":"PreToolUse","session_id":"session-a","tool_name":"AskUserQuestion","tool_use_id":"toolu-a","transcript_path":%q}`,
+		transcriptA,
+	)), getenv); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(context.Background(), strings.NewReader(fmt.Sprintf(
+		`{"hook_event_name":"PreToolUse","session_id":"session-b","tool_name":"AskUserQuestion","tool_use_id":"toolu-b","transcript_path":%q}`,
+		transcriptB,
+	)), getenv); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		select {
+		case req := <-requests:
+			if req.Payload.State != instancepresence.StateAttention {
+				t.Fatalf("attention %d = %#v", i+1, req.Payload)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("missing attention %d", i+1)
+		}
+	}
+
+	watchA := mustQuestionWatch(t, statePath, "session-a", "toolu-a", transcriptA)
+	if watchA.TranscriptOffset != 0 || watchA.Revision == 0 {
+		t.Fatalf("watchA = %#v", watchA)
+	}
+
+	// Non-matching tool_use_id and is_error=false must not clear A.
+	if err := os.WriteFile(transcriptA, []byte(
+		`{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"other","is_error":true}]}}`+"\n"+
+			`{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu-a","is_error":false,"content":"answered"}]}}`+"\n",
+	), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Poll once via watchQuestion with short context would hang on TTL; instead
+	// verify scanner and pending still true, then write the real cancel.
+	matched, _, err := claudehook.ScanQuestionTranscript(transcriptA, "toolu-a", 0)
+	if err != nil || matched {
+		t.Fatalf("false positive match: matched=%t err=%v", matched, err)
+	}
+	store, err := claudehook.NewSessionStore(statePath, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := store.QuestionPending(watchA)
+	if err != nil || !pending {
+		t.Fatalf("A should still be pending: %t err=%v", pending, err)
+	}
+
+	// Structural Esc: matching tool_result with is_error=true (content ignored).
+	if err := os.WriteFile(transcriptA, []byte(
+		`{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu-a","is_error":true,"content":"ignored-by-matcher"}]}}`+"\n",
+	), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := watchQuestion(context.Background(), watchA, getenv); err != nil {
+		t.Fatalf("watchQuestion: %v", err)
+	}
+
+	select {
+	case req := <-requests:
+		if req.Payload.HookSessionRef != "session-a" || req.Payload.State != instancepresence.StateIdle {
+			t.Fatalf("cancel delivery = %#v", req.Payload)
+		}
+		if req.Payload.Tool != instancepresence.ToolClaude {
+			t.Fatalf("tool = %q", req.Payload.Tool)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("idle not delivered after transcript cancel")
+	}
+
+	select {
+	case extra := <-requests:
+		t.Fatalf("session-b must not change: %#v", extra)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	watchB := mustQuestionWatch(t, statePath, "session-b", "toolu-b", transcriptB)
+	pendingB, err := store.QuestionPending(watchB)
+	if err != nil || !pendingB {
+		t.Fatalf("B pending = %t err=%v", pendingB, err)
+	}
+
+	select {
+	case <-relayHits:
+		t.Fatal("local cancel recovery must not hit legacy relay")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	entries, err := os.ReadDir(watcherDir)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("watcher registration leaked: %#v", entries)
+	}
+}
+
+func TestLocalQuestionStopBeforeRecoverySkipsDuplicateIdle(t *testing.T) {
+	defer stubQuestionWatcher(t)()
+
+	requests := make(chan localhooktransport.IngestRequest, 4)
+	socketPath := startLocalIngestSocketN(t, requests, 4)
+	directory := t.TempDir()
+	statePath := filepath.Join(directory, "sessions.json")
+	transcriptPath := filepath.Join(directory, "t.jsonl")
+	if err := os.WriteFile(transcriptPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	values := map[string]string{
+		claudehook.StateFileEnv:                statePath,
+		claudehook.SessionTTLEnv:               "1h",
+		claudehook.WatcherFileEnv:              filepath.Join(directory, "watchers"),
+		localhooktransport.EnvLocalHookEnabled: "1",
+		localhooktransport.EnvLocalHookSocket:  socketPath,
+	}
+	getenv := func(key string) string { return values[key] }
+
+	if err := run(context.Background(), strings.NewReader(fmt.Sprintf(
+		`{"hook_event_name":"PreToolUse","session_id":"session-a","tool_name":"AskUserQuestion","tool_use_id":"toolu-a","transcript_path":%q}`,
+		transcriptPath,
+	)), getenv); err != nil {
+		t.Fatal(err)
+	}
+	watch := mustQuestionWatch(t, statePath, "session-a", "toolu-a", transcriptPath)
+	if err := run(context.Background(), strings.NewReader(
+		`{"hook_event_name":"Stop","session_id":"session-a"}`,
+	), getenv); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		select {
+		case <-requests:
+		case <-time.After(time.Second):
+			t.Fatalf("missing delivery %d", i+1)
+		}
+	}
+	if err := os.WriteFile(transcriptPath, []byte(
+		`{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu-a","is_error":true}]}}`+"\n",
+	), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := watchQuestion(context.Background(), watch, getenv); err != nil {
+		t.Fatalf("watch after Stop: %v", err)
+	}
+	select {
+	case extra := <-requests:
+		t.Fatalf("duplicate idle after Stop: %#v", extra)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func TestLocalQuestionApprovedFollowsWorkingIdle(t *testing.T) {
+	defer stubQuestionWatcher(t)()
+
+	requests := make(chan localhooktransport.IngestRequest, 4)
+	socketPath := startLocalIngestSocketN(t, requests, 4)
+	directory := t.TempDir()
+	statePath := filepath.Join(directory, "sessions.json")
+	transcriptPath := filepath.Join(directory, "t.jsonl")
+	if err := os.WriteFile(transcriptPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	values := map[string]string{
+		claudehook.StateFileEnv:                statePath,
+		claudehook.SessionTTLEnv:               "1h",
+		localhooktransport.EnvLocalHookEnabled: "1",
+		localhooktransport.EnvLocalHookSocket:  socketPath,
+	}
+	getenv := func(key string) string { return values[key] }
+
+	steps := []struct {
+		payload string
+		want    instancepresence.EffectiveState
+	}{
+		{
+			payload: fmt.Sprintf(
+				`{"hook_event_name":"PreToolUse","session_id":"session-a","tool_name":"AskUserQuestion","tool_use_id":"toolu-a","transcript_path":%q}`,
+				transcriptPath,
+			),
+			want: instancepresence.StateAttention,
+		},
+		{
+			payload: `{"hook_event_name":"PostToolUse","session_id":"session-a","tool_name":"AskUserQuestion"}`,
+			want:    instancepresence.StateWorking,
+		},
+		{
+			payload: `{"hook_event_name":"Stop","session_id":"session-a"}`,
+			want:    instancepresence.StateIdle,
+		},
+	}
+	for _, step := range steps {
+		if err := run(context.Background(), strings.NewReader(step.payload), getenv); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case req := <-requests:
+			if req.Payload.State != step.want || req.Payload.HookSessionRef != "session-a" {
+				t.Fatalf("got %#v want %q", req.Payload, step.want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("missing %s", step.want)
+		}
+	}
+}
+
+func TestStartWatcherProcessOverlaysLocalHookEnv(t *testing.T) {
+	// Verify overlayWatcherEnv preserves socket + enabled for the child.
+	base := []string{"PATH=/usr/bin", "AURORA_LOCAL_HOOK_ENABLED=0", "OTHER=1"}
+	getenv := func(key string) string {
+		switch key {
+		case localhooktransport.EnvLocalHookEnabled:
+			return "1"
+		case localhooktransport.EnvLocalHookSocket:
+			return "/home/user/.local/state/aurora/hook.sock"
+		case claudehook.WatcherFileEnv:
+			return "/tmp/watchers"
+		default:
+			return ""
+		}
+	}
+	got := overlayWatcherEnv(base, getenv)
+	found := map[string]string{}
+	for _, entry := range got {
+		if key, value, ok := strings.Cut(entry, "="); ok {
+			found[key] = value
+		}
+	}
+	if found[localhooktransport.EnvLocalHookEnabled] != "1" {
+		t.Fatalf("enabled = %q", found[localhooktransport.EnvLocalHookEnabled])
+	}
+	if found[localhooktransport.EnvLocalHookSocket] != "/home/user/.local/state/aurora/hook.sock" {
+		t.Fatalf("socket = %q", found[localhooktransport.EnvLocalHookSocket])
+	}
+	if found[claudehook.WatcherFileEnv] != "/tmp/watchers" {
+		t.Fatalf("watcher dir = %q", found[claudehook.WatcherFileEnv])
+	}
+	if found["OTHER"] != "1" {
+		t.Fatal("unrelated env lost")
+	}
+}
+
+func stubQuestionWatcher(t *testing.T) func() {
+	t.Helper()
+	previous := startQuestionWatcher
+	startQuestionWatcher = func(claudehook.QuestionWatch, func(string) string) error {
+		return nil
+	}
+	return func() { startQuestionWatcher = previous }
+}
+
+func mustQuestionWatch(
+	t *testing.T,
+	statePath, sessionID, toolUseID, transcriptPath string,
+) claudehook.QuestionWatch {
+	t.Helper()
+	store, err := claudehook.NewSessionStore(statePath, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for revision := uint64(1); revision <= 32; revision++ {
+		watch := claudehook.QuestionWatch{
+			SessionID:        sessionID,
+			ToolUseID:        toolUseID,
+			TranscriptPath:   transcriptPath,
+			TranscriptOffset: 0,
+			Revision:         revision,
+		}
+		pending, err := store.QuestionPending(watch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pending {
+			return watch
+		}
+	}
+	t.Fatalf("no pending question for session %s", sessionID)
+	return claudehook.QuestionWatch{}
 }
 
 func startLocalIngestSocket(t *testing.T, requests chan<- localhooktransport.IngestRequest) string {

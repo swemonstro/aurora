@@ -30,6 +30,10 @@ type Event struct {
 	SessionID        string `json:"session_id"`
 	NotificationType string `json:"notification_type"`
 	ToolName         string `json:"tool_name"`
+	// ToolUseID and TranscriptPath are present on PreToolUse AskUserQuestion
+	// and power transcript-based Esc recovery. They are never logged.
+	ToolUseID      string `json:"tool_use_id"`
+	TranscriptPath string `json:"transcript_path"`
 }
 
 type EventAction struct {
@@ -125,6 +129,8 @@ func ParseEvent(input []byte) (Event, error) {
 	event.SessionID = strings.TrimSpace(event.SessionID)
 	event.NotificationType = strings.TrimSpace(event.NotificationType)
 	event.ToolName = strings.TrimSpace(event.ToolName)
+	event.ToolUseID = strings.TrimSpace(event.ToolUseID)
+	event.TranscriptPath = strings.TrimSpace(event.TranscriptPath)
 	return event, nil
 }
 
@@ -171,9 +177,10 @@ func MapEvent(event Event) (EventAction, bool) {
 	case "PostToolUse":
 		return EventAction{State: status.Working}, true
 	case "PostToolUseFailure":
-		// Esc / decline on AskUserQuestion surfaces as PostToolUseFailure with
-		// terminal text "User declined to answer questions". Only that tool
-		// clears attention; other tool failures must not invent idle.
+		// Defensive fallback only: Esc on AskUserQuestion does not currently
+		// emit this hook (recovery is transcript-based). If a Claude version
+		// ever sends PostToolUseFailure for AskUserQuestion, map it to idle.
+		// Other tool failures must not invent idle.
 		if event.ToolName == "AskUserQuestion" {
 			return EventAction{State: status.Idle}, true
 		}
