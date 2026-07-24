@@ -610,6 +610,90 @@ func TestRegisterStartupPendingAttentionClearedBySessionStart(t *testing.T) {
 	}
 }
 
+func TestApplyRuntimeMutationSettingStartupPending(t *testing.T) {
+	registry, clock := newTestRegistry(t)
+	inst, err := registry.Register(registration("instance-u", 404))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inst.StartupPending || inst.State != instancepresence.StateIdle {
+		t.Fatalf("register = %#v", inst)
+	}
+	slot := inst.Slot
+	changedAt := inst.Lifecycle.StateChangedAt
+	clock.Advance(time.Second)
+	mutation := runtimeMutation(2, instancepresence.RuntimeAlive, "set-pending")
+	after, err := registry.ApplyRuntimeMutationSettingStartupPending("instance-u", mutation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.StartupPending || after.State != instancepresence.StateAttention {
+		t.Fatalf("after set pending = %#v", after)
+	}
+	if after.Revisions.HookRevision != 0 || after.Slot != slot || after.ID != "instance-u" {
+		t.Fatalf("hook/slot/id changed: %#v", after)
+	}
+	if !after.Lifecycle.StateChangedAt.After(changedAt) {
+		t.Fatalf("StateChangedAt not updated: %#v", after.Lifecycle)
+	}
+
+	// Explicit hook blocks re-setting after clear via working claim path.
+	clock.Advance(time.Second)
+	if _, err := registry.ApplyNextHookMutation("instance-u", "epoch-a", instancepresence.StateWorking, clock.Now(), "hook-1"); err != nil {
+		t.Fatal(err)
+	}
+	// Clear pending via ordinary renew with clear is separate; after hook pending is false.
+	got, _ := registry.Get("instance-u")
+	if got.StartupPending || got.State != instancepresence.StateWorking {
+		t.Fatalf("after hook = %#v", got)
+	}
+	clock.Advance(time.Second)
+	blocked, err := registry.ApplyRuntimeMutationSettingStartupPending("instance-u", runtimeMutation(3, instancepresence.RuntimeAlive, "set-pending-blocked"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blocked.StartupPending || blocked.State != instancepresence.StateWorking || blocked.Revisions.HookRevision != 1 {
+		t.Fatalf("hook must block startup-pending set: %#v", blocked)
+	}
+
+	// Ended runtime cannot be reactivated.
+	clock.Advance(time.Second)
+	if _, err := registry.EndRuntime("instance-u", runtimeMutation(4, instancepresence.RuntimeEnded, "end-u")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.ApplyRuntimeMutationSettingStartupPending("instance-u", runtimeMutation(5, instancepresence.RuntimeAlive, "revive")); !errors.Is(err, ErrRuntimeEnded) {
+		t.Fatalf("ended set pending error = %v", err)
+	}
+}
+
+func TestApplyRuntimeMutationSettingStartupPendingBlockedByIdleHookRevision(t *testing.T) {
+	// Positive HookRevision with NoHookClaim must still block pending activation.
+	registry, clock := newTestRegistry(t)
+	if _, err := registry.Register(registration("instance-idle-hook", 405)); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(time.Second)
+	idle, err := registry.ApplyNextHookMutation(
+		"instance-idle-hook", "epoch-a", instancepresence.StateIdle, clock.Now(), "idle-1",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if idle.Revisions.HookRevision != 1 || idle.HookClaim != instancepresence.NoHookClaim || idle.State != instancepresence.StateIdle {
+		t.Fatalf("idle hook fixture = %#v", idle)
+	}
+	clock.Advance(time.Second)
+	blocked, err := registry.ApplyRuntimeMutationSettingStartupPending(
+		"instance-idle-hook", runtimeMutation(2, instancepresence.RuntimeAlive, "set-blocked-idle-hook"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blocked.StartupPending || blocked.State != instancepresence.StateIdle || blocked.Revisions.HookRevision != 1 {
+		t.Fatalf("idle hook revision must block pending: %#v", blocked)
+	}
+}
+
 func TestApplyNextHookMutationSequencesPerRuntime(t *testing.T) {
 	registry, _ := newTestRegistry(t)
 	mustRegister(t, registry, registration("instance-a", 101))
