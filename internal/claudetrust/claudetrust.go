@@ -30,9 +30,10 @@ type Observer struct {
 	MaxBytes int64
 }
 
-// Observe returns ProjectPresent if the exact cleaned cwd exists as a key in
-// top-level projects. If projects exists but the key is missing, it returns
-// ProjectMissing. Any parse/path/I/O uncertainty returns Unknown.
+// Observe returns ProjectMissing when the exact cleaned cwd is absent or its
+// hasTrustDialogAccepted value is explicitly false. An existing project with
+// true, null, or no trust field returns ProjectPresent. Any parse/path/I/O
+// uncertainty returns Unknown.
 func (o Observer) Observe(pid uint64, userHome, cwd string) Status {
 	procRoot := strings.TrimSpace(o.ProcRoot)
 	if procRoot == "" {
@@ -86,14 +87,30 @@ func (o Observer) Observe(pid uint64, userHome, cwd string) Status {
 	}
 
 	want := filepath.Clean(cwd)
-	for key := range top.Projects {
+	for key, rawProject := range top.Projects {
 		k := strings.TrimSpace(key)
-		if k == "" {
+		if k == "" || filepath.Clean(k) != want {
 			continue
 		}
-		if filepath.Clean(k) == want {
+
+		var project map[string]json.RawMessage
+		if err := json.Unmarshal(rawProject, &project); err != nil || project == nil {
+			return Unknown
+		}
+
+		rawAccepted, exists := project["hasTrustDialogAccepted"]
+		if !exists {
 			return ProjectPresent
 		}
+
+		var accepted *bool
+		if err := json.Unmarshal(rawAccepted, &accepted); err != nil {
+			return Unknown
+		}
+		if accepted != nil && !*accepted {
+			return ProjectMissing
+		}
+		return ProjectPresent
 	}
 	return ProjectMissing
 }

@@ -48,6 +48,19 @@ func TestObserver_ProjectPresent_True(t *testing.T) {
 	}
 }
 
+func TestObserver_ProjectPresent_FalseRequiresTrust(t *testing.T) {
+	procRoot := t.TempDir()
+	obs := Observer{ProcRoot: procRoot}
+	pid := 123
+	home := "/home/carl"
+	cwd := "/home/carl/proj"
+	writeProcClaudeJSON(t, procRoot, pid, home, `{"projects":{"/home/carl/proj":{"hasTrustDialogAccepted":false}}}`)
+
+	if got := obs.Observe(uint64(pid), home, cwd); got != ProjectMissing {
+		t.Fatalf("got %v want %v", got, ProjectMissing)
+	}
+}
+
 func TestObserver_ProjectPresent_Null(t *testing.T) {
 	procRoot := t.TempDir()
 	obs := Observer{ProcRoot: procRoot}
@@ -156,7 +169,7 @@ func TestObserver_ReplacedClaudeJSONFollowedThroughProcRoot(t *testing.T) {
 	if got := obs.Observe(uint64(pid), home, cwd); got != ProjectMissing {
 		t.Fatalf("first got %v want %v", got, ProjectMissing)
 	}
-	if err := os.WriteFile(path, []byte(`{"projects":{"/home/carl/proj":null}}`), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(`{"projects":{"/home/carl/proj":{"hasTrustDialogAccepted":null}}}`), 0o600); err != nil {
 		t.Fatalf("rewrite: %v", err)
 	}
 	if got := obs.Observe(uint64(pid), home, cwd); got != ProjectPresent {
