@@ -6,22 +6,11 @@ import (
 	"time"
 
 	"github.com/swemonstro/aurora/internal/claudetrust"
-	"github.com/swemonstro/aurora/internal/codextrust"
+	"github.com/swemonstro/aurora/internal/codexhook"
 	"github.com/swemonstro/aurora/internal/instancepresence"
 	"github.com/swemonstro/aurora/internal/instanceregistry"
 	"github.com/swemonstro/aurora/internal/presencev2"
 	"github.com/swemonstro/aurora/internal/runtimerecognition"
-)
-
-// codexStartupTrustState tracks per-generation Codex trust observation so an
-// initial Unknown poll can later become NotTrusted (pending) without reopening
-// a generation that already resolved (trusted or hooked).
-type codexStartupTrustState uint8
-
-const (
-	codexTrustUnresolved codexStartupTrustState = iota + 1
-	codexTrustPending
-	codexTrustResolved
 )
 
 // RegistrySync keeps canonical v2 instances aligned with secure runtime families.
@@ -39,12 +28,8 @@ type RegistrySync struct {
 	// startup-pending. Pre-existing processes at service restart stay idle
 	// without a hook (Claude) or trust metadata (Codex).
 	observerStartedAt time.Time
-	// codexStartupTrust tracks post-baseline interactive Codex generations only.
-	codexStartupTrust map[instancepresence.InstanceID]codexStartupTrustState
-	// userHome resolves ~/.codex when CODEX_HOME is unset. Tests may override.
+	// userHome resolves ~/.claude.json's directory when needed. Tests may override.
 	userHome func() (string, error)
-	// projectTrust observes Codex config.toml trust. Tests may override.
-	projectTrust func(codexHomeEnv, projectDir, userHome string) codextrust.Status
 	// claudeTrust observes Claude project presence in ~/.claude.json through /proc/<pid>/root.
 	// Tests may override.
 	claudeTrust func(pid uint64, userHome, cwd string) claudetrust.Status
@@ -82,9 +67,7 @@ func NewRegistrySync(
 		registry: registry, hostID: hostID, producerEpoch: epoch, source: source,
 		known: make(map[instancepresence.InstanceID]instancepresence.RuntimeRevision), clock: clock,
 		observerStartedAt: baseline,
-		codexStartupTrust: make(map[instancepresence.InstanceID]codexStartupTrustState),
 		userHome:          os.UserHomeDir,
-		projectTrust:      codextrust.ProjectTrust,
 		claudeTrust:       claudetrust.Observer{ProcRoot: "/proc"}.Observe,
 	}, nil
 }
@@ -97,13 +80,11 @@ func (sync *RegistrySync) ObserverStartedAt() time.Time { return sync.observerSt
 // Recognized families map to RuntimeAlive or RuntimeSuspended from root stop state.
 //
 // Startup-pending uses a generation start time that is strictly after the
-// observer baseline:
-//   - Claude: Candidate.Runtime.RootProcess.StartedAt
-//   - Codex:  Family.LaunchProcess.StartedAt (outermost matched Codex process,
-//     e.g. Node launcher — never a pre-baseline terminal shell)
-//
-// Codex trust may resolve after an initial Unknown poll without inventing hook
-// revisions (unresolved → pending → resolved).
+// observer baseline, and only for Claude: a post-baseline generation with no
+// observed ~/.claude.json project entry is startup-pending. Codex never sets
+// StartupPending at all — see startupAtRegister and
+// codexhook.CodexStartupAttention for the shared G.4 semantic both this
+// monolith path and internal/codexproducer defer to.
 func (sync *RegistrySync) ApplyRecognition(result runtimerecognition.Result, bootID instancepresence.BootIdentity) error {
 	now := sync.clock().UTC()
 	seen := make(map[instancepresence.InstanceID]struct{})
@@ -126,7 +107,7 @@ func (sync *RegistrySync) ApplyRecognition(result runtimerecognition.Result, boo
 			status = instancepresence.RuntimeSuspended
 		}
 		if _, known := sync.known[id]; !known {
-			pending, trustState, track := sync.startupAtRegister(family, userHome)
+			pending := sync.startupAtRegister(family, userHome)
 			registration := instanceregistry.Registration{
 				InstanceID: id, Tool: candidate.Tool, Source: sync.source,
 				Runtime: instancepresence.RuntimeIdentity{
@@ -140,24 +121,11 @@ func (sync *RegistrySync) ApplyRecognition(result runtimerecognition.Result, boo
 			if _, err := sync.registry.Register(registration); err != nil {
 				// Exact retry of identical registration is OK; identity conflicts are hard errors.
 				if existing, getErr := sync.registry.Get(id); getErr == nil {
-					// Install tracking before renew so Unknown→NotTrusted still works
-					// after an exact registration retry. Roll back map/known if renew fails.
 					_, hadKnown := sync.known[id]
-					_, hadTrust := sync.codexStartupTrust[id]
 					sync.known[id] = existing.Revisions.RuntimeRevision
-					installedTrust := false
-					if track {
-						if !hadTrust {
-							sync.codexStartupTrust[id] = trustState
-							installedTrust = true
-						}
-					}
 					if renewErr := sync.renew(id, status, now, family, userHome); renewErr != nil {
 						if !hadKnown {
 							delete(sync.known, id)
-						}
-						if installedTrust {
-							delete(sync.codexStartupTrust, id)
 						}
 						return renewErr
 					}
@@ -165,11 +133,8 @@ func (sync *RegistrySync) ApplyRecognition(result runtimerecognition.Result, boo
 				}
 				return fmt.Errorf("register %s: %w", id, err)
 			}
-			// Register succeeded: only then record known + trust tracking.
+			// Register succeeded: only then record known.
 			sync.known[id] = 1
-			if track {
-				sync.codexStartupTrust[id] = trustState
-			}
 			continue
 		}
 		if err := sync.renew(id, status, now, family, userHome); err != nil {
@@ -191,7 +156,6 @@ func (sync *RegistrySync) ApplyRecognition(result runtimerecognition.Result, boo
 			return fmt.Errorf("end %s: %w", id, err)
 		}
 		delete(sync.known, id)
-		delete(sync.codexStartupTrust, id)
 	}
 	return nil
 }
@@ -226,49 +190,12 @@ func (sync *RegistrySync) renew(
 		haveExisting = true
 		return existing, nil
 	}
-	// nextTrust is applied only after a successful registry mutation.
-	var nextTrust codexStartupTrustState
-	var commitTrust bool
-
-	if trustState, tracked := sync.codexStartupTrust[id]; tracked {
-		existing, err := getExisting()
-		if err != nil {
-			return fmt.Errorf("renew %s: %w", id, err)
-		}
-		switch trustState {
-		case codexTrustUnresolved:
-			if existing.Revisions.HookRevision > 0 || existing.HookClaim != instancepresence.NoHookClaim {
-				// Hook already owns the instance; resolve after ordinary renew.
-				nextTrust, commitTrust = codexTrustResolved, true
-				break
-			}
-			switch sync.observeCodexTrust(family, userHome) {
-			case codextrust.Unknown:
-				// Stay unresolved; ordinary renew, no map change.
-			case codextrust.Trusted:
-				nextTrust, commitTrust = codexTrustResolved, true
-			case codextrust.NotTrusted:
-				action = renewSet
-				keySuffix = string(status) + "|trust-pending"
-				// Final map state decided from mutation return value.
-			}
-		case codexTrustPending:
-			if existing.Revisions.HookRevision > 0 || existing.HookClaim != instancepresence.NoHookClaim || !existing.StartupPending {
-				nextTrust, commitTrust = codexTrustResolved, true
-				break
-			}
-			switch sync.observeCodexTrust(family, userHome) {
-			case codextrust.Trusted:
-				action = renewClear
-				keySuffix = string(status) + "|trust-cleared"
-				nextTrust, commitTrust = codexTrustResolved, true
-			case codextrust.Unknown, codextrust.NotTrusted:
-				// Keep pending; ordinary renew, no map change.
-			}
-		case codexTrustResolved:
-			// Never re-evaluate trust or re-activate pending.
-		}
-	}
+	// Codex has no startup-pending observer here at all: codexhook.CodexStartupAttention
+	// is always false, so there is nothing to (re-)evaluate on renew — a Codex
+	// instance's StartupPending is set to false once at registration (see
+	// startupAtRegister) and never revisited. This is the single shared
+	// semantic with internal/codexproducer; see codexhook.CodexStartupAttention's
+	// doc comment.
 
 	// Claude trust observer: only post-baseline generations participate.
 	if family.Candidate.Tool == instancepresence.ToolClaude &&
@@ -306,35 +233,18 @@ func (sync *RegistrySync) renew(
 		Status: status, ObservedAt: now,
 		IdempotencyKey: fmt.Sprintf("runtime-lease|%s|%d|%s", id, next, keySuffix),
 	}
-	var (
-		err    error
-		result instancepresence.Instance
-	)
+	var err error
 	switch action {
 	case renewClear:
-		result, err = sync.registry.ApplyRuntimeMutationClearingStartup(id, mutation)
+		_, err = sync.registry.ApplyRuntimeMutationClearingStartup(id, mutation)
 	case renewSet:
-		result, err = sync.registry.ApplyRuntimeMutationSettingStartupPending(id, mutation)
+		_, err = sync.registry.ApplyRuntimeMutationSettingStartupPending(id, mutation)
 	default:
-		result, err = sync.registry.ApplyRuntimeMutation(id, mutation)
+		_, err = sync.registry.ApplyRuntimeMutation(id, mutation)
 	}
 	if err != nil {
-		// Leave known + codexStartupTrust unchanged on failure.
+		// Leave known unchanged on failure.
 		return fmt.Errorf("renew %s: %w", id, err)
-	}
-
-	// Commit map transitions only after a successful registry mutation.
-	if action == renewSet {
-		if result.StartupPending &&
-			result.Revisions.HookRevision == 0 &&
-			result.HookClaim == instancepresence.NoHookClaim {
-			sync.codexStartupTrust[id] = codexTrustPending
-		} else {
-			// Hook or other transition won the race; do not leave unresolved.
-			sync.codexStartupTrust[id] = codexTrustResolved
-		}
-	} else if commitTrust {
-		sync.codexStartupTrust[id] = nextTrust
 	}
 	sync.known[id] = next
 	return nil
@@ -343,68 +253,35 @@ func (sync *RegistrySync) renew(
 // KnownCount reports tracked instances (tests).
 func (sync *RegistrySync) KnownCount() int { return len(sync.known) }
 
-// codexTrustStateFor reports tracked trust state (tests).
-func (sync *RegistrySync) codexTrustStateFor(id instancepresence.InstanceID) (codexStartupTrustState, bool) {
-	state, ok := sync.codexStartupTrust[id]
-	return state, ok
-}
-
-// startupAtRegister decides StartupPending and optional Codex trust tracking.
-// track is true only for post-baseline interactive Codex generations.
+// startupAtRegister decides StartupPending at first registration.
 //
-// Claude uses RootProcess.StartedAt (unchanged). Codex uses LaunchProcess
-// (outermost matched Codex process such as the Node launcher), never a
-// terminal shell that may predate the observer baseline.
-func (sync *RegistrySync) startupAtRegister(family runtimerecognition.Family, userHome string) (pending bool, state codexStartupTrustState, track bool) {
-	start := family.Candidate.Runtime.RootProcess.StartedAt
-	if family.Candidate.Tool == instancepresence.ToolCodex {
-		if family.LaunchProcess.PID != 0 && !family.LaunchProcess.StartedAt.IsZero() {
-			start = family.LaunchProcess.StartedAt
-		}
-	}
-	if start.IsZero() || sync.observerStartedAt.IsZero() || !start.After(sync.observerStartedAt) {
-		return false, 0, false
-	}
+// Claude uses RootProcess.StartedAt (unchanged): a post-baseline generation
+// with no observed ~/.claude.json project entry is startup-pending, exactly
+// as before.
+//
+// Codex never sets StartupPending here, regardless of baseline, trust
+// configuration, or process interactivity — see
+// codexhook.CodexStartupAttention, the single shared function both this
+// monolith path and internal/codexproducer defer to for that decision. This
+// is the G.4 false-red fix: a missing or explicitly untrusted Codex project
+// trust entry is not, by itself, evidence of an observed question.
+func (sync *RegistrySync) startupAtRegister(family runtimerecognition.Family, userHome string) (pending bool) {
 	switch family.Candidate.Tool {
 	case instancepresence.ToolClaude:
+		start := family.Candidate.Runtime.RootProcess.StartedAt
+		if start.IsZero() || sync.observerStartedAt.IsZero() || !start.After(sync.observerStartedAt) {
+			return false
+		}
 		observe := sync.claudeTrust
 		if observe == nil {
 			observe = claudetrust.Observer{ProcRoot: "/proc"}.Observe
 		}
-		switch observe(family.Candidate.Runtime.RootProcess.PID, userHome, family.WorkingDirectory) {
-		case claudetrust.ProjectMissing:
-			return true, 0, false
-		case claudetrust.ProjectPresent, claudetrust.Unknown:
-			return false, 0, false
-		default:
-			return false, 0, false
-		}
+		return observe(family.Candidate.Runtime.RootProcess.PID, userHome, family.WorkingDirectory) == claudetrust.ProjectMissing
 	case instancepresence.ToolCodex:
-		// Interactivity from LaunchProcess argv only — never shell argv.
-		if !codextrust.InteractiveArgv(family.Argv) {
-			return false, 0, false
-		}
-		switch sync.observeCodexTrust(family, userHome) {
-		case codextrust.Unknown:
-			return false, codexTrustUnresolved, true
-		case codextrust.NotTrusted:
-			return true, codexTrustPending, true
-		case codextrust.Trusted:
-			return false, codexTrustResolved, true
-		default:
-			return false, codexTrustUnresolved, true
-		}
+		return codexhook.CodexStartupAttention()
 	default:
-		return false, 0, false
+		return false
 	}
-}
-
-func (sync *RegistrySync) observeCodexTrust(family runtimerecognition.Family, userHome string) codextrust.Status {
-	lookup := sync.projectTrust
-	if lookup == nil {
-		lookup = codextrust.ProjectTrust
-	}
-	return lookup(family.EnvCodexHome, family.WorkingDirectory, userHome)
 }
 
 // claudeStartupPending is retained for tests covering Claude-only baseline rules.

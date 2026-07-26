@@ -9,6 +9,27 @@ import (
 	"github.com/swemonstro/aurora/internal/runtimerecognition"
 )
 
+// CodexStartupAttention is the single source of truth for whether a newly
+// observed Codex process, before any hook event has been observed for it,
+// should be treated as attention (StartupPending). It is always false:
+// neither a missing project trust entry nor an explicitly untrusted entry
+// is, by itself, evidence that Codex is actually displaying an observed
+// question — that would be an inference from configuration, not an
+// observation. Both internal/runtimepresence.RegistrySync (the monolith's
+// registry/presentation path, still the ESP's live status source) and
+// internal/codexproducer (the standalone G.4 shadow producer) must treat
+// Codex startup as idle-until-hook by deferring to this single function
+// rather than each independently deciding what counts as startup attention,
+// so the two can never diverge on this point over time.
+//
+// Attention may still come from a real observed signal: a PermissionRequest
+// hook event (see MapEvent) or an actually observed error. If Codex's real
+// startup trust prompt ("Do you trust this folder?") ever gets a reliable
+// observed signal in the hook event set, this is the single function to
+// change — not a per-caller heuristic layered on top of trust
+// configuration, cwd, or process interactivity.
+func CodexStartupAttention() bool { return false }
+
 func LocalHookObservation(event Event, metadata hookadapter.Metadata) (hookadapter.Observation, error) {
 	action, supported := MapEvent(event)
 	if !supported {
