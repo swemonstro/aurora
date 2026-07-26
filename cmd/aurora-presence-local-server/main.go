@@ -25,6 +25,7 @@ import (
 	"github.com/swemonstro/aurora/internal/linuxidentitymeasure"
 	"github.com/swemonstro/aurora/internal/linuxprocess"
 	"github.com/swemonstro/aurora/internal/localhooktransport"
+	"github.com/swemonstro/aurora/internal/presencebroker"
 	"github.com/swemonstro/aurora/internal/publish"
 	"github.com/swemonstro/aurora/internal/runtimepresence"
 	"github.com/swemonstro/aurora/internal/runtimerecognition"
@@ -184,7 +185,7 @@ func composeServer(arguments []string, stderr io.Writer, getenv func(string) str
 
 	var registry *instanceregistry.Registry
 	var relayBridge *runtimepresence.RelayBridge
-	var presentationBridge *runtimepresence.PresentationBridge
+	var presentationBridge *presencebroker.PresentationBridge
 
 	ensureRegistry := func() error {
 		if registry != nil {
@@ -356,7 +357,7 @@ func composeServer(arguments []string, stderr io.Writer, getenv func(string) str
 		fmt.Fprintf(stderr, "canonical snapshot file: %s (read-only JSON; content-free instances)\n", snapshotFile)
 		snapCtx, snapCancel := context.WithCancel(context.Background())
 		cleanups = append(cleanups, snapCancel)
-		go runSnapshotLoop(snapCtx, registry, snapshotFile, defaultSnapshotInterval, stderr)
+		go presencebroker.RunSnapshotLoop(snapCtx, registry, snapshotFile, presencebroker.DefaultSnapshotInterval, stderr)
 	}
 
 	// Optional v2→v1 relay bridge. CLI -relay wins over AURORA_RELAY_URL.
@@ -386,11 +387,11 @@ func composeServer(arguments []string, stderr io.Writer, getenv func(string) str
 			return nil, nil, false, err
 		}
 		relayBridge = bridge
-		presBridge, err := runtimepresence.NewPresentationBridge(
+		presBridge, err := presencebroker.NewPresentationBridge(
 			registry,
 			publisher,
 			relayPresentationPixelCapacity,
-			runtimepresence.DefaultBridgeInterval,
+			presencebroker.DefaultBridgeInterval,
 			stderr,
 		)
 		if err != nil {

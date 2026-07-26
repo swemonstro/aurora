@@ -1,6 +1,4 @@
-//go:build linux
-
-package main
+package presencebroker
 
 import (
 	"context"
@@ -15,17 +13,17 @@ import (
 	"github.com/swemonstro/aurora/internal/presencev2"
 )
 
-// defaultSnapshotInterval is the maximum age of a written snapshot while the server runs.
-const defaultSnapshotInterval = 250 * time.Millisecond
+// DefaultSnapshotInterval is the maximum age of a written snapshot while the server runs.
+const DefaultSnapshotInterval = 250 * time.Millisecond
 
-// snapshotSource is the registry surface used by the read-only snapshot writer.
-type snapshotSource interface {
+// SnapshotSource is the registry surface used by the read-only snapshot writer.
+type SnapshotSource interface {
 	CanonicalSnapshot() (presencev2.CanonicalSnapshot, error)
 }
 
-// writeCanonicalSnapshotAtomic marshals a CanonicalSnapshot and replaces path
+// WriteCanonicalSnapshotAtomic marshals a CanonicalSnapshot and replaces path
 // via temp file + fsync + rename. The final file mode is 0600.
-func writeCanonicalSnapshotAtomic(path string, source snapshotSource) error {
+func WriteCanonicalSnapshotAtomic(path string, source SnapshotSource) error {
 	if source == nil {
 		return fmt.Errorf("snapshot source must not be nil")
 	}
@@ -83,20 +81,20 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 	return nil
 }
 
-// runSnapshotLoop writes snapshots on interval until ctx is cancelled.
+// RunSnapshotLoop writes snapshots on interval until ctx is cancelled.
 // Write failures are logged to stderr and never stop the loop or other server work.
-func runSnapshotLoop(
+func RunSnapshotLoop(
 	ctx context.Context,
-	source snapshotSource,
+	source SnapshotSource,
 	path string,
 	interval time.Duration,
 	stderr io.Writer,
 ) {
 	if interval <= 0 {
-		interval = defaultSnapshotInterval
+		interval = DefaultSnapshotInterval
 	}
 	// Immediate first write so consumers do not wait a full interval.
-	if err := writeCanonicalSnapshotAtomic(path, source); err != nil {
+	if err := WriteCanonicalSnapshotAtomic(path, source); err != nil {
 		fmt.Fprintln(stderr, "snapshot write:", err)
 	}
 	ticker := time.NewTicker(interval)
@@ -106,12 +104,12 @@ func runSnapshotLoop(
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := writeCanonicalSnapshotAtomic(path, source); err != nil {
+			if err := WriteCanonicalSnapshotAtomic(path, source); err != nil {
 				fmt.Fprintln(stderr, "snapshot write:", err)
 			}
 		}
 	}
 }
 
-// ensure registry satisfies snapshotSource.
-var _ snapshotSource = (*instanceregistry.Registry)(nil)
+// ensure registry satisfies SnapshotSource.
+var _ SnapshotSource = (*instanceregistry.Registry)(nil)

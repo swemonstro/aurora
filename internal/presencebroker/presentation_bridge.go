@@ -1,4 +1,4 @@
-package runtimepresence
+package presencebroker
 
 import (
 	"context"
@@ -11,6 +11,13 @@ import (
 	"github.com/swemonstro/aurora/internal/instancepresence"
 	"github.com/swemonstro/aurora/internal/presencev2"
 )
+
+// DefaultBridgeInterval is this package's default reconciliation interval.
+// It intentionally duplicates the numeric value of
+// runtimepresence.DefaultPollInterval rather than importing runtimepresence
+// (which pulls in tool-specific trust/recognition packages): the broker
+// core must not depend on the tool-specific layer, only the reverse.
+const DefaultBridgeInterval = 2 * time.Second
 
 // PresentationSource supplies a pixel-slot presentation from the v2 registry.
 type PresentationSource interface {
@@ -32,8 +39,8 @@ type desiredPresentation struct {
 }
 
 // PresentationBridge publishes registry.Presentation(pixelCapacity) to the
-// relay /presence/presentation endpoint. It is independent of the v1
-// aggregate RelayBridge and never mutates GET /presence aggregation.
+// relay /presence/presentation endpoint. It is independent of any v1
+// aggregate bridge and never mutates GET /presence aggregation.
 //
 // Trigger captures presentation snapshots synchronously and queues distinct
 // states in order so rapid transitions (e.g. working→idle) are not coalesced.
