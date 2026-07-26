@@ -18,6 +18,7 @@ import (
 
 	"github.com/swemonstro/aurora/internal/claudehook"
 	"github.com/swemonstro/aurora/internal/codexhook"
+	"github.com/swemonstro/aurora/internal/grokpresence"
 	"github.com/swemonstro/aurora/internal/instancecorrelation"
 	"github.com/swemonstro/aurora/internal/instancepresence"
 	"github.com/swemonstro/aurora/internal/instanceregistry"
@@ -34,6 +35,8 @@ import (
 const EnvRelayURL = "AURORA_RELAY_URL"
 
 const relayHTTPTimeout = 2 * time.Second
+
+const grokStatePollInterval = 250 * time.Millisecond
 
 // relayPresentationPixelCapacity is the fixed ESP slot count for v2 presentation.
 const relayPresentationPixelCapacity uint64 = 5
@@ -249,17 +252,18 @@ func composeServer(arguments []string, stderr io.Writer, getenv func(string) str
 		server.SetIdentityObserver(observer)
 
 		sessions := sessionbinding.New()
+		notifyBridges := func() {
+			// Only after successful registry mutation: wake both bridges.
+			if relayBridge != nil {
+				relayBridge.Trigger()
+			}
+			if presentationBridge != nil {
+				presentationBridge.Trigger()
+			}
+		}
 		mutator := notifyingHookMutator{
 			HookMutator: registry,
-			notify: func() {
-				// Only after successful registry mutation: wake both bridges.
-				if relayBridge != nil {
-					relayBridge.Trigger()
-				}
-				if presentationBridge != nil {
-					presentationBridge.Trigger()
-				}
-			},
+			notify:      notifyBridges,
 		}
 		engine, err := localhooktransport.NewBindingEngine(sessions, observer, mutator)
 		if err != nil {
@@ -282,7 +286,33 @@ func composeServer(arguments []string, stderr io.Writer, getenv func(string) str
 		}
 		pollCtx, pollCancel := context.WithCancel(context.Background())
 		cleanups = append(cleanups, pollCancel)
-		go pollRuntimes(pollCtx, adapter, *hostID, instancepresence.BootIdentity(*bootID), regSync, stderr)
+		grokSync := &grokpresence.StateSync{
+			Registry: registry,
+			Reader: grokpresence.EventReader{
+				ProcRoot: *procRoot,
+				Capturer: adapter,
+			},
+			Notify: notifyBridges,
+		}
+		startGrokObserver := func() {
+			grokSync.EstablishBaseline(registry.ActiveInstances())
+			go pollGrokStates(pollCtx, grokSync, stderr)
+			fmt.Fprintf(
+				stderr,
+				"Grok structural presence enabled: poll=%s, content-blind\n",
+				grokStatePollInterval,
+			)
+		}
+
+		go pollRuntimes(
+			pollCtx,
+			adapter,
+			*hostID,
+			instancepresence.BootIdentity(*bootID),
+			regSync,
+			startGrokObserver,
+			stderr,
+		)
 		bindingEnabled = true
 	} else {
 		// Observe-only identity measure without binding when ingest is off.
@@ -385,22 +415,51 @@ func composeServer(arguments []string, stderr io.Writer, getenv func(string) str
 	return server, cleanup, bindingEnabled, nil
 }
 
+func pollGrokStates(
+	ctx context.Context,
+	syncer *grokpresence.StateSync,
+	stderr io.Writer,
+) {
+	ticker := time.NewTicker(grokStatePollInterval)
+	defer ticker.Stop()
+
+	for {
+		result := syncer.Apply(ctx)
+		for _, err := range result.Errors {
+			if !errors.Is(err, context.Canceled) {
+				fmt.Fprintln(stderr, "grok presence sync:", err)
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
 func pollRuntimes(
 	ctx context.Context,
 	adapter *linuxprocess.Adapter,
 	hostID string,
 	bootID instancepresence.BootIdentity,
 	sync *runtimepresence.RegistrySync,
+	onFirstSuccessfulSync func(),
 	stderr io.Writer,
 ) {
 	ticker := time.NewTicker(runtimepresence.DefaultPollInterval)
 	defer ticker.Stop()
+
+	baselineEstablished := false
 	for {
 		sample, err := adapter.Observe(ctx)
 		if err == nil {
 			result, recErr := runtimerecognition.Recognize(
 				sample.Recognition, hostID,
-				claudehook.RuntimeRecognizer(), codexhook.RuntimeRecognizer(),
+				claudehook.RuntimeRecognizer(),
+				codexhook.RuntimeRecognizer(),
+				grokpresence.RuntimeRecognizer(),
 			)
 			if recErr == nil {
 				effectiveBoot := bootID
@@ -409,6 +468,11 @@ func pollRuntimes(
 				}
 				if syncErr := sync.ApplyRecognition(result, effectiveBoot); syncErr != nil {
 					fmt.Fprintln(stderr, "runtime registry sync:", syncErr)
+				} else if !baselineEstablished {
+					baselineEstablished = true
+					if onFirstSuccessfulSync != nil {
+						onFirstSuccessfulSync()
+					}
 				}
 			} else {
 				fmt.Fprintln(stderr, "runtime recognize:", recErr)

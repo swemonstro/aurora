@@ -51,6 +51,46 @@ func TestDefaultObservationIsFiniteAndSanitized(t *testing.T) {
 	}
 }
 
+func TestOutputReportCountsGrokFamilies(t *testing.T) {
+	observed := time.Date(2026, 7, 25, 14, 0, 0, 0, time.UTC)
+	root := instancepresence.ProcessIdentity{
+		PID:       202,
+		StartedAt: observed.Add(-time.Second),
+	}
+	candidate := instancepresence.RuntimeCandidate{
+		InstanceID: "grok-observe-fixture",
+		Tool:       instancepresence.ToolGrok,
+		Runtime: instancepresence.RuntimeIdentity{
+			HostID:      "host-a",
+			BootID:      "boot-a",
+			RootProcess: root,
+		},
+		Members: []instancepresence.ProcessIdentity{root},
+	}
+	report := makeOutputReport(
+		1,
+		linuxprocess.Sample{
+			Snapshot: instancepresence.ProcessSnapshot{ObservedAt: observed},
+		},
+		runtimerecognition.Result{
+			Families: []runtimerecognition.Family{{Candidate: candidate}},
+		},
+		nil,
+	)
+
+	if report.Summary.GrokFamilies != 1 ||
+		report.Summary.ClaudeFamilies != 0 ||
+		report.Summary.CodexFamilies != 0 {
+		t.Fatalf("summary = %#v", report.Summary)
+	}
+
+	var output bytes.Buffer
+	writeTextReport(&output, report)
+	if !strings.Contains(output.String(), "grok=1") {
+		t.Fatalf("text output = %q", output.String())
+	}
+}
+
 func TestHelpDeclaresObserveOnlyMode(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	err := run([]string{"-help"}, &stdout, &stderr, testClock{}, func(time.Duration) {})

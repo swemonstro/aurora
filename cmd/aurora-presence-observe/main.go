@@ -14,6 +14,7 @@ import (
 
 	"github.com/swemonstro/aurora/internal/claudehook"
 	"github.com/swemonstro/aurora/internal/codexhook"
+	"github.com/swemonstro/aurora/internal/grokpresence"
 	"github.com/swemonstro/aurora/internal/instancepresence"
 	"github.com/swemonstro/aurora/internal/linuxprocess"
 	"github.com/swemonstro/aurora/internal/runtimerecognition"
@@ -38,6 +39,7 @@ type outputSummary struct {
 	ObservedProcesses uint64 `json:"observed_processes"`
 	ClaudeFamilies    uint64 `json:"claude_families"`
 	CodexFamilies     uint64 `json:"codex_families"`
+	GrokFamilies      uint64 `json:"grok_families"`
 	UnknownProcesses  uint64 `json:"unknown_processes"`
 	AmbiguousFamilies uint64 `json:"ambiguous_families"`
 }
@@ -130,7 +132,13 @@ func run(
 			}
 			exits = diff.Exits
 		}
-		recognition, recognitionErr := runtimerecognition.Recognize(sample.Recognition, *hostID, claudehook.RuntimeRecognizer(), codexhook.RuntimeRecognizer())
+		recognition, recognitionErr := runtimerecognition.Recognize(
+			sample.Recognition,
+			*hostID,
+			claudehook.RuntimeRecognizer(),
+			codexhook.RuntimeRecognizer(),
+			grokpresence.RuntimeRecognizer(),
+		)
 		if recognitionErr != nil {
 			return fmt.Errorf("recognize sample %d: %w", index, recognitionErr)
 		}
@@ -160,6 +168,8 @@ func makeOutputReport(sampleNumber int, sample linuxprocess.Sample, recognition 
 			summary.ClaudeFamilies++
 		} else if family.Candidate.Tool == instancepresence.ToolCodex {
 			summary.CodexFamilies++
+		} else if family.Candidate.Tool == instancepresence.ToolGrok {
+			summary.GrokFamilies++
 		}
 		families = append(families, outputFamily{
 			CandidateRef: string(family.Candidate.InstanceID), Tool: family.Candidate.Tool,
@@ -214,9 +224,10 @@ func mergedDiagnostics(collection []linuxprocess.Diagnostic, recognition runtime
 func writeTextReport(writer io.Writer, report outputReport) {
 	fmt.Fprintf(
 		writer,
-		"observe-only sample=%d processes=%d claude=%d codex=%d unknown=%d ambiguous=%d exits=%d\n",
+		"observe-only sample=%d processes=%d claude=%d codex=%d grok=%d unknown=%d ambiguous=%d exits=%d\n",
 		report.Sample, report.Summary.ObservedProcesses, report.Summary.ClaudeFamilies,
-		report.Summary.CodexFamilies, report.Summary.UnknownProcesses,
+		report.Summary.CodexFamilies, report.Summary.GrokFamilies,
+		report.Summary.UnknownProcesses,
 		report.Summary.AmbiguousFamilies, len(report.Exits),
 	)
 	for _, family := range report.Families {

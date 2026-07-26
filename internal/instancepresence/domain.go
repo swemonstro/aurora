@@ -23,11 +23,12 @@ type ToolKind string
 const (
 	ToolClaude ToolKind = "claude"
 	ToolCodex  ToolKind = "codex"
+	ToolGrok   ToolKind = "grok"
 )
 
 func (kind ToolKind) Validate() error {
 	switch kind {
-	case ToolClaude, ToolCodex:
+	case ToolClaude, ToolCodex, ToolGrok:
 		return nil
 	default:
 		return fmt.Errorf("unsupported tool kind %q", kind)
