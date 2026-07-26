@@ -88,6 +88,56 @@ func TestInstanceIDUnsupportedCharactersRejected(t *testing.T) {
 	}
 }
 
+func TestEmptyProducerEpochRejected(t *testing.T) {
+	clock := &testClock{now: testTime}
+	config := testConfig(clock)
+	msg := validMessage(ToolClaude)
+	msg.ProducerEpoch = ""
+	err := ValidateMessage(config, msg)
+	if ErrorCodeOf(err) != CodeInvalidProducerEpoch {
+		t.Fatalf("code = %v, want invalid_producer_epoch (err=%v)", ErrorCodeOf(err), err)
+	}
+}
+
+func TestProducerEpochTooLongRejected(t *testing.T) {
+	clock := &testClock{now: testTime}
+	config := testConfig(clock)
+	config.MaximumProducerEpochLength = 8
+	msg := validMessage(ToolClaude)
+	msg.ProducerEpoch = "this-producer-epoch-is-far-too-long"
+	err := ValidateMessage(config, msg)
+	if ErrorCodeOf(err) != CodeInvalidProducerEpoch {
+		t.Fatalf("code = %v, want invalid_producer_epoch (err=%v)", ErrorCodeOf(err), err)
+	}
+}
+
+func TestProducerEpochUnsupportedCharactersRejected(t *testing.T) {
+	clock := &testClock{now: testTime}
+	config := testConfig(clock)
+	msg := validMessage(ToolClaude)
+	msg.ProducerEpoch = "bad epoch/with space"
+	err := ValidateMessage(config, msg)
+	if ErrorCodeOf(err) != CodeInvalidProducerEpoch {
+		t.Fatalf("code = %v, want invalid_producer_epoch (err=%v)", ErrorCodeOf(err), err)
+	}
+}
+
+func TestDifferentProducerEpochsAreDistinctValidMessages(t *testing.T) {
+	clock := &testClock{now: testTime}
+	config := testConfig(clock)
+	first := validMessage(ToolClaude)
+	first.ProducerEpoch = "epoch-a"
+	second := validMessage(ToolClaude)
+	second.ProducerEpoch = "epoch-b"
+	second.Revision = 1 // A restarted producer legitimately resets its own counter.
+	if err := ValidateMessage(config, CanonicalMessage(first)); err != nil {
+		t.Fatalf("first epoch rejected: %v", err)
+	}
+	if err := ValidateMessage(config, CanonicalMessage(second)); err != nil {
+		t.Fatalf("second epoch with reset revision rejected: %v", err)
+	}
+}
+
 func TestRevisionZeroRejected(t *testing.T) {
 	clock := &testClock{now: testTime}
 	config := testConfig(clock)

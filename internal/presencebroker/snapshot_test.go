@@ -3,6 +3,8 @@ package presencebroker
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -242,6 +244,73 @@ type failingSource struct {
 func (s *failingSource) CanonicalSnapshot() (presencev2.CanonicalSnapshot, error) {
 	s.calls.Add(1)
 	return presencev2.CanonicalSnapshot{}, context.DeadlineExceeded
+}
+
+// TestWrapOpaqueNeverLeaksCauseText is the generic proof that wrapOpaque's
+// Error() text depends only on message, never on cause — regardless of
+// what cause is, including a *fs.PathError carrying a filesystem path — so
+// every writeFileAtomic call site that routes through it (CreateTemp,
+// Chmod, Write, Sync, Close, Rename) is content-free by construction, not
+// by accident of which specific OS error happened to be returned.
+func TestWrapOpaqueNeverLeaksCauseText(t *testing.T) {
+	const canary = "wrap-opaque-canary-path-4d8f21/should-never-appear"
+	cause := &fs.PathError{Op: "open", Path: canary, Err: fs.ErrNotExist}
+	err := wrapOpaque("stable message", cause)
+	if err.Error() != "stable message" {
+		t.Fatalf("Error() = %q, want exactly the message", err.Error())
+	}
+	if strings.Contains(err.Error(), canary) {
+		t.Fatalf("Error() leaked the cause's path: %q", err.Error())
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Fatal("errors.Is through wrapOpaque must still reach the cause's sentinel")
+	}
+	if !errors.Is(err, cause) {
+		t.Fatal("errors.Unwrap through wrapOpaque must still reach the exact cause")
+	}
+	if wrapOpaque("message", nil) != nil {
+		t.Fatal("wrapOpaque(message, nil) must be nil")
+	}
+}
+
+// TestWriteFileAtomicCreateTempFailureDoesNotLeakPath is the direct
+// regression test for the CreateTemp leak: os.CreateTemp on a
+// non-existent parent directory returns a *fs.PathError whose Error()
+// text embeds that directory's full path — writeFileAtomic must never
+// return that raw.
+func TestWriteFileAtomicCreateTempFailureDoesNotLeakPath(t *testing.T) {
+	const canary = "nonexistent-canary-directory-9f2b1c"
+	path := filepath.Join(t.TempDir(), canary, "snapshot.json") // parent does not exist.
+	err := writeFileAtomic(path, []byte("{}"), 0o600)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if strings.Contains(err.Error(), canary) {
+		t.Fatalf("CreateTemp error leaked the canary path: %v", err)
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("error = %v, want errors.Is to still reach fs.ErrNotExist through the wrap", err)
+	}
+}
+
+// TestWriteFileAtomicRenameFailureDoesNotLeakPath is the direct regression
+// test for the Rename leak: os.Rename returns a *os.LinkError embedding
+// both the temp file's generated name and the destination path when the
+// destination cannot be replaced (here: it is an existing directory, not a
+// file, so rename fails with EISDIR/ENOTEMPTY depending on platform).
+func TestWriteFileAtomicRenameFailureDoesNotLeakPath(t *testing.T) {
+	const canary = "canary-destination-directory-7a3e9d"
+	destination := filepath.Join(t.TempDir(), canary)
+	if err := os.Mkdir(destination, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	err := writeFileAtomic(destination, []byte("{}"), 0o600)
+	if err == nil {
+		t.Fatal("expected an error (renaming a file over an existing directory must fail)")
+	}
+	if strings.Contains(err.Error(), canary) {
+		t.Fatalf("Rename error leaked the canary path: %v", err)
+	}
 }
 
 func TestSnapshotWriteFailureIsReturned(t *testing.T) {

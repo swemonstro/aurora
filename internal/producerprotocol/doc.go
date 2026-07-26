@@ -14,9 +14,13 @@
 //     logic leaking into the transport.
 //
 // The wire message is intentionally minimal: protocol_version, tool,
-// instance_id, state, revision, observed_at, lease_expires_at. Unknown
-// fields are rejected so that adding a field is always a protocol_version
-// change, never a silent extension.
+// instance_id, producer_epoch, state, revision, observed_at,
+// lease_expires_at. Unknown fields are rejected so that adding a field is
+// always a protocol_version change, never a silent extension — as it was
+// for producer_epoch itself, added in version 2 (see CurrentProtocolVersion)
+// so a broker can tell "producer restarted, revision legitimately reset"
+// apart from "stale or replayed data for the same generation," a
+// distinction Revision alone cannot make.
 //
 // socket_linux.go's secure-socket-directory logic and framing.go's
 // length-prefixed frame codec are close cousins of the equivalent code in

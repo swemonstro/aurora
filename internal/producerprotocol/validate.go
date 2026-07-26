@@ -21,6 +21,9 @@ func ValidateMessage(config Config, msg Message) error {
 	if err := validateInstanceID(msg.InstanceID, config.MaximumInstanceIDLength); err != nil {
 		return protocolError(CodeInvalidInstanceID, err)
 	}
+	if err := validateProducerEpoch(msg.ProducerEpoch, config.MaximumProducerEpochLength); err != nil {
+		return protocolError(CodeInvalidProducerEpoch, err)
+	}
 	if msg.Revision == 0 {
 		return protocolError(CodeInvalidRevision, fmt.Errorf("revision must be positive"))
 	}
@@ -43,15 +46,25 @@ func ValidateMessage(config Config, msg Message) error {
 // identifier. The restricted charset keeps the identifier safe to embed in
 // logs, metrics labels, and file paths without further escaping.
 func validateInstanceID(id InstanceID, maximum int) error {
-	value := string(id)
+	return validateOpaqueIdentifier("instance ID", string(id), maximum)
+}
+
+// validateProducerEpoch enforces the same bounded, printable-ASCII shape as
+// InstanceID: ProducerEpoch flows into idempotency keys and logs the same
+// way, so it needs the same safety guarantee.
+func validateProducerEpoch(epoch ProducerEpoch, maximum int) error {
+	return validateOpaqueIdentifier("producer epoch", string(epoch), maximum)
+}
+
+func validateOpaqueIdentifier(name, value string, maximum int) error {
 	if value == "" {
-		return fmt.Errorf("instance ID must not be empty")
+		return fmt.Errorf("%s must not be empty", name)
 	}
 	if len(value) > maximum {
-		return fmt.Errorf("instance ID exceeds maximum length")
+		return fmt.Errorf("%s exceeds maximum length", name)
 	}
 	if strings.TrimSpace(value) != value {
-		return fmt.Errorf("instance ID must not contain surrounding whitespace")
+		return fmt.Errorf("%s must not contain surrounding whitespace", name)
 	}
 	for _, character := range value {
 		switch {
@@ -60,7 +73,7 @@ func validateInstanceID(id InstanceID, maximum int) error {
 		case character >= '0' && character <= '9':
 		case strings.ContainsRune("._:@-", character):
 		default:
-			return fmt.Errorf("instance ID contains unsupported characters")
+			return fmt.Errorf("%s contains unsupported characters", name)
 		}
 	}
 	return nil

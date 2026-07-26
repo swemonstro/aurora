@@ -27,6 +27,9 @@ type Config struct {
 	// MaximumInstanceIDLength bounds InstanceID.
 	MaximumInstanceIDLength int
 
+	// MaximumProducerEpochLength bounds ProducerEpoch.
+	MaximumProducerEpochLength int
+
 	// MaximumRevision bounds Revision. Zero disables the upper bound (the
 	// lower bound of "greater than zero" always applies).
 	MaximumRevision uint64
@@ -52,13 +55,14 @@ type Config struct {
 // absolute maximum.
 func DefaultConfig(clock Clock) Config {
 	return Config{
-		MaximumMessageBytes:     4096,
-		MaximumInstanceIDLength: 128,
-		MaximumRevision:         1<<53 - 1, // JSON-number-safe upper bound for cross-language consumers.
-		ReadTimeout:             2 * time.Second,
-		WriteTimeout:            2 * time.Second,
-		DialTimeout:             2 * time.Second,
-		Clock:                   clock,
+		MaximumMessageBytes:        4096,
+		MaximumInstanceIDLength:    128,
+		MaximumProducerEpochLength: 128,
+		MaximumRevision:            1<<53 - 1, // JSON-number-safe upper bound for cross-language consumers.
+		ReadTimeout:                2 * time.Second,
+		WriteTimeout:               2 * time.Second,
+		DialTimeout:                2 * time.Second,
+		Clock:                      clock,
 	}
 }
 
@@ -74,6 +78,9 @@ func (config Config) Validate(requireSocket bool) error {
 	}
 	if config.MaximumInstanceIDLength < 8 || config.MaximumInstanceIDLength > 256 {
 		return errors.New("maximum instance ID length is outside supported bounds")
+	}
+	if config.MaximumProducerEpochLength < 8 || config.MaximumProducerEpochLength > 256 {
+		return errors.New("maximum producer epoch length is outside supported bounds")
 	}
 	if requireSocket {
 		if config.ReadTimeout <= 0 || config.WriteTimeout <= 0 || config.DialTimeout <= 0 {

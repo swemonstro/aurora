@@ -13,13 +13,16 @@ import (
 )
 
 type Registry struct {
-	mu             sync.RWMutex
-	clock          instancepresence.Clock
-	namespace      string
-	leaseDuration  time.Duration
-	gracePeriod    time.Duration
-	instances      map[instancepresence.InstanceID]*record
-	activeRuntimes map[runtimeKey]instancepresence.InstanceID
+	mu                   sync.RWMutex
+	clock                instancepresence.Clock
+	namespace            string
+	leaseDuration        time.Duration
+	gracePeriod          time.Duration
+	maximumProducerLease time.Duration
+	maximumClockSkew     time.Duration
+	maximumReportAge     time.Duration
+	instances            map[instancepresence.InstanceID]*record
+	activeRuntimes       map[runtimeKey]instancepresence.InstanceID
 }
 
 type runtimeKey struct {
@@ -36,6 +39,11 @@ type record struct {
 	hookPayload        hookPayload
 	runtimeIdempotency map[string]runtimePayload
 	hookIdempotency    map[string]hookPayload
+	// lastReport is the last report ApplyProducerReport accepted for this
+	// instance, used for idempotency/staleness comparisons. nil until the
+	// first ApplyProducerReport call; instances created via Register are
+	// never touched by ApplyProducerReport, so this stays nil for them.
+	lastReport *reportPayload
 }
 
 type runtimePayload struct {
@@ -59,8 +67,11 @@ func New(config Config) (*Registry, error) {
 	return &Registry{
 		clock: config.Clock, namespace: config.SlotNamespace,
 		leaseDuration: config.LeaseDuration, gracePeriod: config.GracePeriod,
-		instances:      make(map[instancepresence.InstanceID]*record),
-		activeRuntimes: make(map[runtimeKey]instancepresence.InstanceID),
+		maximumProducerLease: config.MaximumProducerLeaseDuration,
+		maximumClockSkew:     config.MaximumClockSkew,
+		maximumReportAge:     config.MaximumReportAge,
+		instances:            make(map[instancepresence.InstanceID]*record),
+		activeRuntimes:       make(map[runtimeKey]instancepresence.InstanceID),
 	}, nil
 }
 
@@ -88,13 +99,7 @@ func (registry *Registry) Register(registration Registration) (instancepresence.
 		return instancepresence.Instance{}, domainError("register", registration.InstanceID, ErrIdentityConflict, fmt.Sprintf("runtime is active as %q", id))
 	}
 
-	occupied := make([]instancepresence.Slot, 0, len(registry.activeRuntimes))
-	for _, existing := range registry.instances {
-		if existing.instance.Status.Active() {
-			occupied = append(occupied, existing.instance.Slot)
-		}
-	}
-	index, err := instancepresence.LowestAvailableSlot(registry.namespace, occupied)
+	index, err := instancepresence.LowestAvailableSlot(registry.namespace, registry.occupiedSlots())
 	if err != nil {
 		return instancepresence.Instance{}, fmt.Errorf("register slot: %w", err)
 	}

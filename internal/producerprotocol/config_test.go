@@ -32,6 +32,18 @@ func TestConfigRejectsOutOfBoundMessageSize(t *testing.T) {
 	}
 }
 
+func TestConfigRejectsOutOfBoundProducerEpochLength(t *testing.T) {
+	config := DefaultConfig(&testClock{now: testTime})
+	config.MaximumProducerEpochLength = 0
+	if err := config.Validate(false); err == nil {
+		t.Fatal("expected error for too-small maximum producer epoch length")
+	}
+	config.MaximumProducerEpochLength = 1024
+	if err := config.Validate(false); err == nil {
+		t.Fatal("expected error for maximum producer epoch length above ceiling")
+	}
+}
+
 func TestConfigRejectsMissingClock(t *testing.T) {
 	config := DefaultConfig(&testClock{now: testTime})
 	config.Clock = nil

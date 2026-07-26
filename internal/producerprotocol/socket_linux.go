@@ -198,7 +198,7 @@ func (listener *Listener) Accept(ctx context.Context) (*Conn, PeerIdentity, erro
 func (listener *Listener) Close() error {
 	closeErr := listener.listener.Close()
 	if closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
-		return closeErr
+		return wrapOpaque("close local socket", closeErr)
 	}
 	current, err := statSocketIdentity(listener.path, true)
 	if errors.Is(err, os.ErrNotExist) {

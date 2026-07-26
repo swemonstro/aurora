@@ -36,6 +36,7 @@ func validMessage(tool Tool) Message {
 		ProtocolVersion: CurrentProtocolVersion,
 		Tool:            tool,
 		InstanceID:      "instance-fixture-1",
+		ProducerEpoch:   "epoch-fixture-1",
 		State:           StateWorking,
 		Revision:        1,
 		ObservedAt:      testTime,

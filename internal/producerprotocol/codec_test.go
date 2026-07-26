@@ -16,7 +16,8 @@ func TestEncodeDecodeRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if decoded.Tool != msg.Tool || decoded.InstanceID != msg.InstanceID || decoded.Revision != msg.Revision {
+	if decoded.Tool != msg.Tool || decoded.InstanceID != msg.InstanceID || decoded.Revision != msg.Revision ||
+		decoded.ProducerEpoch != msg.ProducerEpoch {
 		t.Fatalf("round trip mismatch: %#v vs %#v", decoded, msg)
 	}
 	if !decoded.ObservedAt.Equal(msg.ObservedAt) || !decoded.LeaseExpiresAt.Equal(msg.LeaseExpiresAt) {
@@ -93,7 +94,7 @@ func TestEncodeProducesValidJSON(t *testing.T) {
 	if err := json.Unmarshal(data, &generic); err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{"protocol_version", "tool", "instance_id", "state", "revision", "observed_at", "lease_expires_at"} {
+	for _, key := range []string{"protocol_version", "tool", "instance_id", "producer_epoch", "state", "revision", "observed_at", "lease_expires_at"} {
 		if _, ok := generic[key]; !ok {
 			t.Fatalf("missing wire field %q in %s", key, data)
 		}

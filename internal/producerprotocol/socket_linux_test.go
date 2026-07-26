@@ -284,3 +284,48 @@ func TestStatSocketIdentityNotExistPreservesChainAndRedactsPath(t *testing.T) {
 		t.Fatalf("statSocketIdentity leaked the socket filename: %v", err)
 	}
 }
+
+// TestCloseErrorDoesNotLeakSocketPath guards a genuine (non-net.ErrClosed)
+// Close failure: net.UnixListener.Close wraps its error in a *net.OpError
+// carrying Addr (this Listener's boundPath, containing the socket
+// filename), which Listener.Close previously returned unwrapped. The
+// underlying fd is closed directly (bypassing Listener.Close) so the
+// subsequent Close call hits a real, distinct-from-ErrClosed OS failure
+// instead of the ordinary double-close path already covered elsewhere.
+func TestCloseErrorDoesNotLeakSocketPath(t *testing.T) {
+	private := filepath.Join(secureTempDir(t), "private")
+	if err := os.Mkdir(private, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config := DefaultConfig(&testClock{now: testTime})
+	config.SocketPath = filepath.Join(private, "instance-close-leak-canary.sock")
+	listener, err := Listen(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := listener.listener.SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if controlErr := raw.Control(func(fd uintptr) {
+		_ = syscall.Close(int(fd))
+	}); controlErr != nil {
+		t.Fatal(controlErr)
+	}
+
+	closeErr := listener.Close()
+	if closeErr == nil {
+		t.Fatal("expected a close error after the underlying fd was closed out from under the listener")
+	}
+	if errors.Is(closeErr, net.ErrClosed) {
+		t.Fatal("test setup did not produce the intended non-ErrClosed failure")
+	}
+	base := filepath.Base(config.SocketPath)
+	if strings.Contains(closeErr.Error(), base) {
+		t.Fatalf("close error leaked the socket filename %q: %v", base, closeErr)
+	}
+	if strings.Contains(closeErr.Error(), config.SocketPath) {
+		t.Fatalf("close error leaked the socket path: %v", closeErr)
+	}
+}

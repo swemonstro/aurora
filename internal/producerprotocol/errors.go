@@ -17,6 +17,7 @@ const (
 	CodeInvalidTool                ErrorCode = "invalid_tool"
 	CodeInvalidState               ErrorCode = "invalid_state"
 	CodeInvalidInstanceID          ErrorCode = "invalid_instance_id"
+	CodeInvalidProducerEpoch       ErrorCode = "invalid_producer_epoch"
 	CodeInvalidRevision            ErrorCode = "invalid_revision"
 	CodeInvalidTimestamp           ErrorCode = "invalid_timestamp"
 	CodeMessageTooLarge            ErrorCode = "message_too_large"
