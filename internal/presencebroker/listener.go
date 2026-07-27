@@ -81,12 +81,14 @@ func RunProducerListener(
 }
 
 // handleProducerConnection reads messages from one producer connection
-// until it disconnects, ctx is cancelled, or a non-timeout transport error
-// occurs. A read timeout does not close the connection: Conn.ReadMessage
-// applies a fresh deadline on every call, so a producer that goes quiet for
-// a while (no state change to report) is not disconnected for it — only
-// genuine disconnects and shutdown end the loop. A rejected message (bad
-// revision, epoch change, cross-tool mutation, ...) is logged and the
+// until it disconnects, ctx is cancelled, or a non-idle transport error
+// occurs. An idle read timeout (zero bytes of the next frame consumed)
+// does not close the connection: Conn.ReadMessage applies a fresh deadline
+// on every call, so a producer that goes quiet for a while (no state change
+// to report) is not disconnected for it. A read timeout after any partial
+// frame consumption is fatal — the stream framing is no longer safe, so the
+// connection is closed and the producer must reconnect. A rejected message
+// (bad revision, epoch change, cross-tool mutation, ...) is logged and the
 // connection stays open: one bad message must not force a reconnect.
 //
 // session.Close is always called on return, releasing this connection's
@@ -126,7 +128,9 @@ func handleProducerConnection(ctx context.Context, conn *producerprotocol.Conn, 
 	for {
 		msg, err := conn.ReadMessage()
 		if err != nil {
-			if producerprotocol.ErrorCodeOf(err) == producerprotocol.CodeReadTimeout {
+			// Only zero-byte idle deadlines are recoverable. Partial-frame
+			// timeouts are CodeIncompleteFrame and must close this stream.
+			if producerprotocol.IsIdleReadTimeout(err) {
 				continue
 			}
 			if !errors.Is(err, producerprotocol.ErrPeerDisconnected) {

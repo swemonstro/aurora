@@ -28,7 +28,14 @@ const (
 	CodePeerDisconnected           ErrorCode = "peer_disconnected"
 	CodeReadTimeout                ErrorCode = "read_timeout"
 	CodeWriteTimeout               ErrorCode = "write_timeout"
-	CodeInternalError              ErrorCode = "internal_error"
+	// CodeIncompleteFrame is a read that timed out (or otherwise failed in a
+	// way reclassified here) after at least one byte of the current length-
+	// prefixed frame was consumed. The stream framing is no longer safe; the
+	// connection must be closed so the peer reconnects with a fresh stream.
+	// Distinct from CodeReadTimeout, which is only returned when zero frame
+	// bytes were consumed and is therefore safe to retry on the same conn.
+	CodeIncompleteFrame ErrorCode = "incomplete_frame"
+	CodeInternalError   ErrorCode = "internal_error"
 )
 
 var (
@@ -48,6 +55,9 @@ var (
 	ErrPeerDisconnected           = errors.New("peer disconnected")
 	ErrReadTimeout                = errors.New("read timeout")
 	ErrWriteTimeout               = errors.New("write timeout")
+	// ErrIncompleteFrame marks a framing failure after partial frame
+	// consumption. Callers must not continue reading on the same stream.
+	ErrIncompleteFrame = errors.New("incomplete frame")
 )
 
 // ProtocolError pairs a stable ErrorCode with the underlying cause.
@@ -93,6 +103,8 @@ func ErrorCodeOf(err error) ErrorCode {
 	case errors.Is(err, ErrPeerDisconnected), errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF),
 		errors.Is(err, io.ErrClosedPipe), errors.Is(err, net.ErrClosed):
 		return CodePeerDisconnected
+	case errors.Is(err, ErrIncompleteFrame):
+		return CodeIncompleteFrame
 	case errors.Is(err, ErrReadTimeout):
 		return CodeReadTimeout
 	case errors.Is(err, ErrWriteTimeout):
@@ -100,6 +112,16 @@ func ErrorCodeOf(err error) ErrorCode {
 	default:
 		return CodeInternalError
 	}
+}
+
+// IsIdleReadTimeout reports whether err is a read deadline that expired
+// before any byte of the next length-prefixed frame was consumed. Such a
+// timeout leaves stream framing intact, so a broker may safely continue
+// reading on the same connection. A timeout after any partial frame
+// consumption is not idle: it is CodeIncompleteFrame / ErrIncompleteFrame
+// and must close the connection.
+func IsIdleReadTimeout(err error) bool {
+	return err != nil && ErrorCodeOf(err) == CodeReadTimeout
 }
 
 // classifyIOError maps a raw net/io error into one of this package's

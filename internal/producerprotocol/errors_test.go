@@ -50,6 +50,32 @@ func TestClassifyIOErrorNeverLeaksAddress(t *testing.T) {
 	}
 }
 
+func TestIsIdleReadTimeout(t *testing.T) {
+	if IsIdleReadTimeout(nil) {
+		t.Fatal("nil must not be idle read timeout")
+	}
+	idle := classifyIOError(&net.OpError{Op: "read", Err: os.ErrDeadlineExceeded}, true)
+	if !IsIdleReadTimeout(idle) {
+		t.Fatalf("classified timeout should be idle: %v", idle)
+	}
+	partial := protocolError(CodeIncompleteFrame, &wrappedError{
+		sentinel: ErrIncompleteFrame,
+		cause:    idle,
+	})
+	if IsIdleReadTimeout(partial) {
+		t.Fatalf("incomplete frame must not be idle: %v", partial)
+	}
+	if ErrorCodeOf(partial) != CodeIncompleteFrame {
+		t.Fatalf("code = %v, want incomplete_frame", ErrorCodeOf(partial))
+	}
+	if !errors.Is(partial, ErrIncompleteFrame) {
+		t.Fatal("errors.Is IncompleteFrame failed")
+	}
+	if !errors.Is(partial, ErrReadTimeout) {
+		t.Fatal("incomplete frame should still match ErrReadTimeout via cause chain")
+	}
+}
+
 func TestWrapOpaqueHidesCauseTextButPreservesUnwrap(t *testing.T) {
 	cause := &os.PathError{Op: "lstat", Path: "/run/aurora/instance-secret.sock", Err: os.ErrPermission}
 	wrapped := wrapOpaque("inspect socket path", cause)
