@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/swemonstro/aurora/internal/claudetrust"
+	"github.com/swemonstro/aurora/internal/codexhook"
 	"github.com/swemonstro/aurora/internal/codextrust"
 	"github.com/swemonstro/aurora/internal/instancepresence"
 	"github.com/swemonstro/aurora/internal/instanceregistry"
@@ -1005,6 +1006,21 @@ func codexFalseRedFamily(id instancepresence.InstanceID, boot instancepresence.B
 	}
 }
 
+func codexRuntimeProcess(pid uint64, start time.Time, argv []string) runtimerecognition.ProcessObservation {
+	return runtimerecognition.ProcessObservation{
+		Process:            instancepresence.ProcessIdentity{PID: pid, StartedAt: start},
+		ParentPIDHint:      1,
+		CommIdentity:       "exe:codex",
+		ExecutableIdentity: "exe:codex",
+		ProcessGroupOrJob:  "pgrp:codex-test",
+		OSSession:          "session:codex-test",
+		OwnerIdentity:      "uid:1000",
+		WorkingDirectory:   "/tmp/codex-project",
+		EnvCodexHome:       "/tmp/codex-home",
+		Argv:               argv,
+	}
+}
+
 // assertNeverAttention fails the test if any state in the sequence is
 // attention, reporting the full sequence for diagnosis.
 func assertNeverAttention(t *testing.T, label string, sequence []instancepresence.EffectiveState) {
@@ -1056,6 +1072,72 @@ func TestFalseRedA_MissingProjectTrustEntryNeverAttention(t *testing.T) {
 	assertNeverAttention(t, "scenario A", sequence)
 	if sequence[len(sequence)-1] != instancepresence.StateIdle {
 		t.Fatalf("scenario A final state = %v, want idle (sequence %v)", sequence[len(sequence)-1], sequence)
+	}
+}
+
+func TestRegistrySyncCodexAppServerDoesNotCreateSecondInstance(t *testing.T) {
+	sync, registry, clock := newCodexFalseRedSync(t)
+	boot := instancepresence.BootIdentity("boot-a")
+	start := sync.ObserverStartedAt().Add(time.Second)
+	interactive := codexRuntimeProcess(910, start, []string{"codex", "fix the tests"})
+
+	result, err := runtimerecognition.Recognize(
+		runtimerecognition.Snapshot{
+			ObservedAt: clock.Now(),
+			BootID:     boot,
+			Processes:  []runtimerecognition.ProcessObservation{interactive},
+		},
+		"host-a",
+		codexhook.RuntimeRecognizer(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Families) != 1 {
+		t.Fatalf("initial recognition = %#v", result)
+	}
+	if err := sync.ApplyRecognition(result, boot); err != nil {
+		t.Fatal(err)
+	}
+	originalID := result.Families[0].Candidate.InstanceID
+	original, err := registry.Get(originalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	clock.now = clock.now.Add(time.Second)
+	appServer := codexRuntimeProcess(911, start.Add(time.Minute), []string{"codex", "app-server", "--stdio"})
+	appServer.ProcessGroupOrJob = "pgrp:codex-app-server"
+	appServer.OSSession = "session:codex-app-server"
+	result, err = runtimerecognition.Recognize(
+		runtimerecognition.Snapshot{
+			ObservedAt: clock.Now(),
+			BootID:     boot,
+			Processes:  []runtimerecognition.ProcessObservation{interactive, appServer},
+		},
+		"host-a",
+		codexhook.RuntimeRecognizer(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sync.ApplyRecognition(result, boot); err != nil {
+		t.Fatal(err)
+	}
+
+	presentation, err := registry.Presentation(5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if presentation.ActiveCount != 1 || presentation.VisibleCount != 1 {
+		t.Fatalf("presentation = %#v, want only established Codex active", presentation)
+	}
+	current, err := registry.Get(originalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.ID != original.ID || current.Slot.Index != original.Slot.Index {
+		t.Fatalf("established Codex moved: before=%#v after=%#v", original, current)
 	}
 }
 

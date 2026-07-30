@@ -289,6 +289,106 @@ func TestRecognizerNormalizesMixedCaseExecutablePrefixes(t *testing.T) {
 	}
 }
 
+func TestRecognizeIgnoresCodexUtilityCommands(t *testing.T) {
+	start := fixtureTime()
+	for _, test := range []struct {
+		name string
+		argv []string
+	}{
+		{name: "app server stdio", argv: []string{"codex", "app-server", "--stdio"}},
+		{name: "version", argv: []string{"codex", "--version"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			utility := process(501, start, nil, 1, "codex", "codex")
+			utility.Argv = test.argv
+
+			result, err := runtimerecognition.Recognize(
+				runtimeSnapshot([]runtimerecognition.ProcessObservation{utility}),
+				"host-a",
+				codexhook.RuntimeRecognizer(),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(result.Families) != 0 || len(result.Observations) != 0 {
+				t.Fatalf("utility command created runtime family: %#v", result)
+			}
+		})
+	}
+}
+
+func TestRecognizeCodexUtilitiesDoNotAddRuntimeBesideEstablishedCodex(t *testing.T) {
+	start := fixtureTime()
+	interactive := process(601, start, nil, 1, "codex", "codex")
+	interactive.Argv = []string{"codex", "fix the tests"}
+	utility := process(602, start.Add(time.Minute), nil, 1, "codex", "codex")
+	utility.Argv = []string{"codex", "app-server", "--stdio"}
+	utility.ProcessGroupOrJob = "pgrp:utility"
+	utility.OSSession = "session:utility"
+
+	result, err := runtimerecognition.Recognize(
+		runtimeSnapshot([]runtimerecognition.ProcessObservation{interactive, utility}),
+		"host-a",
+		codexhook.RuntimeRecognizer(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Families) != 1 || len(result.Observations) != 1 {
+		t.Fatalf("families = %#v", result.Families)
+	}
+	family := result.Families[0]
+	if family.Candidate.Runtime.RootProcess != interactive.Process {
+		t.Fatalf("root = %#v, want established interactive process", family.Candidate.Runtime.RootProcess)
+	}
+	beforeID := family.Candidate.InstanceID
+
+	withoutUtility, err := runtimerecognition.Recognize(
+		runtimeSnapshot([]runtimerecognition.ProcessObservation{interactive}),
+		"host-a",
+		codexhook.RuntimeRecognizer(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(withoutUtility.Families) != 1 {
+		t.Fatalf("without utility = %#v", withoutUtility)
+	}
+	if withoutUtility.Families[0].Candidate.InstanceID != beforeID ||
+		withoutUtility.Families[0].Candidate.Runtime.RootProcess != interactive.Process {
+		t.Fatalf("established Codex identity changed: with=%#v without=%#v", family, withoutUtility.Families[0])
+	}
+}
+
+func TestRecognizePreservesInteractiveAndExecCodexFamilies(t *testing.T) {
+	start := fixtureTime()
+	first := process(701, start, nil, 1, "codex", "codex")
+	first.Argv = []string{"codex", "fix the tests"}
+	second := process(702, start.Add(time.Minute), nil, 1, "codex", "codex")
+	second.Argv = []string{"codex", "exec", "go test ./..."}
+	second.ProcessGroupOrJob = "pgrp:exec"
+	second.OSSession = "session:exec"
+
+	result, err := runtimerecognition.Recognize(
+		runtimeSnapshot([]runtimerecognition.ProcessObservation{first, second}),
+		"host-a",
+		codexhook.RuntimeRecognizer(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Families) != 2 || len(result.Observations) != 2 {
+		t.Fatalf("families = %#v", result.Families)
+	}
+	if result.Families[0].Candidate.Runtime.RootProcess != first.Process ||
+		result.Families[1].Candidate.Runtime.RootProcess != second.Process {
+		t.Fatalf("roots = %#v", result.Families)
+	}
+	if result.Families[0].Candidate.InstanceID == result.Families[1].Candidate.InstanceID {
+		t.Fatalf("separate Codex runtimes collided: %#v", result.Families)
+	}
+}
+
 type atomicSource struct {
 	snapshots []runtimerecognition.Snapshot
 	calls     int

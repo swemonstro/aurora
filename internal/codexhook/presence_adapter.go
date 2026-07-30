@@ -77,6 +77,9 @@ func (runtimeRecognizer) Recognize(process runtimerecognition.ProcessObservation
 		}
 	}
 	if direct {
+		if len(process.Argv) >= 2 && (process.Argv[1] == "app-server" || process.Argv[1] == "--version") {
+			return runtimerecognition.Recognition{}, false
+		}
 		role := runtimerecognition.RoleDirect
 		if native {
 			role = runtimerecognition.RoleNative

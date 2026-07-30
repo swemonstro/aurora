@@ -94,3 +94,51 @@ func TestCodexCodeModeHostIsNotRecognizedAsSession(t *testing.T) {
 		)
 	}
 }
+
+func TestCodexUtilityCommandsAreNotRecognizedAsRuntime(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		argv []string
+	}{
+		{name: "app server stdio", argv: []string{"codex", "app-server", "--stdio"}},
+		{name: "version", argv: []string{"codex", "--version"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			process := runtimerecognition.ProcessObservation{
+				CommIdentity:       "exe:codex",
+				ExecutableIdentity: "exe:codex",
+				Argv:               test.argv,
+			}
+
+			if recognition, recognized := RuntimeRecognizer().Recognize(process); recognized {
+				t.Fatalf("utility command recognized as Codex runtime: %#v", recognition)
+			}
+		})
+	}
+}
+
+func TestCodexInteractiveAndExecCommandsRemainRecognized(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		argv []string
+	}{
+		{name: "interactive prompt", argv: []string{"codex", "fix the tests"}},
+		{name: "exec", argv: []string{"codex", "exec", "go test ./..."}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			process := runtimerecognition.ProcessObservation{
+				CommIdentity:       "exe:codex",
+				ExecutableIdentity: "exe:codex",
+				Argv:               test.argv,
+			}
+
+			recognition, recognized := RuntimeRecognizer().Recognize(process)
+			if !recognized {
+				t.Fatal("Codex command was not recognized")
+			}
+			if recognition.Tool != instancepresence.ToolCodex || recognition.Role != runtimerecognition.RoleDirect {
+				t.Fatalf("recognition = %#v", recognition)
+			}
+		})
+	}
+}
