@@ -91,6 +91,49 @@ func TestStopChangesOnlyMatchingSession(t *testing.T) {
 	}
 }
 
+func TestLifecycleStopIsTurnCorrelatedAndParallelSafe(t *testing.T) {
+	store := newTestStore(t)
+
+	mustUpdate(t, store, Event{HookEventName: "PermissionRequest", SessionID: "a", TurnID: "turn-a"})
+	mustUpdate(t, store, Event{HookEventName: "PermissionRequest", SessionID: "b", TurnID: "turn-b"})
+	update, supported, err := store.UpdateLifecycle(Event{HookEventName: "Stop", SessionID: "a", TurnID: "turn-a"})
+	if err != nil || !supported || !update.Applied {
+		t.Fatalf("matching Stop update = %#v, supported=%t err=%v", update, supported, err)
+	}
+	state := readState(t, store.path)
+	if state.Sessions["a"].State != status.Idle {
+		t.Fatalf("session a = %#v, want idle", state.Sessions["a"])
+	}
+	if state.Sessions["b"].State != status.Attention || state.Sessions["b"].TurnID != "turn-b" {
+		t.Fatalf("session b changed after session a Stop: %#v", state.Sessions["b"])
+	}
+	if update.State != status.Attention {
+		t.Fatalf("aggregate = %q, want attention", update.State)
+	}
+}
+
+func TestStaleLifecycleEventCannotClearNewerAttention(t *testing.T) {
+	store := newTestStore(t)
+	mustUpdate(t, store, Event{HookEventName: "PermissionRequest", SessionID: "a", TurnID: "turn-old"})
+	mustUpdate(t, store, Event{HookEventName: "PermissionRequest", SessionID: "a", TurnID: "turn-new"})
+
+	stale, supported, err := store.UpdateLifecycle(Event{HookEventName: "Stop", SessionID: "a", TurnID: "turn-old"})
+	if err != nil || !supported {
+		t.Fatalf("stale Stop: supported=%t err=%v", supported, err)
+	}
+	if stale.Applied {
+		t.Fatalf("stale Stop was applied: %#v", stale)
+	}
+	if session := readState(t, store.path).Sessions["a"]; session.State != status.Attention || session.TurnID != "turn-new" {
+		t.Fatalf("stale Stop changed newer attention: %#v", session)
+	}
+
+	matching, _, err := store.UpdateLifecycle(Event{HookEventName: "Stop", SessionID: "a", TurnID: "turn-new"})
+	if err != nil || !matching.Applied || matching.State != status.Idle {
+		t.Fatalf("matching Stop = %#v err=%v, want applied idle", matching, err)
+	}
+}
+
 func TestSessionEndRemovesOnlyMatchingSession(t *testing.T) {
 	store := newTestStore(t)
 

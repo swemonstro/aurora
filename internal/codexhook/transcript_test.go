@@ -3,9 +3,8 @@ package codexhook
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
-
-	"github.com/swemonstro/aurora/internal/status"
 )
 
 func TestScanTranscriptMatchesOnlyRequestedTurnAbort(t *testing.T) {
@@ -69,67 +68,69 @@ func TestScanTranscriptHandlesMalformedPartialMissingAndTruncatedJSONL(t *testin
 	}
 }
 
-func TestPermissionRecoveryIsCorrelatedAndParallelSafe(t *testing.T) {
+func TestPermissionRequestDoesNotPersistTranscriptPath(t *testing.T) {
 	store := newTestStore(t)
 	transcript := filepath.Join(t.TempDir(), "transcript.jsonl")
 	if err := os.WriteFile(transcript, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	first, supported, err := store.UpdateLifecycle(Event{
+	update, supported, err := store.UpdateLifecycle(Event{
 		HookEventName:  "PermissionRequest",
 		SessionID:      "session-a",
 		TurnID:         "turn-a",
 		TranscriptPath: transcript,
 	})
-	if err != nil || !supported || first.Watch == nil {
-		t.Fatalf("first permission update = %#v, supported=%t err=%v", first, supported, err)
+	if err != nil || !supported {
+		t.Fatalf("permission update = %#v, supported=%t err=%v", update, supported, err)
 	}
 	pending := readState(t, store.path).Sessions["session-a"]
-	if pending.TurnID != "turn-a" || pending.TranscriptPath != transcript || pending.Revision == 0 {
-		t.Fatalf("stored permission metadata = %#v", pending)
+	if pending.TurnID != "turn-a" {
+		t.Fatalf("stored turn identity = %q, want turn-a", pending.TurnID)
 	}
-	mustUpdate(t, store, Event{HookEventName: "UserPromptSubmit", SessionID: "session-b"})
-
-	update, recovered, err := store.RecoverCancelled(*first.Watch)
-	if err != nil || !recovered {
-		t.Fatalf("RecoverCancelled: recovered=%t err=%v", recovered, err)
+	stateFile, err := os.ReadFile(store.path)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if update.State != status.Working || !update.Active {
-		t.Fatalf("aggregate = %#v, want active working", update)
-	}
-	state := readState(t, store.path)
-	if state.Sessions["session-a"].State != status.Idle || state.Sessions["session-b"].State != status.Working {
-		t.Fatalf("sessions = %#v", state.Sessions)
+	if strings.Contains(string(stateFile), transcript) || strings.Contains(string(stateFile), "transcript_path") {
+		t.Fatalf("state file contains transcript metadata: %s", stateFile)
 	}
 }
 
-func TestStaleAbortCannotClearNewerAttentionRequest(t *testing.T) {
+func TestPromptSubmitDoesNotPersistSensitiveUnknownFields(t *testing.T) {
 	store := newTestStore(t)
 	transcript := filepath.Join(t.TempDir(), "transcript.jsonl")
 	if err := os.WriteFile(transcript, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	event := Event{
-		HookEventName:  "PermissionRequest",
-		SessionID:      "session-a",
-		TurnID:         "turn-a",
-		TranscriptPath: transcript,
-	}
-	oldUpdate, _, _ := store.UpdateLifecycle(event)
-	newUpdate, _, _ := store.UpdateLifecycle(event)
-	if oldUpdate.Watch == nil || newUpdate.Watch == nil || oldUpdate.Watch.Revision == newUpdate.Watch.Revision {
-		t.Fatal("permission requests did not receive distinct revisions")
-	}
 
-	_, recovered, err := store.RecoverCancelled(*oldUpdate.Watch)
+	event, err := ParseEvent([]byte(`{
+		"hook_event_name": "UserPromptSubmit",
+		"session_id": "session-a",
+		"turn_id": "turn-a",
+		"transcript_path": "` + transcript + `",
+		"cwd": "/secret/project",
+		"prompt": "do not store this"
+	}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if recovered {
-		t.Fatal("stale abort cleared a newer permission request")
+
+	update, supported, err := store.UpdateLifecycle(event)
+	if err != nil || !supported {
+		t.Fatalf("prompt update = %#v, supported=%t err=%v", update, supported, err)
 	}
-	if got := readState(t, store.path).Sessions["session-a"].State; got != status.Attention {
-		t.Fatalf("state = %q, want attention", got)
+	session := readState(t, store.path).Sessions["session-a"]
+	if session.TurnID != "turn-a" {
+		t.Fatalf("stored turn identity = %q, want turn-a", session.TurnID)
+	}
+	stateFile, err := os.ReadFile(store.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{transcript, "/secret/project", "do not store this", "transcript_path", "cwd", "prompt"} {
+		if strings.Contains(string(stateFile), forbidden) {
+			t.Fatalf("state file contains sensitive payload content %q in %s", forbidden, stateFile)
+		}
 	}
 }

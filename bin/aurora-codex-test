@@ -5,14 +5,173 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-mkdir -p "$TMP/home/.codex-business" "$TMP/runtime"
+assert_eq() {
+  local got=$1
+  local want=$2
+  local label=$3
+
+  if [ "$got" != "$want" ]; then
+    printf 'assertion failed: %s\nwant: %s\ngot:  %s\n' "$label" "$want" "$got" >&2
+    exit 1
+  fi
+}
+
+assert_file_empty() {
+  local path=$1
+  local label=$2
+
+  if [ -s "$path" ]; then
+    printf 'assertion failed: %s was not empty\n' "$label" >&2
+    exit 1
+  fi
+}
+
+assert_file_absent() {
+  local path=$1
+  local label=$2
+
+  if [ -e "$path" ]; then
+    printf 'assertion failed: %s exists unexpectedly: %s\n' "$label" "$path" >&2
+    exit 1
+  fi
+}
+
+assert_file_bytes() {
+  local got=$1
+  local want=$2
+  local label=$3
+
+  if ! cmp -s "$got" "$want"; then
+    printf 'assertion failed: %s bytes differ\n' "$label" >&2
+    exit 1
+  fi
+}
+
+write_expected() {
+  local path=$1
+  local payload=$2
+
+  printf '%s' "$payload" >"$path"
+}
+
+run_adapter_case() {
+  local name=$1
+  local expected_payload=$2
+  shift 2
+
+  local case_dir="$TMP/adapter/$name"
+  mkdir -p "$case_dir"
+
+  cat >"$case_dir/fake-hook" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+cat >"$AURORA_TEST_RECEIVED"
+EOF
+  chmod +x "$case_dir/fake-hook"
+
+  local expected="$case_dir/expected"
+  local stdout="$case_dir/stdout"
+  local stderr="$case_dir/stderr"
+  local received="$case_dir/received"
+  write_expected "$expected" "$expected_payload"
+
+  AURORA_TEST_RECEIVED="$received" \
+  AURORA_CODEX_NOTIFY_HOOK_COMMAND="$case_dir/fake-hook" \
+    "$ROOT/deploy/bin/aurora-codex-notify" "$@" >"$stdout" 2>"$stderr"
+
+  assert_file_bytes "$received" "$expected" "$name payload"
+  assert_file_empty "$stdout" "$name stdout"
+  assert_file_empty "$stderr" "$name stderr"
+
+  if find "$case_dir" -type f \
+      ! -name fake-hook \
+      ! -name expected \
+      ! -name received \
+      ! -name stdout \
+      ! -name stderr \
+      -print -quit | grep -q .; then
+    printf 'assertion failed: %s created an unexpected file\n' "$name" >&2
+    exit 1
+  fi
+}
+
+run_adapter_missing_payload_case() {
+  local case_dir="$TMP/adapter/missing-payload"
+  mkdir -p "$case_dir"
+
+  cat >"$case_dir/fake-hook" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+cat >"$AURORA_TEST_RECEIVED"
+EOF
+  chmod +x "$case_dir/fake-hook"
+
+  local stdout="$case_dir/stdout"
+  local stderr="$case_dir/stderr"
+  local received="$case_dir/received"
+
+  AURORA_TEST_RECEIVED="$received" \
+  AURORA_CODEX_NOTIFY_HOOK_COMMAND="$case_dir/fake-hook" \
+    "$ROOT/deploy/bin/aurora-codex-notify" >"$stdout" 2>"$stderr"
+
+  assert_file_absent "$received" "missing payload hook output"
+  assert_file_empty "$stdout" "missing payload stdout"
+  assert_file_empty "$stderr" "missing payload stderr"
+}
+
+run_adapter_tests() {
+  run_adapter_case json '{"hook_event_name":"Stop","session_id":"abc"}' \
+    '{"hook_event_name":"Stop","session_id":"abc"}'
+  run_adapter_case spaces '{"last-assistant-message":"klar med flera ord"}' \
+    '{"last-assistant-message":"klar med flera ord"}'
+  run_adapter_case quotes '{"text":"quote: \"hello\" and slash \\ ok"}' \
+    '{"text":"quote: \"hello\" and slash \\ ok"}'
+  run_adapter_case unicode '{"text":"räksmörgås 東京"}' \
+    '{"text":"räksmörgås 東京"}'
+  run_adapter_case last-argument '{"payload":"last"}' \
+    ignored '{"payload":"last"}'
+  run_adapter_missing_payload_case
+}
 
 cat >"$TMP/fake-codex" <<'EOF'
 #!/usr/bin/env bash
 set -eu
+
 printf '%s\n' "$AURORA_CODEX_SOURCE" >"$TEST_OUTPUT/source"
 printf '%s\n' "$AURORA_CODEX_STATE_FILE" >"$TEST_OUTPUT/state"
-printf '%s\n' "$*" >"$TEST_OUTPUT/args"
+printf '%s\n' "$AURORA_CODEX_SESSION_ID_FILE" >"$TEST_OUTPUT/session-id-file"
+printf '%s\n' "$AURORA_CODEX_WATCHER_FILE" >"$TEST_OUTPUT/watcher-file"
+printf '%s\n' "$AURORA_CODEX_WRAPPER_PID" >"$TEST_OUTPUT/wrapper-pid"
+
+argument_count=0
+notify_count=0
+lifecycle_count=0
+for argument do
+  printf '%s' "$argument" >"$TEST_OUTPUT/arg-$argument_count"
+  case "$argument" in
+    notify*) notify_count=$((notify_count + 1)) ;;
+    hooks.*) lifecycle_count=$((lifecycle_count + 1)) ;;
+  esac
+  argument_count=$((argument_count + 1))
+done
+printf '%s\n' "$argument_count" >"$TEST_OUTPUT/arg-count"
+printf '%s\n' "$notify_count" >"$TEST_OUTPUT/notify-count"
+printf '%s\n' "$lifecycle_count" >"$TEST_OUTPUT/lifecycle-count"
+
+if [ "${AURORA_TEST_SIMULATE_LIFECYCLE:-}" = "1" ]; then
+  session_id="${AURORA_TEST_SESSION_ID:-session-test}"
+  "${AURORA_CODEX_LIFECYCLE_HOOK_COMMAND:?}" <<EOF2
+{"hook_event_name":"SessionStart","session_id":"$session_id"}
+EOF2
+  "${AURORA_CODEX_LIFECYCLE_HOOK_COMMAND:?}" <<EOF2
+{"hook_event_name":"UserPromptSubmit","session_id":"$session_id","turn_id":"turn-1"}
+EOF2
+  printf '%s\n' "working-observed" >"$TEST_OUTPUT/while-working"
+  "${AURORA_CODEX_LIFECYCLE_HOOK_COMMAND:?}" <<EOF2
+{"hook_event_name":"Stop","session_id":"$session_id","turn_id":"turn-1"}
+EOF2
+fi
+
 printf '%s\n' "session-test" >"$AURORA_CODEX_SESSION_ID_FILE"
 mkdir -p "$AURORA_CODEX_WATCHER_FILE"
 sleep 30 &
@@ -32,40 +191,339 @@ printf '%s\n' "$AURORA_CODEX_STATE_FILE" >"$TEST_OUTPUT/hook-state"
 cat "$2" >"$TEST_OUTPUT/hook-session"
 EOF
 
-chmod +x "$TMP/fake-codex" "$TMP/fake-hook"
-mkdir -p "$TMP/output"
+cat >"$TMP/fake-lifecycle-hook" <<'EOF'
+#!/usr/bin/env bash
+set -eu
+payload=$(cat)
+printf '%s\n' "$payload" >>"$TEST_OUTPUT/lifecycle-payloads"
+case "$payload" in
+  *'"hook_event_name":"SessionStart"'*) state=idle ;;
+  *'"hook_event_name":"UserPromptSubmit"'*) state=working ;;
+  *'"hook_event_name":"Stop"'*) state=idle ;;
+  *) state=unknown ;;
+esac
+case "$payload" in
+  *'"session_id":"session-a"'*) session=session-a ;;
+  *'"session_id":"session-b"'*) session=session-b ;;
+  *'"session_id":"foreign"'*) session=foreign ;;
+  *) session=session-test ;;
+esac
+printf '%s %s\n' "$session" "$state" >>"$TEST_OUTPUT/lifecycle-states"
+EOF
 
-set +e
-env -u AURORA_CODEX_SOURCE -u AURORA_CODEX_STATE_FILE \
-HOME="$TMP/home" \
-XDG_RUNTIME_DIR="$TMP/runtime" \
-CODEX_HOME="$TMP/home/.codex-business" \
-TEST_OUTPUT="$TMP/output" \
-TEST_CODEX_EXIT=7 \
-AURORA_CODEX_COMMAND="$TMP/fake-codex" \
-AURORA_CODEX_HOOK_COMMAND="$TMP/fake-hook" \
-"$ROOT/bin/aurora-codex" --no-alt-screen example
-result=$?
-set -e
+chmod +x "$TMP/fake-codex" "$TMP/fake-hook" "$TMP/fake-lifecycle-hook"
+mkdir -p "$TMP/home/.codex-business" "$TMP/runtime" "$TMP/output"
 
-test "$result" -eq 7
-test "$(cat "$TMP/output/source")" = "codex-business"
-test "$(cat "$TMP/output/hook-source")" = "codex-business"
-test "$(cat "$TMP/output/state")" = "$TMP/home/.local/state/aurora/codex-business-sessions.json"
-test "$(cat "$TMP/output/hook-state")" = "$TMP/home/.local/state/aurora/codex-business-sessions.json"
-test "$(cat "$TMP/output/args")" = "--no-alt-screen example"
-test "$(cat "$TMP/output/hook-args")" = "--session-end-file $(cat "$TMP/output/hook-session-path")"
-test "$(cat "$TMP/output/hook-session")" = "session-test"
+run_wrapper_case() {
+  local name=$1
+  local codex_home=$2
+  local source_override=$3
+  local expected_exit=$4
+  shift 4
 
-if find "$TMP/runtime" -name 'codex-session.*' -print -quit | grep -q .; then
-  echo "temporary session file was not removed" >&2
+  local output="$TMP/output/$name"
+  mkdir -p "$output"
+
+  local environment=(
+    env
+    -u AURORA_CODEX_SOURCE
+    -u AURORA_CODEX_STATE_FILE
+    HOME="$TMP/home"
+    XDG_RUNTIME_DIR="$TMP/runtime/$name"
+    CODEX_HOME="$codex_home"
+    TEST_OUTPUT="$output"
+    TEST_CODEX_EXIT="$expected_exit"
+    AURORA_CODEX_COMMAND="$TMP/fake-codex"
+    AURORA_CODEX_HOOK_COMMAND="$TMP/fake-hook"
+    AURORA_CODEX_NOTIFY_COMMAND="$TMP/fake-notify"
+    AURORA_CODEX_LIFECYCLE_HOOK_COMMAND="$TMP/fake-lifecycle-hook"
+    AURORA_TEST_SIMULATE_LIFECYCLE="${AURORA_TEST_SIMULATE_LIFECYCLE:-}"
+    AURORA_TEST_SESSION_ID="${AURORA_TEST_SESSION_ID:-}"
+  )
+
+  mkdir -p "$TMP/runtime/$name"
+
+  if [ -n "$source_override" ]; then
+    environment+=(AURORA_CODEX_SOURCE="$source_override")
+  fi
+
+  set +e
+  "${environment[@]}" "$ROOT/bin/aurora-codex" "$@"
+  local result=$?
+  set -e
+
+  assert_eq "$result" "$expected_exit" "$name exit"
+}
+
+arg_at() {
+  local name=$1
+  local index=$2
+
+  cat "$TMP/output/$name/arg-$index"
+}
+
+assert_arg() {
+  local name=$1
+  local index=$2
+  local expected=$3
+
+  assert_eq "$(arg_at "$name" "$index")" "$expected" "$name arg $index"
+}
+
+assert_arg_contains() {
+  local name=$1
+  local expected=$2
+  local count
+  local index
+
+  count=$(cat "$TMP/output/$name/arg-count")
+  for ((index = 0; index < count; index++)); do
+    if [ "$(arg_at "$name" "$index")" = "$expected" ]; then
+      return 0
+    fi
+  done
+  printf 'assertion failed: %s args did not contain %s\n' "$name" "$expected" >&2
   exit 1
-fi
+}
 
-watcher_pid="$(cat "$TMP/output/watcher-pid")"
-if kill -0 "$watcher_pid" 2>/dev/null; then
-  echo "watcher process was not stopped" >&2
-  exit 1
-fi
+assert_last_args() {
+  local name=$1
+  shift
+  local count
+  local start
+  local expected
+  local offset=0
 
-printf 'aurora-codex wrapper test: OK\n'
+  count=$(cat "$TMP/output/$name/arg-count")
+  start=$((count - $#))
+  if [ "$start" -lt 0 ]; then
+    printf 'assertion failed: %s has fewer args than expected tail\n' "$name" >&2
+    exit 1
+  fi
+  for expected in "$@"; do
+    assert_arg "$name" "$((start + offset))" "$expected"
+    offset=$((offset + 1))
+  done
+}
+
+assert_lifecycle_sequence() {
+  local name=$1
+  local expected=$2
+
+  assert_eq "$(paste -sd ',' "$TMP/output/$name/lifecycle-states")" "$expected" "$name lifecycle sequence"
+}
+
+assert_wrapper_cleanup() {
+  local name=$1
+  local watcher_pid
+
+  if find "$TMP/runtime/$name" -name 'codex-session.*' -print -quit | grep -q .; then
+    printf 'temporary session file was not removed for %s\n' "$name" >&2
+    exit 1
+  fi
+
+  watcher_pid="$(cat "$TMP/output/$name/watcher-pid")"
+  if kill -0 "$watcher_pid" 2>/dev/null; then
+    printf 'watcher process was not stopped for %s\n' "$name" >&2
+    exit 1
+  fi
+}
+
+run_wrapper_tests() {
+  run_wrapper_case normal "$TMP/home/.codex-business" "" 7 --no-alt-screen example
+  assert_eq "$(cat "$TMP/output/normal/source")" "codex-business" "normal source"
+  assert_eq "$(cat "$TMP/output/normal/hook-source")" "codex-business" "normal hook source"
+  assert_eq "$(cat "$TMP/output/normal/state")" "$TMP/home/.local/state/aurora/codex-business-sessions.json" "normal state"
+  assert_eq "$(cat "$TMP/output/normal/hook-state")" "$TMP/home/.local/state/aurora/codex-business-sessions.json" "normal hook state"
+  assert_eq "$(cat "$TMP/output/normal/arg-count")" "16" "normal arg count"
+  assert_arg normal 0 "-c"
+  assert_arg normal 1 "notify=[\"$TMP/fake-notify\"]"
+  assert_arg_contains normal "hooks.SessionStart=[{hooks=[{type=\"command\", command=\"$TMP/fake-lifecycle-hook\"}]}]"
+  assert_arg_contains normal "hooks.UserPromptSubmit=[{hooks=[{type=\"command\", command=\"$TMP/fake-lifecycle-hook\"}]}]"
+  assert_arg_contains normal "hooks.Stop=[{hooks=[{type=\"command\", command=\"$TMP/fake-lifecycle-hook\"}]}]"
+  assert_last_args normal "--no-alt-screen" "example"
+  assert_eq "$(cat "$TMP/output/normal/notify-count")" "1" "normal notify count"
+  assert_eq "$(cat "$TMP/output/normal/lifecycle-count")" "6" "normal lifecycle count"
+  assert_eq "$(cat "$TMP/output/normal/hook-args")" "--session-end-file $(cat "$TMP/output/normal/hook-session-path")" "normal hook args"
+  assert_eq "$(cat "$TMP/output/normal/hook-session")" "session-test" "normal hook session"
+  assert_wrapper_cleanup normal
+
+  run_wrapper_case resume-last "$TMP/home/.codex" "" 0 resume --last
+  assert_eq "$(cat "$TMP/output/resume-last/source")" "codex-api" "resume source"
+  assert_eq "$(cat "$TMP/output/resume-last/arg-count")" "16" "resume arg count"
+  assert_arg resume-last 0 "-c"
+  assert_arg resume-last 1 "notify=[\"$TMP/fake-notify\"]"
+  assert_last_args resume-last "resume" "--last"
+  assert_eq "$(cat "$TMP/output/resume-last/notify-count")" "1" "resume notify count"
+  assert_eq "$(cat "$TMP/output/resume-last/lifecycle-count")" "6" "resume lifecycle count"
+
+  mkdir -p "$TMP/home/.codex"
+  printf '%s\n' 'notify=["/user/config/notifier"]' >"$TMP/home/.codex/config.toml"
+  run_wrapper_case config-file-notify-superseded "$TMP/home/.codex" "" 0
+  assert_eq "$(cat "$TMP/output/config-file-notify-superseded/arg-count")" "14" "config notify arg count"
+  assert_arg config-file-notify-superseded 0 "-c"
+  assert_arg config-file-notify-superseded 1 "notify=[\"$TMP/fake-notify\"]"
+  assert_eq "$(cat "$TMP/output/config-file-notify-superseded/notify-count")" "1" "config notify injected count"
+  assert_eq "$(cat "$TMP/output/config-file-notify-superseded/lifecycle-count")" "6" "config lifecycle injected count"
+
+  run_wrapper_case forwarded-args "$TMP/home/.codex" "codex-manual" 0 \
+    -c 'model="gpt-5.4"' --profile deep-review 'prompt med mellanslag'
+  assert_eq "$(cat "$TMP/output/forwarded-args/source")" "codex-manual" "override source"
+  assert_eq "$(cat "$TMP/output/forwarded-args/arg-count")" "19" "forwarded arg count"
+  assert_arg forwarded-args 0 "-c"
+  assert_arg forwarded-args 1 "notify=[\"$TMP/fake-notify\"]"
+  assert_last_args forwarded-args "-c" 'model="gpt-5.4"' "--profile" "deep-review" "prompt med mellanslag"
+  assert_eq "$(cat "$TMP/output/forwarded-args/notify-count")" "1" "forwarded notify count"
+  assert_eq "$(cat "$TMP/output/forwarded-args/lifecycle-count")" "6" "forwarded lifecycle count"
+
+  run_wrapper_case explicit-notify "$TMP/home/.codex" "" 0 \
+    --config 'notify=["/custom/notifier"]' resume --last
+  assert_eq "$(cat "$TMP/output/explicit-notify/arg-count")" "16" "explicit notify arg count"
+  assert_last_args explicit-notify "--config" 'notify=["/custom/notifier"]' "resume" "--last"
+  assert_eq "$(cat "$TMP/output/explicit-notify/notify-count")" "1" "explicit notify count"
+  assert_eq "$(cat "$TMP/output/explicit-notify/lifecycle-count")" "6" "explicit notify lifecycle count"
+
+  run_wrapper_case explicit-notify-spaces "$TMP/home/.codex" "" 0 \
+    -c 'notify = ["/custom/notifier"]'
+  assert_eq "$(cat "$TMP/output/explicit-notify-spaces/arg-count")" "14" "explicit notify spaces arg count"
+  assert_last_args explicit-notify-spaces "-c" 'notify = ["/custom/notifier"]'
+  assert_eq "$(cat "$TMP/output/explicit-notify-spaces/notify-count")" "1" "explicit notify spaces raw notify count"
+  assert_eq "$(cat "$TMP/output/explicit-notify-spaces/lifecycle-count")" "6" "explicit notify spaces lifecycle count"
+
+  run_wrapper_case explicit-notify-long-spaces "$TMP/home/.codex" "" 0 \
+    --config 'notify = ["/custom/notifier"]'
+  assert_eq "$(cat "$TMP/output/explicit-notify-long-spaces/arg-count")" "14" "explicit notify long spaces arg count"
+  assert_last_args explicit-notify-long-spaces "--config" 'notify = ["/custom/notifier"]'
+  assert_eq "$(cat "$TMP/output/explicit-notify-long-spaces/notify-count")" "1" "explicit notify long spaces raw notify count"
+  assert_eq "$(cat "$TMP/output/explicit-notify-long-spaces/lifecycle-count")" "6" "explicit notify long spaces lifecycle count"
+
+  run_wrapper_case explicit-notify-equals "$TMP/home/.codex" "" 0 \
+    --config='notify=["/custom/notifier"]'
+  assert_eq "$(cat "$TMP/output/explicit-notify-equals/arg-count")" "13" "explicit notify equals arg count"
+  assert_last_args explicit-notify-equals '--config=notify=["/custom/notifier"]'
+  assert_eq "$(cat "$TMP/output/explicit-notify-equals/notify-count")" "0" "explicit notify equals raw notify count"
+  assert_eq "$(cat "$TMP/output/explicit-notify-equals/lifecycle-count")" "6" "explicit notify equals lifecycle count"
+
+  run_wrapper_case explicit-notify-short-equals "$TMP/home/.codex" "" 0 \
+    -c='notify=["/custom/notifier"]'
+  assert_eq "$(cat "$TMP/output/explicit-notify-short-equals/arg-count")" "13" "explicit notify short equals arg count"
+  assert_last_args explicit-notify-short-equals '-c=notify=["/custom/notifier"]'
+  assert_eq "$(cat "$TMP/output/explicit-notify-short-equals/notify-count")" "0" "explicit notify short equals raw notify count"
+  assert_eq "$(cat "$TMP/output/explicit-notify-short-equals/lifecycle-count")" "6" "explicit notify short equals lifecycle count"
+
+  run_wrapper_case explicit-hooks "$TMP/home/.codex" "" 0 \
+    -c 'hooks.UserPromptSubmit=[]'
+  assert_eq "$(cat "$TMP/output/explicit-hooks/arg-count")" "4" "explicit hooks arg count"
+  assert_arg explicit-hooks 0 "-c"
+  assert_arg explicit-hooks 1 "notify=[\"$TMP/fake-notify\"]"
+  assert_last_args explicit-hooks "-c" 'hooks.UserPromptSubmit=[]'
+  assert_eq "$(cat "$TMP/output/explicit-hooks/lifecycle-count")" "1" "explicit hooks not duplicated count"
+
+  local hooks_home="$TMP/home/.codex-existing-hooks"
+  mkdir -p "$hooks_home"
+  cat >"$hooks_home/hooks.json" <<EOF
+{
+  "hooks": {
+    "SessionStart": [{"hooks": [{"type": "command", "command": "$TMP/fake-lifecycle-hook"}]}],
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "$TMP/fake-lifecycle-hook"}]}],
+    "PermissionRequest": [{"matcher": ".*", "hooks": [{"type": "command", "command": "$TMP/fake-lifecycle-hook"}]}],
+    "PreToolUse": [{"matcher": ".*", "hooks": [{"type": "command", "command": "$TMP/fake-lifecycle-hook"}]}],
+    "PostToolUse": [{"matcher": ".*", "hooks": [{"type": "command", "command": "$TMP/fake-lifecycle-hook"}]}],
+    "Stop": [{"hooks": [{"type": "command", "command": "$TMP/fake-lifecycle-hook"}]}]
+  }
+}
+EOF
+  run_wrapper_case existing-hooks-json "$hooks_home" "" 0
+  assert_eq "$(cat "$TMP/output/existing-hooks-json/arg-count")" "2" "existing hooks json arg count"
+  assert_arg existing-hooks-json 0 "-c"
+  assert_arg existing-hooks-json 1 "notify=[\"$TMP/fake-notify\"]"
+  assert_eq "$(cat "$TMP/output/existing-hooks-json/lifecycle-count")" "0" "existing hooks json lifecycle count"
+
+  local partial_hooks_home="$TMP/home/.codex-partial-hooks"
+  mkdir -p "$partial_hooks_home"
+  cat >"$partial_hooks_home/hooks.json" <<EOF
+{
+  "hooks": {
+    "SessionStart": [{"hooks": [{"type": "command", "command": "$TMP/fake-lifecycle-hook"}]}]
+  }
+}
+EOF
+  run_wrapper_case hooks-json-command-one-event "$partial_hooks_home" "" 0
+  assert_eq "$(cat "$TMP/output/hooks-json-command-one-event/lifecycle-count")" "6" "partial hooks json lifecycle count"
+
+  local wrong_command_hooks_home="$TMP/home/.codex-wrong-command-hooks"
+  mkdir -p "$wrong_command_hooks_home"
+  cat >"$wrong_command_hooks_home/hooks.json" <<EOF
+{
+  "hooks": {
+    "SessionStart": [{"hooks": [{"type": "command", "command": "/other/hook"}]}],
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "/other/hook"}]}],
+    "PermissionRequest": [{"matcher": ".*", "hooks": [{"type": "command", "command": "/other/hook"}]}],
+    "PreToolUse": [{"matcher": ".*", "hooks": [{"type": "command", "command": "/other/hook"}]}],
+    "PostToolUse": [{"matcher": ".*", "hooks": [{"type": "command", "command": "/other/hook"}]}],
+    "Stop": [{"hooks": [{"type": "command", "command": "/other/hook"}]}]
+  }
+}
+EOF
+  run_wrapper_case hooks-json-events-wrong-command "$wrong_command_hooks_home" "" 0
+  assert_eq "$(cat "$TMP/output/hooks-json-events-wrong-command/lifecycle-count")" "6" "wrong command hooks json lifecycle count"
+
+  local irrelevant_hooks_home="$TMP/home/.codex-irrelevant-hooks"
+  mkdir -p "$irrelevant_hooks_home"
+  cat >"$irrelevant_hooks_home/hooks.json" <<EOF
+{
+  "metadata": {
+    "command": "$TMP/fake-lifecycle-hook",
+    "events": ["SessionStart", "UserPromptSubmit", "PermissionRequest", "PreToolUse", "PostToolUse", "Stop"]
+  },
+  "hooks": {}
+}
+EOF
+  run_wrapper_case hooks-json-command-irrelevant-field "$irrelevant_hooks_home" "" 0
+  assert_eq "$(cat "$TMP/output/hooks-json-command-irrelevant-field/lifecycle-count")" "6" "irrelevant command hooks json lifecycle count"
+
+  local invalid_hooks_home="$TMP/home/.codex-invalid-hooks"
+  mkdir -p "$invalid_hooks_home"
+  printf '%s\n' '{"hooks":' >"$invalid_hooks_home/hooks.json"
+  run_wrapper_case hooks-json-invalid "$invalid_hooks_home" "" 0
+  assert_eq "$(cat "$TMP/output/hooks-json-invalid/lifecycle-count")" "6" "invalid hooks json lifecycle count"
+
+  local missing_hooks_home="$TMP/home/.codex-missing-hooks"
+  mkdir -p "$missing_hooks_home"
+  run_wrapper_case hooks-json-missing "$missing_hooks_home" "" 0
+  assert_eq "$(cat "$TMP/output/hooks-json-missing/lifecycle-count")" "6" "missing hooks json lifecycle count"
+
+  AURORA_TEST_SIMULATE_LIFECYCLE=1 AURORA_TEST_SESSION_ID=session-test \
+    run_wrapper_case first-turn-new "$TMP/home/.codex" "" 0
+  assert_lifecycle_sequence first-turn-new "session-test idle,session-test working,session-test idle"
+  assert_eq "$(cat "$TMP/output/first-turn-new/while-working")" "working-observed" "first turn working marker"
+
+  AURORA_TEST_SIMULATE_LIFECYCLE=1 AURORA_TEST_SESSION_ID=session-test \
+    run_wrapper_case first-turn-resume-last "$TMP/home/.codex" "" 0 resume --last
+  assert_lifecycle_sequence first-turn-resume-last "session-test idle,session-test working,session-test idle"
+
+  AURORA_TEST_SIMULATE_LIFECYCLE=1 AURORA_TEST_SESSION_ID=session-a \
+    run_wrapper_case parallel-a "$TMP/home/.codex" "" 0
+  AURORA_TEST_SIMULATE_LIFECYCLE=1 AURORA_TEST_SESSION_ID=session-b \
+    run_wrapper_case parallel-b "$TMP/home/.codex" "" 0
+  assert_lifecycle_sequence parallel-a "session-a idle,session-a working,session-a idle"
+  assert_lifecycle_sequence parallel-b "session-b idle,session-b working,session-b idle"
+
+  mkdir -p "$TMP/home/.codex/sessions/2099/01/01"
+  printf '%s\n' '{"type":"session_meta","session_id":"foreign"}' >"$TMP/home/.codex/sessions/2099/01/01/foreign.jsonl"
+  run_wrapper_case foreign-session-file "$TMP/home/.codex" "" 0
+  assert_file_absent "$TMP/output/foreign-session-file/lifecycle-states" "foreign session file lifecycle states"
+
+  printf '%s\n' '{"type":"session_meta","session_id":"candidate-a"}' >"$TMP/home/.codex/sessions/2099/01/01/candidate-a.jsonl"
+  printf '%s\n' '{"type":"session_meta","session_id":"candidate-b"}' >"$TMP/home/.codex/sessions/2099/01/01/candidate-b.jsonl"
+  run_wrapper_case multiple-session-candidates "$TMP/home/.codex" "" 0
+  assert_file_absent "$TMP/output/multiple-session-candidates/lifecycle-states" "multiple candidate lifecycle states"
+
+  run_wrapper_case no-bootstrap-without-lifecycle "$TMP/home/.codex" "" 0
+  assert_file_absent "$TMP/output/no-bootstrap-without-lifecycle/lifecycle-states" "closed bootstrap lifecycle states"
+}
+
+run_adapter_tests
+run_wrapper_tests
+
+printf 'aurora-codex shell tests: OK\n'

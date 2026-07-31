@@ -3,6 +3,8 @@ set -u
 
 REAL_CODEX="${AURORA_CODEX_COMMAND:-/home/carl/.npm-global/bin/codex}"
 HOOK_COMMAND="${AURORA_CODEX_HOOK_COMMAND:-/srv/dev/aurora/bin/aurora-codex-hook}"
+NOTIFY_COMMAND="${AURORA_CODEX_NOTIFY_COMMAND:-/usr/local/bin/aurora-codex-notify}"
+LIFECYCLE_HOOK_COMMAND="${AURORA_CODEX_LIFECYCLE_HOOK_COMMAND:-/usr/local/bin/aurora-codex-hook-local}"
 CODEX_HOME_VALUE="${CODEX_HOME:-$HOME/.codex}"
 
 case "$CODEX_HOME_VALUE" in
@@ -53,5 +55,172 @@ cleanup() {
 
 trap cleanup EXIT
 
-"$REAL_CODEX" "$@"
+trim_ascii_space() {
+  local value=$1
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+config_key_from_override() {
+  local override
+  local key
+
+  override=$(trim_ascii_space "$1")
+  case "$override" in
+    *=*) ;;
+    *) return 1 ;;
+  esac
+  key=$(trim_ascii_space "${override%%=*}")
+  [ -n "$key" ] || return 1
+  printf '%s' "$key"
+}
+
+config_key_matches() {
+  local key=$1
+  local wanted=$2
+
+  if [ "$key" = "$wanted" ]; then
+    return 0
+  fi
+  case "$key" in
+    "$wanted".*) return 0 ;;
+  esac
+  return 1
+}
+
+has_explicit_config_key() {
+  local wanted=$1
+  local argument
+  local next_is_config=false
+  local key
+  local override
+
+  shift
+  for argument in "$@"; do
+    if [ "$argument" = "--" ]; then
+      return 1
+    fi
+    if [ "$next_is_config" = true ]; then
+      key=$(config_key_from_override "$argument" || true)
+      if [ -n "$key" ] && config_key_matches "$key" "$wanted"; then
+        return 0
+      fi
+      next_is_config=false
+      continue
+    fi
+
+    case "$argument" in
+      -c|--config)
+        next_is_config=true
+        ;;
+      --config=*)
+        override=${argument#--config=}
+        key=$(config_key_from_override "$override" || true)
+        if [ -n "$key" ] && config_key_matches "$key" "$wanted"; then
+          return 0
+        fi
+        ;;
+      -c=*)
+        override=${argument#-c=}
+        key=$(config_key_from_override "$override" || true)
+        if [ -n "$key" ] && config_key_matches "$key" "$wanted"; then
+          return 0
+        fi
+        ;;
+      -c?*)
+        override=${argument#-c}
+        key=$(config_key_from_override "$override" || true)
+        if [ -n "$key" ] && config_key_matches "$key" "$wanted"; then
+          return 0
+        fi
+        ;;
+    esac
+  done
+
+  return 1
+}
+
+toml_string() {
+  local value=$1
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  printf '"%s"' "$value"
+}
+
+append_lifecycle_hook_config() {
+  local command_toml
+
+  command_toml=$(toml_string "$LIFECYCLE_HOOK_COMMAND")
+  codex_args+=(
+    "-c" "hooks.SessionStart=[{hooks=[{type=\"command\", command=$command_toml}]}]"
+    "-c" "hooks.UserPromptSubmit=[{hooks=[{type=\"command\", command=$command_toml}]}]"
+    "-c" "hooks.PermissionRequest=[{matcher=\".*\", hooks=[{type=\"command\", command=$command_toml}]}]"
+    "-c" "hooks.PreToolUse=[{matcher=\".*\", hooks=[{type=\"command\", command=$command_toml}]}]"
+    "-c" "hooks.PostToolUse=[{matcher=\".*\", hooks=[{type=\"command\", command=$command_toml}]}]"
+    "-c" "hooks.Stop=[{hooks=[{type=\"command\", command=$command_toml}]}]"
+  )
+}
+
+has_existing_aurora_lifecycle_hooks() {
+  local hooks_file="$CODEX_HOME_VALUE/hooks.json"
+
+  [ -r "$hooks_file" ] || return 1
+  command -v node >/dev/null 2>&1 || return 1
+
+  AURORA_CODEX_HOOKS_FILE="$hooks_file" \
+  AURORA_CODEX_EXPECTED_HOOK_COMMAND="$LIFECYCLE_HOOK_COMMAND" \
+    node <<'NODE'
+const fs = require("fs");
+
+const hooksFile = process.env.AURORA_CODEX_HOOKS_FILE;
+const expectedCommand = process.env.AURORA_CODEX_EXPECTED_HOOK_COMMAND;
+const events = [
+  "SessionStart",
+  "UserPromptSubmit",
+  "PermissionRequest",
+  "PreToolUse",
+  "PostToolUse",
+  "Stop",
+];
+
+let document;
+try {
+  document = JSON.parse(fs.readFileSync(hooksFile, "utf8"));
+} catch {
+  process.exit(1);
+}
+
+const hooks = document && document.hooks;
+function eventHasExpectedCommand(eventName) {
+  const matcherGroups = hooks && hooks[eventName];
+  if (!Array.isArray(matcherGroups)) {
+    return false;
+  }
+  return matcherGroups.some((group) => {
+    const handlers = group && group.hooks;
+    return Array.isArray(handlers) && handlers.some((handler) =>
+      handler &&
+      handler.type === "command" &&
+      handler.command === expectedCommand
+    );
+  });
+}
+
+process.exit(events.every(eventHasExpectedCommand) ? 0 : 1);
+NODE
+}
+
+codex_args=()
+if ! has_explicit_config_key "notify" "$@"; then
+  codex_args+=("-c" "notify=[\"$NOTIFY_COMMAND\"]")
+fi
+if ! has_explicit_config_key "hooks" "$@" &&
+  ! has_explicit_config_key "features.hooks" "$@" &&
+  ! has_existing_aurora_lifecycle_hooks; then
+  append_lifecycle_hook_config
+fi
+codex_args+=("$@")
+
+"$REAL_CODEX" "${codex_args[@]}"
 exit $?

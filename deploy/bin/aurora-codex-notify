@@ -1,0 +1,16 @@
+#!/bin/sh
+
+set -eu
+
+hook_command=${AURORA_CODEX_NOTIFY_HOOK_COMMAND:-/usr/local/bin/aurora-codex-hook-local}
+payload=
+
+for argument do
+  payload=$argument
+done
+
+if [ "$#" -eq 0 ]; then
+  exit 0
+fi
+
+printf '%s' "$payload" | "$hook_command" >/dev/null

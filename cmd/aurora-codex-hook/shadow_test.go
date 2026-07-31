@@ -6,7 +6,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -17,7 +16,6 @@ import (
 	"github.com/swemonstro/aurora/internal/codexhook"
 	"github.com/swemonstro/aurora/internal/codexproducer"
 	"github.com/swemonstro/aurora/internal/hookadapter"
-	"github.com/swemonstro/aurora/internal/localhooktransport"
 	"github.com/swemonstro/aurora/internal/presence"
 )
 
@@ -283,6 +281,62 @@ func TestShadowTimeoutFromEnv_NeverPanicsAndFallsBackSafely(t *testing.T) {
 	}
 }
 
+func TestShadow_StaleStopIsNotForwardedOverNewerAttention(t *testing.T) {
+	shadowCalls := withStubbedDeliverShadow(t)
+	values, snapshots := newRelayHarness(t)
+	getenv := func(key string) string { return values[key] }
+
+	for _, payload := range []string{
+		`{"hook_event_name":"PermissionRequest","session_id":"session-race","turn_id":"turn-old"}`,
+		`{"hook_event_name":"PermissionRequest","session_id":"session-race","turn_id":"turn-new"}`,
+	} {
+		if err := run(context.Background(), strings.NewReader(payload), getenv); err != nil {
+			t.Fatal(err)
+		}
+		if got := mustReceiveSnapshot(t, snapshots).State; got != "attention" {
+			t.Fatalf("permission state = %q, want attention", got)
+		}
+	}
+	if err := run(context.Background(), strings.NewReader(
+		`{"hook_event_name":"Stop","session_id":"session-race","turn_id":"turn-old"}`,
+	), getenv); err != nil {
+		t.Fatal(err)
+	}
+	if calls := shadowCalls.value(); calls != 2 {
+		t.Fatalf("stale Stop added a shadow-forward call: got %d calls, want 2", calls)
+	}
+	select {
+	case snapshot := <-snapshots:
+		t.Fatalf("stale Stop was published to ordinary relay: %#v", snapshot)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestShadow_MatchingStopForwardsExactlyOnce(t *testing.T) {
+	shadowCalls := withStubbedDeliverShadow(t)
+	values, snapshots := newRelayHarness(t)
+	getenv := func(key string) string { return values[key] }
+
+	if err := run(context.Background(), strings.NewReader(
+		`{"hook_event_name":"PermissionRequest","session_id":"session-win","turn_id":"turn-win"}`,
+	), getenv); err != nil {
+		t.Fatal(err)
+	}
+	mustReceiveSnapshot(t, snapshots)
+	before := shadowCalls.value()
+	if err := run(context.Background(), strings.NewReader(
+		`{"hook_event_name":"Stop","session_id":"session-win","turn_id":"turn-win"}`,
+	), getenv); err != nil {
+		t.Fatal(err)
+	}
+	if got := mustReceiveSnapshot(t, snapshots).State; got != "idle" {
+		t.Fatalf("matching Stop state = %q, want idle", got)
+	}
+	if calls := shadowCalls.value(); calls != before+1 {
+		t.Fatalf("matching Stop shadow calls = %d, want %d", calls, before+1)
+	}
+}
+
 // withStubbedDeliverShadow substitutes the package-level deliverShadow var
 // with fake, recording every call, and restores the original on cleanup.
 func withStubbedDeliverShadow(t *testing.T) *int32Counter {
@@ -311,159 +365,4 @@ func (c *int32Counter) value() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.count
-}
-
-// withTestHookBeforeRecoveryAttempt substitutes the package-level
-// testHookBeforeRecoveryAttempt var with fn and restores the original on
-// cleanup.
-func withTestHookBeforeRecoveryAttempt(t *testing.T, fn func()) {
-	t.Helper()
-	original := testHookBeforeRecoveryAttempt
-	testHookBeforeRecoveryAttempt = fn
-	t.Cleanup(func() { testHookBeforeRecoveryAttempt = original })
-}
-
-// TestWatchPermission_LostRecoveryRaceNeverShadowForwards is the direct
-// regression test for the bug found in the G.4 ultrareview: watchPermission
-// used to unconditionally shadow-forward a synthetic "Stop" after
-// sourcelifecycle.WithLock returned, even when store.RecoverCancelled lost
-// the race (recovered=false) because a genuine, concurrent Stop hook
-// invocation (a separate OS process in production, e.g. run()'s own
-// sourcelifecycle.WithLock call) cleared this exact permission watch first.
-// That genuine Stop is shadow-forwarded by that other invocation; this
-// watcher process must not also emit a second, phantom Stop for the same
-// underlying transition.
-//
-// permissionMatches (store.go) is the same check both PermissionPending and
-// RecoverCancelled use against the same session state, so the two only
-// disagree when a mutation lands in the narrow window between them within
-// one loop iteration — exactly the production race between a concurrent
-// Stop hook process and this watcher. testHookBeforeRecoveryAttempt is a
-// production no-op call site sitting exactly at that boundary (immediately
-// after the transcript match is confirmed, immediately before
-// RecoverCancelled/WithLock); substituting it lets this test apply the
-// competing Stop synchronously, in-process, with an exact, guaranteed
-// ordering — no goroutine, no lock race, no sleep, and therefore no way for
-// this test to pass by accident via a less interesting code path.
-func TestWatchPermission_LostRecoveryRaceNeverShadowForwards(t *testing.T) {
-	shadowCalls := withStubbedDeliverShadow(t)
-
-	directory := t.TempDir()
-	statePath := filepath.Join(directory, "state.json")
-	transcriptPath := filepath.Join(directory, "transcript.jsonl")
-	if err := os.WriteFile(transcriptPath, []byte(""), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	store, err := codexhook.NewSessionStore(statePath, time.Hour)
-	if err != nil {
-		t.Fatal(err)
-	}
-	update, _, err := store.UpdateLifecycle(codexhook.Event{
-		HookEventName:  "PermissionRequest",
-		SessionID:      "session-race",
-		TurnID:         "turn-race",
-		TranscriptPath: transcriptPath,
-	})
-	if err != nil || update.Watch == nil {
-		t.Fatalf("permission update = %#v, err=%v", update, err)
-	}
-	// Write the turn_aborted marker after capturing watch.TranscriptOffset,
-	// exactly like TestWatchPermissionPublishesIdleForMatchingAbort.
-	if err := os.WriteFile(transcriptPath, []byte(`{"type":"event_msg","payload":{"type":"turn_aborted","turn_id":"turn-race"}}`+"\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	hookCalls := 0
-	withTestHookBeforeRecoveryAttempt(t, func() {
-		hookCalls++
-		// Runs synchronously, in-process, exactly once, at the precise
-		// boundary between the transcript-match confirmation and
-		// watchPermission's own RecoverCancelled attempt: apply the
-		// competing Stop right here so RecoverCancelled is guaranteed —
-		// not merely likely — to observe the post-Stop state.
-		if _, _, err := store.UpdateLifecycle(codexhook.Event{
-			HookEventName: "Stop",
-			SessionID:     "session-race",
-		}); err != nil {
-			t.Fatal(err)
-		}
-	})
-
-	values := map[string]string{
-		codexhook.RelayURLEnv:         "http://unused.invalid",
-		codexhook.SourceEnv:           "codex-api",
-		codexhook.StateFileEnv:        statePath,
-		codexhook.SessionTTLEnv:       "1h",
-		codexhook.WatcherFileEnv:      filepath.Join(directory, "watchers"),
-		codexproducer.EnvShadowSocket: filepath.Join(directory, "shadow.sock"),
-	}
-	if err := watchPermission(
-		context.Background(),
-		*update.Watch,
-		func(key string) string { return values[key] },
-	); err != nil {
-		t.Fatalf("watch permission: %v", err)
-	}
-
-	if hookCalls != 1 {
-		t.Fatalf("expected the synchronization hook to fire exactly once, got %d", hookCalls)
-	}
-	if calls := shadowCalls.value(); calls != 0 {
-		t.Fatalf("expected zero shadow-forward calls when recovery lost the race, got %d", calls)
-	}
-}
-
-// TestWatchPermission_WonRecoveryDoesShadowForward is the positive
-// counterpart: when recovery genuinely wins, exactly one shadow-forward
-// call happens.
-func TestWatchPermission_WonRecoveryDoesShadowForward(t *testing.T) {
-	shadowCalls := withStubbedDeliverShadow(t)
-
-	directory := t.TempDir()
-	statePath := filepath.Join(directory, "state.json")
-	transcriptPath := filepath.Join(directory, "transcript.jsonl")
-	if err := os.WriteFile(transcriptPath, []byte(""), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	store, err := codexhook.NewSessionStore(statePath, time.Hour)
-	if err != nil {
-		t.Fatal(err)
-	}
-	update, _, err := store.UpdateLifecycle(codexhook.Event{
-		HookEventName:  "PermissionRequest",
-		SessionID:      "session-win",
-		TurnID:         "turn-win",
-		TranscriptPath: transcriptPath,
-	})
-	if err != nil || update.Watch == nil {
-		t.Fatalf("permission update = %#v, err=%v", update, err)
-	}
-	// The abort marker must be written after capturing watch.TranscriptOffset
-	// (above), exactly like TestWatchPermissionPublishesIdleForMatchingAbort:
-	// otherwise ScanTranscript's starting offset is already past it and
-	// "matched" never becomes true, hanging the loop until config.TTL.
-	if err := os.WriteFile(transcriptPath, []byte(`{"type":"event_msg","payload":{"type":"turn_aborted","turn_id":"turn-win"}}`+"\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	values := map[string]string{
-		codexhook.RelayURLEnv:                  "http://unused.invalid",
-		codexhook.SourceEnv:                    "codex-api",
-		codexhook.StateFileEnv:                 statePath,
-		codexhook.SessionTTLEnv:                "1h",
-		codexhook.WatcherFileEnv:               filepath.Join(directory, "watchers"),
-		codexproducer.EnvShadowSocket:          filepath.Join(directory, "shadow.sock"),
-		localhooktransport.EnvLocalHookEnabled: "1",
-	}
-	if err := watchPermission(
-		context.Background(),
-		*update.Watch,
-		func(key string) string { return values[key] },
-	); err != nil {
-		t.Fatalf("watch permission: %v", err)
-	}
-
-	if calls := shadowCalls.value(); calls != 1 {
-		t.Fatalf("expected exactly one shadow-forward call when recovery wins, got %d", calls)
-	}
 }

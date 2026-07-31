@@ -4,6 +4,7 @@ set -Eeuo pipefail
 
 readonly hook_target=/usr/local/bin/aurora-claude-hook
 readonly codex_hook_target=/usr/local/bin/aurora-codex-hook
+readonly codex_notify_target=/usr/local/bin/aurora-codex-notify
 readonly server_target=/usr/local/bin/aurora-presence-local-server
 readonly wrapper_target=/usr/local/bin/aurora-claude-hook-local
 readonly codex_wrapper_target=/usr/local/bin/aurora-codex-hook-local
@@ -16,7 +17,7 @@ usage() {
 Usage: scripts/install-aurora-presence-local-server.sh [--replace]
 
 Build and install the Aurora local presence server, Claude and Codex hooks,
-local hook wrappers and systemd unit.
+local hook wrappers, Codex notify adapter and systemd unit.
 
   --replace   Allow replacement of existing installed files.
   -h, --help  Show this help.
@@ -48,6 +49,7 @@ readonly repository_root=$(cd -- "$script_directory/.." && pwd)
 readonly unit_source="$repository_root/deploy/systemd/aurora-presence-local-server.service"
 readonly wrapper_source="$repository_root/deploy/bin/aurora-claude-hook-local"
 readonly codex_wrapper_source="$repository_root/deploy/bin/aurora-codex-hook-local"
+readonly codex_notify_source="$repository_root/deploy/bin/aurora-codex-notify"
 
 for command in go install systemctl; do
   if ! command -v "$command" >/dev/null 2>&1; then
@@ -59,7 +61,8 @@ done
 if [[ ! -f "$repository_root/go.mod" ||
       ! -f "$unit_source" ||
       ! -f "$wrapper_source" ||
-      ! -f "$codex_wrapper_source" ]]; then
+      ! -f "$codex_wrapper_source" ||
+      ! -f "$codex_notify_source" ]]; then
   printf 'error: repository files are incomplete under %s\n' "$repository_root" >&2
   exit 1
 fi
@@ -76,6 +79,7 @@ fi
 targets=(
   "$hook_target"
   "$codex_hook_target"
+  "$codex_notify_target"
   "$server_target"
   "$wrapper_target"
   "$codex_wrapper_target"
@@ -125,6 +129,8 @@ printf 'Installing binaries and wrapper...\n'
   "$build_directory/aurora-claude-hook" "$hook_target"
 "${privilege_command[@]}" install -o root -g root -m 0755 \
   "$build_directory/aurora-codex-hook" "$codex_hook_target"
+"${privilege_command[@]}" install -o root -g root -m 0755 \
+  "$codex_notify_source" "$codex_notify_target"
 "${privilege_command[@]}" install -o root -g root -m 0755 \
   "$build_directory/aurora-presence-local-server" "$server_target"
 "${privilege_command[@]}" install -o root -g root -m 0755 \

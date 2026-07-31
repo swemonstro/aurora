@@ -282,6 +282,36 @@ func TestRunReturnsLifecyclePublicationAndRemovalFailures(t *testing.T) {
 		}
 	})
 
+	t.Run("matching stop", func(t *testing.T) {
+		fail := false
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+			if fail {
+				writer.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			writer.WriteHeader(http.StatusNoContent)
+		}))
+		defer server.Close()
+		values := map[string]string{
+			codexhook.RelayURLEnv:  server.URL,
+			codexhook.SourceEnv:    "codex-api",
+			codexhook.StateFileEnv: filepath.Join(t.TempDir(), "state.json"),
+		}
+		getenv := func(key string) string { return values[key] }
+		if err := run(context.Background(), strings.NewReader(
+			`{"hook_event_name":"PermissionRequest","session_id":"session-a","turn_id":"turn-a"}`,
+		), getenv); err != nil {
+			t.Fatalf("seed permission: %v", err)
+		}
+		fail = true
+		err := run(context.Background(), strings.NewReader(
+			`{"hook_event_name":"Stop","session_id":"session-a","turn_id":"turn-a"}`,
+		), getenv)
+		if err == nil || !strings.Contains(err.Error(), "publish presence snapshot") {
+			t.Fatalf("error = %v, want matching Stop publication failure", err)
+		}
+	})
+
 	t.Run("removal", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(
 			writer http.ResponseWriter,
@@ -480,143 +510,6 @@ func TestCodexAPIAndBusinessLifecycleIsolation(t *testing.T) {
 	}
 }
 
-func TestWatchPermissionPublishesIdleForMatchingAbort(t *testing.T) {
-	states := make(chan status.State, 1)
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		var snapshot presence.Snapshot
-		if err := json.NewDecoder(request.Body).Decode(&snapshot); err != nil {
-			t.Errorf("decode snapshot: %v", err)
-			writer.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		states <- snapshot.State
-		writer.WriteHeader(http.StatusNoContent)
-	}))
-	defer server.Close()
-
-	directory := t.TempDir()
-	statePath := filepath.Join(directory, "state.json")
-	transcriptPath := filepath.Join(directory, "transcript.jsonl")
-	oldAbort := `{"type":"event_msg","payload":{"type":"turn_aborted","turn_id":"turn-a"}}` + "\n"
-	if err := os.WriteFile(transcriptPath, []byte(oldAbort), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	store, err := codexhook.NewSessionStore(statePath, time.Hour)
-	if err != nil {
-		t.Fatal(err)
-	}
-	update, _, err := store.UpdateLifecycle(codexhook.Event{
-		HookEventName:  "PermissionRequest",
-		SessionID:      "session-a",
-		TurnID:         "turn-a",
-		TranscriptPath: transcriptPath,
-	})
-	if err != nil || update.Watch == nil {
-		t.Fatalf("permission update = %#v, err=%v", update, err)
-	}
-	file, err := os.OpenFile(transcriptPath, os.O_APPEND|os.O_WRONLY, 0o600)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := file.WriteString(`{"type":"event_msg","payload":{"type":"turn_aborted","turn_id":"turn-a"}}` + "\n"); err != nil {
-		t.Fatal(err)
-	}
-	if err := file.Close(); err != nil {
-		t.Fatal(err)
-	}
-	values := map[string]string{
-		codexhook.RelayURLEnv:    server.URL,
-		codexhook.SourceEnv:      "codex-api",
-		codexhook.StateFileEnv:   statePath,
-		codexhook.SessionTTLEnv:  "1h",
-		codexhook.WatcherFileEnv: filepath.Join(directory, "watchers"),
-	}
-	if err := watchPermission(
-		context.Background(),
-		*update.Watch,
-		func(key string) string { return values[key] },
-	); err != nil {
-		t.Fatalf("watch permission: %v", err)
-	}
-
-	select {
-	case got := <-states:
-		if got != status.Idle {
-			t.Fatalf("state = %q, want idle", got)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("abort recovery was not published")
-	}
-	entries, err := os.ReadDir(values[codexhook.WatcherFileEnv])
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) != 0 {
-		t.Fatalf("watcher registration leaked: %#v", entries)
-	}
-}
-
-func TestWatchPermissionReturnsCancellationPublicationFailure(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(
-		writer http.ResponseWriter,
-		_ *http.Request,
-	) {
-		writer.WriteHeader(http.StatusServiceUnavailable)
-	}))
-	defer server.Close()
-
-	directory := t.TempDir()
-	statePath := filepath.Join(directory, "state.json")
-	transcriptPath := filepath.Join(directory, "transcript.jsonl")
-	if err := os.WriteFile(transcriptPath, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	store, err := codexhook.NewSessionStore(statePath, time.Hour)
-	if err != nil {
-		t.Fatal(err)
-	}
-	update, _, err := store.UpdateLifecycle(codexhook.Event{
-		HookEventName:  "PermissionRequest",
-		SessionID:      "session-a",
-		TurnID:         "turn-a",
-		TranscriptPath: transcriptPath,
-	})
-	if err != nil || update.Watch == nil {
-		t.Fatalf("permission update = %#v, err=%v", update, err)
-	}
-	if err := os.WriteFile(
-		transcriptPath,
-		[]byte(`{"type":"event_msg","payload":{"type":"turn_aborted","turn_id":"turn-a"}}`+"\n"),
-		0o600,
-	); err != nil {
-		t.Fatal(err)
-	}
-
-	watcherDirectory := filepath.Join(directory, "watchers")
-	values := map[string]string{
-		codexhook.RelayURLEnv:    server.URL,
-		codexhook.SourceEnv:      "codex-api",
-		codexhook.StateFileEnv:   statePath,
-		codexhook.SessionTTLEnv:  "1h",
-		codexhook.WatcherFileEnv: watcherDirectory,
-	}
-	err = watchPermission(
-		context.Background(),
-		*update.Watch,
-		func(key string) string { return values[key] },
-	)
-	if err == nil || !strings.Contains(err.Error(), "publish presence snapshot") {
-		t.Fatalf("error = %v, want cancellation publication failure", err)
-	}
-	entries, readErr := os.ReadDir(watcherDirectory)
-	if readErr != nil {
-		t.Fatal(readErr)
-	}
-	if len(entries) != 0 {
-		t.Fatalf("watcher registration leaked: %#v", entries)
-	}
-}
-
 func TestRunLocalIngressEnabledSkipsLegacyStateAndRelay(t *testing.T) {
 	relayHits := make(chan struct{}, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(
@@ -655,15 +548,13 @@ func TestRunLocalIngressEnabledSkipsLegacyStateAndRelay(t *testing.T) {
 		t.Fatal("local mode published to the legacy relay")
 	case <-time.After(150 * time.Millisecond):
 	}
-	// Local mode may maintain session state for permission-watcher
-	// coordination, but must never publish the aggregate to the relay.
+	// Local mode maintains only lifecycle ordering state and never publishes
+	// the aggregate to the relay.
 }
 
-func TestLocalPermissionCancelDeliversIdleToSocket(t *testing.T) {
-	defer stubPermissionWatcher(t)()
-
-	requests := make(chan localhooktransport.IngestRequest, 4)
-	socketPath := startCodexLocalIngestSocketN(t, requests, 4)
+func TestLocalPermissionRequestDoesNotPersistTranscriptPathOrStartWatcher(t *testing.T) {
+	requests := make(chan localhooktransport.IngestRequest, 2)
+	socketPath := startCodexLocalIngestSocketN(t, requests, 2)
 
 	relayHits := make(chan struct{}, 2)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -674,12 +565,8 @@ func TestLocalPermissionCancelDeliversIdleToSocket(t *testing.T) {
 
 	directory := t.TempDir()
 	statePath := filepath.Join(directory, "state.json")
-	transcriptA := filepath.Join(directory, "a.jsonl")
-	transcriptB := filepath.Join(directory, "b.jsonl")
-	if err := os.WriteFile(transcriptA, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(transcriptB, nil, 0o600); err != nil {
+	transcriptPath := filepath.Join(directory, "session.jsonl")
+	if err := os.WriteFile(transcriptPath, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	watcherDir := filepath.Join(directory, "watchers")
@@ -694,81 +581,31 @@ func TestLocalPermissionCancelDeliversIdleToSocket(t *testing.T) {
 	}
 	getenv := func(key string) string { return values[key] }
 
-	// Two concurrent Codex sessions both wait for permission.
 	if err := run(context.Background(), strings.NewReader(fmt.Sprintf(
-		`{"hook_event_name":"PermissionRequest","session_id":"session-a","turn_id":"turn-a","transcript_path":%q}`,
-		transcriptA,
+		`{"hook_event_name":"PermissionRequest","session_id":"session-a","turn_id":"turn-a","transcript_path":%q,"cwd":"/secret/project","prompt":"do not store"}`,
+		transcriptPath,
 	)), getenv); err != nil {
 		t.Fatal(err)
-	}
-	if err := run(context.Background(), strings.NewReader(fmt.Sprintf(
-		`{"hook_event_name":"PermissionRequest","session_id":"session-b","turn_id":"turn-b","transcript_path":%q}`,
-		transcriptB,
-	)), getenv); err != nil {
-		t.Fatal(err)
-	}
-
-	// Drain permission attention deliveries.
-	for i := 0; i < 2; i++ {
-		select {
-		case req := <-requests:
-			if req.Payload.State != instancepresence.StateAttention {
-				t.Fatalf("permission delivery %d = %#v", i+1, req.Payload)
-			}
-		case <-time.After(time.Second):
-			t.Fatalf("missing permission attention %d", i+1)
-		}
-	}
-
-	store, err := codexhook.NewSessionStore(statePath, time.Hour)
-	if err != nil {
-		t.Fatal(err)
-	}
-	watchA := mustPermissionWatch(t, statePath, "session-a", "turn-a", transcriptA)
-
-	// Esc / turn_aborted only for session-a.
-	if err := os.WriteFile(transcriptA, []byte(
-		`{"type":"event_msg","payload":{"type":"turn_aborted","turn_id":"turn-a"}}`+"\n",
-	), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := watchPermission(context.Background(), watchA, getenv); err != nil {
-		t.Fatalf("watchPermission A: %v", err)
 	}
 
 	select {
 	case req := <-requests:
 		if req.Payload.HookSessionRef != "session-a" {
-			t.Fatalf("cancel session = %q, want session-a", req.Payload.HookSessionRef)
+			t.Fatalf("permission session = %q, want session-a", req.Payload.HookSessionRef)
 		}
-		if req.Payload.State != instancepresence.StateIdle {
-			t.Fatalf("cancel state = %q, want idle", req.Payload.State)
+		if req.Payload.State != instancepresence.StateAttention {
+			t.Fatalf("permission state = %q, want attention", req.Payload.State)
 		}
 		if req.Payload.Tool != instancepresence.ToolCodex {
 			t.Fatalf("tool = %q", req.Payload.Tool)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("local idle not delivered after transcript cancel")
-	}
-
-	// Session B remains pending (attention) — no spurious idle for B.
-	select {
-	case extra := <-requests:
-		t.Fatalf("unexpected extra delivery (session-b must stay untouched): %#v", extra)
-	case <-time.After(150 * time.Millisecond):
-	}
-
-	pendingB, err := store.PermissionPending(mustPermissionWatch(t, statePath, "session-b", "turn-b", transcriptB))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !pendingB {
-		t.Fatal("session-b permission must still be pending after A cancel")
+		t.Fatal("local attention not delivered for permission request")
 	}
 
 	select {
 	case <-relayHits:
-		t.Fatal("local mode must not publish cancel recovery to legacy relay")
+		t.Fatal("local mode must not publish permission event to legacy relay")
 	case <-time.After(50 * time.Millisecond):
 	}
 
@@ -779,11 +616,107 @@ func TestLocalPermissionCancelDeliversIdleToSocket(t *testing.T) {
 	if len(entries) != 0 {
 		t.Fatalf("watcher registration leaked: %#v", entries)
 	}
+
+	stateFile, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{transcriptPath, "/secret/project", "do not store"} {
+		if strings.Contains(string(stateFile), forbidden) {
+			t.Fatalf("state file contains sensitive payload content %q in %s", forbidden, stateFile)
+		}
+	}
 }
 
-func TestLocalPermissionStopBeforeRecoverySkipsDuplicateIdle(t *testing.T) {
-	defer stubPermissionWatcher(t)()
+func TestLocalMatchingStopDeliversIdleWithoutAffectingParallelSession(t *testing.T) {
+	requests := make(chan localhooktransport.IngestRequest, 4)
+	socketPath := startCodexLocalIngestSocketN(t, requests, 3)
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	values := map[string]string{
+		codexhook.StateFileEnv:                 statePath,
+		codexhook.SessionTTLEnv:                "1h",
+		localhooktransport.EnvLocalHookEnabled: "1",
+		localhooktransport.EnvLocalHookSocket:  socketPath,
+	}
+	getenv := func(key string) string { return values[key] }
 
+	for _, payload := range []string{
+		`{"hook_event_name":"PermissionRequest","session_id":"session-a","turn_id":"turn-a"}`,
+		`{"hook_event_name":"PermissionRequest","session_id":"session-b","turn_id":"turn-b"}`,
+		`{"hook_event_name":"Stop","session_id":"session-a","turn_id":"turn-a"}`,
+	} {
+		if err := run(context.Background(), strings.NewReader(payload), getenv); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	wants := []struct {
+		session instancepresence.OpaqueIdentity
+		state   instancepresence.EffectiveState
+	}{
+		{"session-a", instancepresence.StateAttention},
+		{"session-b", instancepresence.StateAttention},
+		{"session-a", instancepresence.StateIdle},
+	}
+	for index, want := range wants {
+		select {
+		case request := <-requests:
+			if request.Payload.HookSessionRef != want.session || request.Payload.State != want.state {
+				t.Fatalf("delivery %d = %#v, want session=%q state=%q", index+1, request.Payload, want.session, want.state)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("missing delivery %d", index+1)
+		}
+	}
+
+	state := readCodexStateForTest(t, statePath)
+	if got := state["session-a"].State; got != status.Idle {
+		t.Fatalf("session-a state = %q, want idle", got)
+	}
+	if got := state["session-b"].State; got != status.Attention {
+		t.Fatalf("session-b state = %q, want attention", got)
+	}
+}
+
+func TestLocalStaleStopCannotClearOrDeliverOverNewerAttention(t *testing.T) {
+	requests := make(chan localhooktransport.IngestRequest, 4)
+	socketPath := startCodexLocalIngestSocketN(t, requests, 2)
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	values := map[string]string{
+		codexhook.StateFileEnv:                 statePath,
+		codexhook.SessionTTLEnv:                "1h",
+		localhooktransport.EnvLocalHookEnabled: "1",
+		localhooktransport.EnvLocalHookSocket:  socketPath,
+	}
+	getenv := func(key string) string { return values[key] }
+
+	for _, payload := range []string{
+		`{"hook_event_name":"PermissionRequest","session_id":"session-a","turn_id":"turn-old"}`,
+		`{"hook_event_name":"PermissionRequest","session_id":"session-a","turn_id":"turn-new"}`,
+		`{"hook_event_name":"Stop","session_id":"session-a","turn_id":"turn-old"}`,
+	} {
+		if err := run(context.Background(), strings.NewReader(payload), getenv); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 2; i++ {
+		select {
+		case request := <-requests:
+			if request.Payload.State != instancepresence.StateAttention {
+				t.Fatalf("delivery %d = %#v, want attention", i+1, request.Payload)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("missing attention delivery %d", i+1)
+		}
+	}
+	select {
+	case request := <-requests:
+		t.Fatalf("stale Stop was delivered: %#v", request.Payload)
+	case <-time.After(150 * time.Millisecond):
+	}
+}
+
+func TestTranscriptAbortCannotCreateLifecycleDelivery(t *testing.T) {
 	requests := make(chan localhooktransport.IngestRequest, 4)
 	socketPath := startCodexLocalIngestSocketN(t, requests, 4)
 
@@ -809,11 +742,11 @@ func TestLocalPermissionStopBeforeRecoverySkipsDuplicateIdle(t *testing.T) {
 	)), getenv); err != nil {
 		t.Fatal(err)
 	}
-	watch := mustPermissionWatch(t, statePath, "session-a", "turn-a", transcriptPath)
 
-	// Normal Stop restores the session before transcript recovery runs.
+	// Normal Stop restores the session. Transcript recovery is deliberately not
+	// started for Codex because transcript_path must not leave parse scope.
 	if err := run(context.Background(), strings.NewReader(
-		`{"hook_event_name":"Stop","session_id":"session-a"}`,
+		`{"hook_event_name":"Stop","session_id":"session-a","turn_id":"turn-a"}`,
 	), getenv); err != nil {
 		t.Fatal(err)
 	}
@@ -832,19 +765,14 @@ func TestLocalPermissionStopBeforeRecoverySkipsDuplicateIdle(t *testing.T) {
 	), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := watchPermission(context.Background(), watch, getenv); err != nil {
-		t.Fatalf("watchPermission after Stop: %v", err)
-	}
 	select {
 	case extra := <-requests:
-		t.Fatalf("recovery must not deliver duplicate idle after Stop: %#v", extra)
+		t.Fatalf("transcript recovery must not deliver duplicate idle after Stop: %#v", extra)
 	case <-time.After(200 * time.Millisecond):
 	}
 }
 
 func TestLocalPermissionApprovedFollowsWorkingIdle(t *testing.T) {
-	defer stubPermissionWatcher(t)()
-
 	requests := make(chan localhooktransport.IngestRequest, 4)
 	socketPath := startCodexLocalIngestSocketN(t, requests, 4)
 
@@ -875,11 +803,11 @@ func TestLocalPermissionApprovedFollowsWorkingIdle(t *testing.T) {
 			want: instancepresence.StateAttention,
 		},
 		{
-			payload: `{"hook_event_name":"PreToolUse","session_id":"session-a","tool_name":"Bash"}`,
+			payload: `{"hook_event_name":"PreToolUse","session_id":"session-a","turn_id":"turn-a","tool_name":"Bash"}`,
 			want:    instancepresence.StateWorking,
 		},
 		{
-			payload: `{"hook_event_name":"Stop","session_id":"session-a"}`,
+			payload: `{"hook_event_name":"Stop","session_id":"session-a","turn_id":"turn-a"}`,
 			want:    instancepresence.StateIdle,
 		},
 	}
@@ -898,44 +826,23 @@ func TestLocalPermissionApprovedFollowsWorkingIdle(t *testing.T) {
 	}
 }
 
-func stubPermissionWatcher(t *testing.T) func() {
-	t.Helper()
-	previous := startPermissionWatcher
-	startPermissionWatcher = func(codexhook.PermissionWatch, func(string) string) error {
-		return nil
-	}
-	return func() { startPermissionWatcher = previous }
+type codexStateForTest struct {
+	State status.State `json:"state"`
 }
 
-func mustPermissionWatch(
-	t *testing.T,
-	statePath, sessionID, turnID, transcriptPath string,
-) codexhook.PermissionWatch {
+func readCodexStateForTest(t *testing.T, path string) map[string]codexStateForTest {
 	t.Helper()
-	// Rebuild watch identity from the live session store entry.
-	store, err := codexhook.NewSessionStore(statePath, time.Hour)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Probe revisions 1..32 until PermissionPending matches (stable in tests).
-	for revision := uint64(1); revision <= 32; revision++ {
-		watch := codexhook.PermissionWatch{
-			SessionID:        sessionID,
-			TurnID:           turnID,
-			TranscriptPath:   transcriptPath,
-			TranscriptOffset: 0,
-			Revision:         revision,
-		}
-		pending, err := store.PermissionPending(watch)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if pending {
-			return watch
-		}
+	var document struct {
+		Sessions map[string]codexStateForTest `json:"sessions"`
 	}
-	t.Fatalf("no pending permission for session %s", sessionID)
-	return codexhook.PermissionWatch{}
+	if err := json.Unmarshal(data, &document); err != nil {
+		t.Fatal(err)
+	}
+	return document.Sessions
 }
 
 func startCodexLocalIngestSocketN(t *testing.T, requests chan<- localhooktransport.IngestRequest, accepts int) string {

@@ -21,12 +21,10 @@ const (
 )
 
 type Session struct {
-	State            status.State `json:"state"`
-	UpdatedAt        time.Time    `json:"updated_at"`
-	TurnID           string       `json:"turn_id,omitempty"`
-	TranscriptPath   string       `json:"transcript_path,omitempty"`
-	TranscriptOffset int64        `json:"transcript_offset,omitempty"`
-	Revision         uint64       `json:"revision,omitempty"`
+	State     status.State `json:"state"`
+	UpdatedAt time.Time    `json:"updated_at"`
+	TurnID    string       `json:"turn_id,omitempty"`
+	Revision  uint64       `json:"revision,omitempty"`
 }
 
 type sessionState struct {
@@ -34,18 +32,10 @@ type sessionState struct {
 	NextRevision uint64             `json:"next_revision,omitempty"`
 }
 
-type PermissionWatch struct {
-	SessionID        string `json:"session_id"`
-	TurnID           string `json:"turn_id"`
-	TranscriptPath   string `json:"transcript_path"`
-	TranscriptOffset int64  `json:"transcript_offset"`
-	Revision         uint64 `json:"revision"`
-}
-
 type LifecycleUpdate struct {
-	State  status.State
-	Active bool
-	Watch  *PermissionWatch
+	State   status.State
+	Active  bool
+	Applied bool
 }
 
 type SessionStore struct {
@@ -106,7 +96,7 @@ func (s *SessionStore) UpdateLifecycle(event Event) (LifecycleUpdate, bool, erro
 
 	now := s.now().UTC()
 	pruneStale(state.Sessions, now, s.ttl)
-	watch := applyEvent(&state, event, action, now)
+	applied := applyEvent(&state, event, action, now)
 	aggregate := Aggregate(state.Sessions)
 
 	if err := s.writeAtomic(directory, state); err != nil {
@@ -114,70 +104,10 @@ func (s *SessionStore) UpdateLifecycle(event Event) (LifecycleUpdate, bool, erro
 	}
 
 	return LifecycleUpdate{
-		State:  aggregate,
-		Active: len(state.Sessions) > 0,
-		Watch:  watch,
+		State:   aggregate,
+		Active:  len(state.Sessions) > 0,
+		Applied: applied,
 	}, true, nil
-}
-
-func (s *SessionStore) PermissionPending(watch PermissionWatch) (bool, error) {
-	state, err := s.read()
-	if err != nil {
-		return false, err
-	}
-	return permissionMatches(state.Sessions[watch.SessionID], watch), nil
-}
-
-func (s *SessionStore) RecoverCancelled(watch PermissionWatch) (LifecycleUpdate, bool, error) {
-	directory := filepath.Dir(s.path)
-	if err := os.MkdirAll(directory, 0o700); err != nil {
-		return LifecycleUpdate{}, false, fmt.Errorf("create session state directory: %w", err)
-	}
-
-	lock, err := os.OpenFile(s.path+".lock", os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		return LifecycleUpdate{}, false, fmt.Errorf("open session state lock: %w", err)
-	}
-	defer lock.Close()
-	if err := lock.Chmod(0o600); err != nil {
-		return LifecycleUpdate{}, false, fmt.Errorf("set session state lock permissions: %w", err)
-	}
-	if err := lockFile(lock, stateLockTimeout); err != nil {
-		return LifecycleUpdate{}, false, fmt.Errorf("lock session state: %w", err)
-	}
-	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
-
-	state, err := s.read()
-	if err != nil {
-		return LifecycleUpdate{}, false, err
-	}
-	now := s.now().UTC()
-	pruneStale(state.Sessions, now, s.ttl)
-	session, exists := state.Sessions[watch.SessionID]
-	if !exists || !permissionMatches(session, watch) {
-		return LifecycleUpdate{}, false, nil
-	}
-
-	state.NextRevision++
-	state.Sessions[watch.SessionID] = Session{
-		State:     status.Idle,
-		UpdatedAt: now,
-		Revision:  state.NextRevision,
-	}
-	if err := s.writeAtomic(directory, state); err != nil {
-		return LifecycleUpdate{}, false, err
-	}
-	return LifecycleUpdate{
-		State:  Aggregate(state.Sessions),
-		Active: true,
-	}, true, nil
-}
-
-func permissionMatches(session Session, watch PermissionWatch) bool {
-	return session.State == status.Attention &&
-		session.TurnID == watch.TurnID &&
-		session.TranscriptPath == watch.TranscriptPath &&
-		session.Revision == watch.Revision
 }
 
 func (s *SessionStore) read() (sessionState, error) {
@@ -278,51 +208,37 @@ func applyEvent(
 	event Event,
 	action EventAction,
 	now time.Time,
-) *PermissionWatch {
+) bool {
 	sessionID := strings.TrimSpace(event.SessionID)
 	if sessionID == "" {
-		return nil
+		return false
 	}
 
 	if action.Remove {
 		delete(state.Sessions, sessionID)
-		return nil
+		return true
+	}
+
+	turnID := strings.TrimSpace(event.TurnID)
+	current, exists := state.Sessions[sessionID]
+	if exists && current.State == status.Attention && current.TurnID != "" &&
+		event.HookEventName != "SessionStart" &&
+		event.HookEventName != "UserPromptSubmit" &&
+		event.HookEventName != "PermissionRequest" &&
+		turnID != current.TurnID {
+		return false
 	}
 
 	state.NextRevision++
 	session := Session{
 		State:     action.State,
 		UpdatedAt: now,
+		TurnID:    turnID,
 		Revision:  state.NextRevision,
-	}
-	if event.HookEventName == "PermissionRequest" {
-		session.TurnID = strings.TrimSpace(event.TurnID)
-		session.TranscriptPath = strings.TrimSpace(event.TranscriptPath)
-		session.TranscriptOffset = transcriptEnd(session.TranscriptPath)
 	}
 	state.Sessions[sessionID] = session
 
-	if session.State != status.Attention || session.TurnID == "" || session.TranscriptPath == "" {
-		return nil
-	}
-	return &PermissionWatch{
-		SessionID:        sessionID,
-		TurnID:           session.TurnID,
-		TranscriptPath:   session.TranscriptPath,
-		TranscriptOffset: session.TranscriptOffset,
-		Revision:         session.Revision,
-	}
-}
-
-func transcriptEnd(path string) int64 {
-	if strings.TrimSpace(path) == "" {
-		return 0
-	}
-	info, err := os.Stat(path)
-	if err != nil || !info.Mode().IsRegular() {
-		return 0
-	}
-	return info.Size()
+	return true
 }
 
 func pruneStale(

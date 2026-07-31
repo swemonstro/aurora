@@ -66,6 +66,78 @@ inte läsa den statefilen implicit.
 starttid saknas och payload-/miljöpåståendet är inte serverattesterat. Wrappern
 är en migrationskälla, inte ett produktkrav.
 
+## Legacy notify-brygga
+
+Codex CLI:s legacy `notify` kör ett externt program och skickar notifieringens
+JSON som argv-argument. Auroras lokala Codexhook (`aurora-codex-hook-local`)
+förväntar sig däremot JSON på stdin. Produktionsbryggan är därför
+`aurora-codex-notify`: den väljer endast sista argv-argumentet, skriver det
+bytekorrekt till hookens stdin och skriver inte råpayloaden till fil, stdout,
+stderr eller logg. Saknad payload är best-effort no-op.
+
+`agent-turn-complete`-notify är för sen för första varvets `working`-signal.
+`bin/aurora-codex` injicerar därför också Codex command hooks för
+`SessionStart`, `UserPromptSubmit`, `PermissionRequest`, `PreToolUse`,
+`PostToolUse` och `Stop`. De command-hookeventen levereras före turn-complete,
+har provider-satt `session_id` och går direkt till samma lokala hook via stdin.
+Det ger första verkliga uppgiften sekvensen `idle -> working -> idle` utan att
+läsa Codex sessionfiler, transcriptinnehåll, prompt eller agentsvar.
+
+Wrappern injicerar även Auroras notify-adapter med `-c notify=...` för nya
+sessioner och `resume`/`resume --last`. Användaren behöver inte ändra sin
+personliga `~/.codex/config.toml`, flytta tokens eller dela konfiguration mellan
+standardprofilen och `CODEX_HOME=~/.codex-business`.
+
+Aurora-wrappern läser inte, skriver inte och mergar inte användarens
+`config.toml`. För Aurora-startade sessioner är wrapperns `-c notify=...` det
+medvetna invokationslagret ovanför personlig config, så en befintlig
+user-level `notify` ersätts under just den wrapperstarten utan att filen ändras.
+
+Om användaren uttryckligen skickar en CLI-config för `notify`, `hooks` eller
+`features.hooks` vidarebefordrar wrappern det valet oförändrat och lägger inte
+till motsvarande Aurora-default. Det undviker dubbla notify-definitioner och
+låter ett medvetet användarval vara högsta invokationslager.
+
+Om `CODEX_HOME/hooks.json` redan innehåller Auroras lokala hookkommando för alla
+sex lifecycle-eventen ovan lägger wrappern inte till ett andra likadant
+lifecycle-lager. Det bevarar befintliga Blue1-profiler utan dubbel watcher eller
+dubbla revisioner från samma provider-event.
+
+Normal start sker via Blue1-kommandot:
+
+```sh
+b1 <workstream> codex
+```
+
+eller direkt från checkouten:
+
+```sh
+/srv/dev/aurora/bin/aurora-codex
+CODEX_HOME="$HOME/.codex-business" /srv/dev/aurora/bin/aurora-codex resume --last
+```
+
+Efter framtida deploy kan en read-only Blue1-driftverifiering göras genom att
+läsa snapshotsfilen före, under och efter en ny Codex-turn och jämföra
+Codexinstansens `state`, `revisions` och `state_changed_at`:
+
+```sh
+jq '
+  .instances[]
+  | select(.tool == "codex")
+  | {
+      instance_id,
+      state,
+      revisions,
+      state_changed_at
+    }
+' /run/aurora/snapshot.json
+```
+
+Förväntad signal är att samma Codexinstans går från `idle` till `working` under
+första verkliga uppgiften och tillbaka till `idle` när varvet avslutas, med
+ökande hookrevisioner. Testet får inte aktivera rå capture eller skriva
+notify-/hookpayloads till disk.
+
 ## Saknad identitet och revisionssemantik
 
 Det observerade hookeventet innehåller ingen verifierad PID plus starttid,
